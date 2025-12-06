@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
-use reqwest::blocking::{Client, Response};
-use reqwest::header::CONTENT_TYPE;
+use reqwest::blocking::{Client, RequestBuilder, Response};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 
 use crate::interval::current_interval_id;
@@ -40,16 +40,18 @@ impl From<reqwest::Error> for ApiError {
 pub struct ApiClient {
     base_url: String,
     http: Client,
+    auth_token: Option<String>,
 }
 
 impl ApiClient {
     /// Create a new client targeting the provided base URL.
-    pub fn new(base_url: impl Into<String>) -> Result<Self, ApiError> {
+    pub fn new(base_url: impl Into<String>, auth_token: Option<String>) -> Result<Self, ApiError> {
         let http = Client::builder().timeout(Duration::from_secs(10)).build()?;
 
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             http,
+            auth_token,
         })
     }
 
@@ -74,20 +76,21 @@ impl ApiClient {
     /// Sends a batch of activity events to the `/activity` endpoint.
     pub fn upload_activity(&self, events: &[ActivityEntry]) -> Result<(), ApiError> {
         let url = format!("{}/activity", self.base_url);
-        let response = self.http.post(url).json(events).send()?;
+        let request = self.http.post(url).json(events);
+        let response = self.authorized(request).send()?;
         Self::handle_response(response)
     }
 
     fn upload_capture(&self, bytes: Vec<u8>, content_type: &'static str) -> Result<(), ApiError> {
         let url = format!("{}/capture", self.base_url);
         let interval_id = current_interval_id();
-        let response = self
+        let request = self
             .http
             .post(url)
             .header(CONTENT_TYPE, content_type)
             .header("X-Interval-ID", interval_id.to_string())
-            .body(bytes)
-            .send()?;
+            .body(bytes);
+        let response = self.authorized(request).send()?;
         Self::handle_response(response)
     }
 
@@ -104,6 +107,14 @@ impl ApiClient {
         let status = response.status();
         let body = response.text().unwrap_or_default();
         Err(ApiError::UnexpectedStatus { status, body })
+    }
+
+    fn authorized(&self, request: RequestBuilder) -> RequestBuilder {
+        if let Some(token) = &self.auth_token {
+            request.header(AUTHORIZATION, format!("Bearer {}", token))
+        } else {
+            request
+        }
     }
 }
 

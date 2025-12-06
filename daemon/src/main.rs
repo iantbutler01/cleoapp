@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::fmt;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +37,7 @@ use screencapturekit::recording_output::{
     SCRecordingOutputFileType,
 };
 use screencapturekit::screenshot_manager::SCScreenshotManager;
+use serde::Deserialize;
 
 use crate::accessibility::ActiveWindowInfo;
 use crate::api::{ActivityEntry, ActivityEvent, ApiClient, ApiError, ImageFormat, VideoFormat};
@@ -51,6 +53,11 @@ const BURST_WINDOW_SECS: u64 = 5;
 const BURST_THRESHOLD: usize = 5;
 const AUTO_RECORDING_TAIL_SECS: u64 = 5;
 const TASK_SLEEP_CHUNK_MS: u64 = 100;
+
+#[derive(Debug, Deserialize)]
+struct CleoConfig {
+    api_token: String,
+}
 
 #[derive(Default)]
 struct MenuBarApp {
@@ -367,7 +374,51 @@ fn build_status_menu() -> (Menu, MenuHandles) {
 
 fn build_api_client() -> Result<ApiClient, CaptureError> {
     let base = env::var(API_BASE_ENV).unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
-    ApiClient::new(base).map_err(CaptureError::from)
+    let auth_token = load_api_token()?;
+    ApiClient::new(base, Some(auth_token)).map_err(CaptureError::from)
+}
+
+fn load_api_token() -> Result<String, CaptureError> {
+    let path = cleo_config_path()?;
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Err(CaptureError::Config(format!(
+                "Missing Cleo config at {}. Create the file with an `api_token` field.",
+                path.display()
+            )));
+        }
+        Err(err) => return Err(CaptureError::from(err)),
+    };
+
+    let config: CleoConfig = serde_json::from_str(&contents).map_err(|err| {
+        CaptureError::Config(format!(
+            "Failed to parse Cleo config {}: {err}",
+            path.display()
+        ))
+    })?;
+
+    let token = config.api_token.trim().to_owned();
+    if token.is_empty() {
+        return Err(CaptureError::Config(format!(
+            "Config {} must define a non-empty `api_token` value",
+            path.display()
+        )));
+    }
+
+    Ok(token)
+}
+
+fn cleo_config_path() -> Result<PathBuf, CaptureError> {
+    let home = env::var("HOME").map_err(|_| {
+        CaptureError::Config(
+            "HOME environment variable must be set to locate ~/.config/cleo.json".into(),
+        )
+    })?;
+    let mut path = PathBuf::from(home);
+    path.push(".config");
+    path.push("cleo.json");
+    Ok(path)
 }
 
 fn action_item(title: &str, message: AppMessage) -> (MenuItemHandle, MenuItem) {
@@ -730,6 +781,7 @@ enum CaptureError {
     Api(ApiError),
     ApiUnavailable,
     ImageEncoding(String),
+    Config(String),
 }
 
 impl fmt::Display for CaptureError {
@@ -750,6 +802,7 @@ impl fmt::Display for CaptureError {
                 )
             }
             CaptureError::ImageEncoding(err) => write!(f, "Failed to encode image: {err}"),
+            CaptureError::Config(err) => write!(f, "{err}"),
         }
     }
 }
