@@ -11,7 +11,7 @@ Rust API server using Axum, TimescaleDB, and Twitter OAuth 2.0.
 ## Environment Variables
 
 ```bash
-export DATABASE_URL=postgres://user:pass@localhost/cleo
+export DATABASE_URL=postgres://cleo:cleo@localhost/cleo
 export TWITTER_CLIENT_ID=your_client_id
 export TWITTER_CLIENT_SECRET=your_client_secret
 export TWITTER_REDIRECT_URI=http://localhost:5173/auth/twitter/callback
