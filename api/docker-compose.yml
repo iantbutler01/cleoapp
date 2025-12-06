@@ -1,0 +1,14 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: cleo
+      POSTGRES_PASSWORD: cleo
+      POSTGRES_DB: cleo
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+
+volumes:
+  timescaledb_data:

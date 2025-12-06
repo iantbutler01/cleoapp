@@ -1,0 +1,307 @@
+Here's the comprehensive documentation for video and image upload functionality in reson-agentic:
+Video and Image Upload Functionality in reson-agentic
+A comprehensive guide to using the reson-agentic Rust framework for uploading and processing videos and images with AI agents.
+Overview
+The reson-agentic framework provides a complete system for uploading and analyzing videos and images using Google's Gemini models. The system consists of:
+Google File API - Upload large media files (>20MB) and manage their lifecycle
+Multimodal Types - Type-safe representations of media content (videos, images, audio, documents)
+Tool Macros - Define type-safe tools with automatic schema generation
+Agentic Macro - Define agent functions with automatic runtime injection and tool binding
+Google GenAI Client - Full-featured client for Gemini models with file upload support
+File API
+The Google File API allows you to upload large media files for use in multiple requests. This is essential for videos, which often exceed the 20MB inline limit.
+Core Methods
+upload_file() - Upload Media to Google File API
+pub async fn upload_file(
+    &self,
+    data: &[u8],
+    mime_type: &str,
+    display_name: Option<&str>,
+) -> Result<UploadedFile>
+Parameters:
+data: &[u8] - The raw bytes of the file to upload
+mime_type: &str - MIME type of the file (e.g., "video/mp4", "image/png", "video/quicktime")
+display_name: Option<&str> - Optional human-readable name for the file (defaults to "uploaded_file")
+Returns: UploadedFile struct containing:
+name: String - The file resource name (e.g., "files/abc123xyz") - use this in subsequent API calls
+uri: String - The file URI to use in generateContent requests
+mime_type: String - The MIME type of the uploaded file
+size_bytes: String - File size in bytes
+state: FileState - Current processing state (Processing, Active, or Failed)
+error: Option<serde_json::Value> - Error details if state is Failed
+Example:
+let video_bytes = std::fs::read("video.mp4")?;
+let uploaded = client
+    .upload_file(&video_bytes, "video/mp4", Some("my-video"))
+    .await?;
+
+println!("File: {}", uploaded.name);     // files/abc123xyz
+println!("URI: {}", uploaded.uri);        // https://generativelanguage.googleapis.com/...
+println!("State: {:?}", uploaded.state);  // Processing or Active
+wait_for_file_processing() - Wait for Video Processing
+pub async fn wait_for_file_processing(
+    &self,
+    file_name: &str,
+    timeout_secs: Option<u64>,
+) -> Result<UploadedFile>
+Parameters:
+file_name: &str - The file resource name (e.g., "files/abc123xyz")
+timeout_secs: Option<u64> - Maximum seconds to wait (defaults to 300 seconds / 5 minutes)
+Behavior:
+Polls every 2 seconds
+Returns immediately if file is Active
+Returns error if file state becomes Failed
+Returns timeout error if duration exceeds timeout_secs
+delete_file() - Clean Up Uploaded Files
+pub async fn delete_file(&self, file_name: &str) -> Result<()>
+Best Practice: Always clean up files after use to avoid unnecessary storage costs.
+FileState Enum
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileState {
+    Processing,  // File upload complete, server-side processing in progress
+    Active,      // File is ready to use
+    Failed,      // Processing failed; check error field
+}
+Types - Multimodal Messages and Media
+MediaSource Enum
+pub enum MediaSource {
+    Base64 { data: String, mime_type: String },
+    Url { url: String },
+    FileId { file_id: String },
+    FileUri { uri: String, mime_type: Option<String> },
+}
+Constructors:
+// Base64 inline data
+let source = MediaSource::base64("AAA...", "video/mp4");
+
+// Public URL
+let source = MediaSource::url("https://example.com/video.mp4");
+
+// Google File API URI (most common for videos)
+let source = MediaSource::file_uri(uploaded.uri);
+
+// YouTube
+let source = MediaSource::youtube("https://www.youtube.com/watch?v=...");
+MediaPart Enum
+pub enum MediaPart {
+    Text { text: String },
+    Image { source: MediaSource, detail: Option<String> },
+    Audio { source: MediaSource, format: Option<String> },
+    Video { source: MediaSource, metadata: Option<VideoMetadata> },
+    Document { source: MediaSource },
+}
+Constructors:
+MediaPart::text("Describe this video");
+MediaPart::image(source);
+MediaPart::image_with_detail(source, "high");
+MediaPart::video(source);
+MediaPart::video_with_metadata(source, metadata);
+MediaPart::youtube("https://youtube.com/watch?v=...");
+MediaPart::youtube_clip("https://youtube.com/watch?v=...", "0:30", "1:00");
+MediaPart::audio(source);
+MediaPart::document(source);
+VideoMetadata Struct
+pub struct VideoMetadata {
+    pub start_offset: Option<String>,  // "0:30" or "1250s"
+    pub end_offset: Option<String>,
+    pub fps: Option<f32>,
+}
+Constructors:
+VideoMetadata::new()
+    .with_clip("00:30", "01:00")
+    .with_fps(2.0);
+MultimodalMessage Struct
+pub struct MultimodalMessage {
+    pub role: ChatRole,
+    pub parts: Vec<MediaPart>,
+    pub cache_marker: Option<CacheMarker>,
+}
+Constructors:
+MultimodalMessage::user(vec![
+    MediaPart::video(source),
+    MediaPart::text("What's in this video?"),
+]);
+
+MultimodalMessage::user_with_video("Describe this video", source);
+MultimodalMessage::user_with_image("What's in this image?", source);
+MultimodalMessage::user_with_youtube("Analyze this", "https://youtube.com/...");
+Tool Macro - #[derive(Tool)]
+Automatically generates tool schema and metadata.
+/// Identify and describe objects in the video
+#[derive(Tool, Serialize, Deserialize, Debug)]
+struct IdentifyObjects {
+    /// Type of objects: "all", "people", "text", "logos", "animals"
+    object_type: String,
+    /// Max results (optional)
+    max_results: Option<u32>,
+}
+Generates:
+tool_name() -> &'static str - Returns "identify_objects" (snake_case)
+description() -> &'static str - Returns struct doc comment
+schema() -> serde_json::Value - Returns JSON Schema
+Field Rules:
+Required fields: Regular types (String, bool)
+Optional fields: Option<T>
+Doc comments become field descriptions in schema
+Agentic Macro - #[agentic]
+Creates a Runtime and injects it into your function.
+#[agentic(model = "gemini:gemini-2.0-flash")]
+async fn analyze_video(
+    video_uri: String,
+    user_query: String,
+    runtime: Runtime,  // REQUIRED - injected automatically
+) -> Result<String> {
+    // Register tools
+    runtime.register_tool_with_schema(
+        MyTool::tool_name(),
+        MyTool::description(),
+        MyTool::schema(),
+        ToolFunction::Sync(Box::new(|args| { Ok("result".to_string()) })),
+    ).await?;
+
+    // Run agent
+    runtime.run(...).await
+}
+Attributes:
+Attribute	Default	Description
+model	Required	"provider:model" format
+api_key	env var	Optional explicit key
+autobind	true	Auto-bind callables as tools
+native_tools	true	Use native tool calling
+Model Formats:
+"anthropic:claude-3-5-sonnet-20241022"
+"openai:gpt-4o"
+"gemini:gemini-2.0-flash"
+"google-genai:gemini-1.5-pro"
+"bedrock:anthropic.claude-3-sonnet"
+Complete Working Example
+use reson_agentic::agentic;
+use reson_agentic::providers::{FileState, GoogleGenAIClient};
+use reson_agentic::runtime::ToolFunction;
+use reson_agentic::types::{ChatRole, MediaPart, MediaSource, MultimodalMessage};
+use reson_agentic::utils::ConversationMessage;
+use reson_agentic::Tool;
+use serde::{Deserialize, Serialize};
+use std::env;
+
+// Step 1: Define Tools
+/// Extract timestamps from a video
+#[derive(Tool, Serialize, Deserialize, Debug)]
+struct ExtractTimestamps {
+    /// What to find timestamps for
+    query: String,
+}
+
+/// Summarize video content
+#[derive(Tool, Serialize, Deserialize, Debug)]
+struct SummarizeVideo {
+    /// Style: "brief", "detailed", "bullet_points"
+    style: String,
+}
+
+// Step 2: Define Agent
+#[agentic(model = "gemini:gemini-2.0-flash")]
+async fn analyze_video(
+    video_uri: String,
+    mime_type: String,
+    user_query: String,
+    runtime: Runtime,
+) -> reson_agentic::error::Result<String> {
+    // Register tools
+    runtime.register_tool_with_schema(
+        ExtractTimestamps::tool_name(),
+        ExtractTimestamps::description(),
+        ExtractTimestamps::schema(),
+        ToolFunction::Sync(Box::new(|args| {
+            let query = args["query"].as_str().unwrap_or("events");
+            Ok(format!("Timestamps for '{}': 0:00, 0:30, 1:15", query))
+        })),
+    ).await?;
+
+    runtime.register_tool_with_schema(
+        SummarizeVideo::tool_name(),
+        SummarizeVideo::description(),
+        SummarizeVideo::schema(),
+        ToolFunction::Sync(Box::new(|args| {
+            let style = args["style"].as_str().unwrap_or("brief");
+            Ok(format!("Summary ({}): Video content analyzed.", style))
+        })),
+    ).await?;
+
+    // Build multimodal message
+    let video_message = MultimodalMessage {
+        role: ChatRole::User,
+        parts: vec![
+            MediaPart::Video {
+                source: MediaSource::FileUri {
+                    uri: video_uri,
+                    mime_type: Some(mime_type),
+                },
+                metadata: None,
+            },
+            MediaPart::Text { text: user_query },
+        ],
+        cache_marker: None,
+    };
+
+    // Run agent
+    let response = runtime.run(
+        None,
+        Some("You are a video analysis expert."),
+        Some(vec![ConversationMessage::Multimodal(video_message)]),
+        None, None, None, None, None, None,
+    ).await?;
+
+    Ok(response.as_str().unwrap_or(&response.to_string()).to_string())
+}
+
+// Step 3: Main - Upload and Run
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let api_key = env::var("GOOGLE_GEMINI_API_KEY")?;
+    let video_path = env::args().nth(1).expect("Usage: video_upload <path>");
+    
+    // Read video
+    let video_bytes = std::fs::read(&video_path)?;
+    let mime_type = match video_path.rsplit('.').next() {
+        Some("mp4") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        _ => "video/mp4",
+    };
+
+    // Upload to File API
+    let client = GoogleGenAIClient::new(&api_key, "gemini-2.0-flash");
+    let uploaded = client.upload_file(&video_bytes, mime_type, Some("my-video")).await?;
+
+    // Wait for processing
+    if uploaded.state == FileState::Processing {
+        client.wait_for_file_processing(&uploaded.name, Some(120)).await?;
+    }
+
+    // Run agent (note: runtime parameter is NOT passed - it's injected)
+    let result = analyze_video(
+        uploaded.uri.clone(),
+        mime_type.to_string(),
+        "Describe this video".to_string(),
+    ).await?;
+
+    println!("{}", result);
+
+    // Cleanup
+    client.delete_file(&uploaded.name).await?;
+    Ok(())
+}
+API Reference Summary
+GoogleGenAIClient Methods
+Method	Purpose
+upload_file(data, mime_type, name)	Upload media
+get_file(file_name)	Check file status
+wait_for_file_processing(file_name, timeout)	Wait for processing
+delete_file(file_name)	Delete file
+Type Constructors
+Type	Constructors
+MediaSource	::base64(), ::url(), ::file_uri(), ::youtube()
+MediaPart	::text(), ::image(), ::video(), ::audio(), ::document()
+MultimodalMessage	::user(), ::user_with_video(), ::user_with_image()
+VideoMetadata	::new().with_clip().with_fps()

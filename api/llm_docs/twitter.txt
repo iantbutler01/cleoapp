@@ -1,0 +1,228 @@
+# How to connect to endpoints using OAuth 2.0 Authorization Code Flow with PKCE
+
+### How to connect to endpoints using OAuth 2.0 Authorization Code Flow with PKCE
+
+#### How to connect to the endpoints
+
+To authenticate your users, your App will need to implement an authorization flow. This authorization flow lets you direct your users to an authorization dialog on X. From there, the primary X experience will show the authorization dialog and handle the authorization on behalf of your App. Your users will be able to authorize your App or decline permission. After the user makes their choice, X will redirect the user to your App, where you can exchange the authorization code for an access token (if the user authorized your App), or handle a rejection (if the user did not authorize your App).
+
+#### Working with confidential clients
+
+If you are working with confidential clients, you will need to use a [basic authentication](https://datatracker.ietf.org/doc/html/rfc2617#section-2) scheme for generating an authorization header with base64 encoding while making requests to the token endpoints.
+
+The `userid` and `password` are separated by a single colon (":") character within a base64 encoded string in the credentials.
+
+An example would look like this:
+
+`-header 'Authorization: Basic V1ROclFTMTRiVWhwTWw4M2FVNWFkVGQyTldNNk1UcGphUTotUm9LeDN4NThKQThTbTlKSXQyZm1BanEzcTVHWC1icVozdmpKeFNlR3NkbUd0WEViUA=='`
+
+If the user agent wishes to send the Client ID "Aladdin" and password "open sesame,” it would use the following header field:
+
+`Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==`
+
+To create the basic authorization header you will need to base64 encoding on your Client ID and Client Secret which can be obtained from your App’s “Keys and Tokens” page inside of the [developer portal.](https://developer.x.com/en/portal/dashboard)
+
+#### Steps to connect using OAuth 2.0
+
+**Step 1: Construct an Authorize URL**
+
+Your App will need to build an authorize URL to X, indicating the scopes your App needs to authorize. For example, if your App needs to lookup Tweets, users and to manage follows, it should request the following scopes:
+
+`tweet.read%20users.read%20follows.read%20follows.write`
+
+The URL will also contain the `code_challenge` and state parameters, in addition to the other required parameters. In production you should use a random string for the `code_challenge`.
+
+**Step 2: GET oauth2/authorize**
+
+Have the user authenticate and send the application an authorization code. If you have enabled OAuth 2.0 for your App you can find your Client ID inside your App’s “Keys and Tokens” page.
+
+An example URL to redirect the user to would look like this:
+
+```
+https://x.com/i/oauth2/authorize?response_type=code&client_id=M1M5R3BMVy13QmpScXkzTUt5OE46MTpjaQ&redirect_uri=https://www.example.com&scope=tweet.read%20users.read%20follows.read%20follows.write&state=state&code_challenge=challenge&code_challenge_method=plain
+```
+
+An example URL with offline\_access would look like this:
+
+```
+https://x.com/i/oauth2/authorize?response_type=code&client_id=M1M5R3BMVy13QmpScXkzTUt5OE46MTpjaQ&redirect_uri=https://www.example.com&scope=tweet.read%20users.read%20follows.read%20offline.access&state=state&code_challenge=challenge&code_challenge_method=plain
+```
+
+Upon successful authentication, the redirect\_uri  you would receive a request containing the auth\_code parameter. Your application should verify the state parameter.
+
+An example request from client’s redirect would be:
+
+```
+https://www.example.com/?state=state&code=VGNibzFWSWREZm01bjN1N3dicWlNUG1oa2xRRVNNdmVHelJGY2hPWGxNd2dxOjE2MjIxNjA4MjU4MjU6MToxOmFjOjE
+```
+
+**Step 3: POST oauth2/token - Access Token**
+
+At this point, you can use the authorization code to create an access token and refresh token (only if `offline.access` scope is requested). You can make a POST request to the following endpoint:
+
+```
+https://api.x.com/2/oauth2/token
+```
+
+You will need to pass in the `Content-Type` of `application/x-www-form-urlencoded` via a header.  Additionally, you should have in your request: `code`, `grant_type`, `client_id` and `redirect_uri`, and the `code_verifier`.
+
+Here is an example token request for a public client:
+
+```json  theme={null}
+curl --location --request POST 'https://api.x.com/2/oauth2/token' \
+--header 'Content-Type: application/x-www-form-urlencoded' \
+--data-urlencode 'code=VGNibzFWSWREZm01bjN1N3dicWlNUG1oa2xRRVNNdmVHelJGY2hPWGxNd2dxOjE2MjIxNjA4MjU4MjU6MToxOmFjOjE' \
+--data-urlencode 'grant_type=authorization_code' \
+--data-urlencode 'client_id=rG9n6402A3dbUJKzXTNX4oWHJ' \
+--data-urlencode 'redirect_uri=https://www.example.com' \
+--data-urlencode 'code_verifier=challenge'
+```
+
+Here is an example using a confidential client: 
+
+```json  theme={null}
+curl --location --request POST 'https://api.x.com/2/oauth2/token' \
+--header 'Content-Type: application/x-www-form-urlencoded' \
+--header 'Authorization: Basic V1ROclFTMTRiVWhwTWw4M2FVNWFkVGQyTldNNk1UcGphUTotUm9LeDN4NThKQThTbTlKSXQyZm1BanEzcTVHWC1icVozdmpKeFNlR3NkbUd0WEViUA=='\
+--data-urlencode 'code=VGNibzFWSWREZm01bjN1N3dicWlNUG1oa2xRRVNNdmVHelJGY2hPWGxNd2dxOjE2MjIxNjA4MjU4MjU6MToxOmFjOjE' \
+--data-urlencode 'grant_type=authorization_code' \
+--data-urlencode 'redirect_uri=https://www.example.com' \
+--data-urlencode 'code_verifier=challenge'
+```
+
+**Step 4: Connect to the APIs**
+
+You are now ready to connect to the endpoints using OAuth 2.0. To do so, you will request the API as you would using [Bearer Token authentication](/resources/fundamentals/authentication/oauth-2-0/application-only). Instead of passing your Bearer Token, you’ll want to use the access token you generated in the last step. As a response, you should see the appropriate payload corresponding to the endpoint you are requesting. This request is the same for both public and confidential clients. 
+
+An example of the request you would make would look as follows:
+
+```json  theme={null}
+curl --location --request GET 'https://api.x.com/2/tweets?ids=1261326399320715264,1278347468690915330' \
+--header 'Authorization: Bearer Q0Mzb0VhZ0V5dmNXSTEyNER2MFNfVW50RzdXdTN6STFxQlVkTGhTc1lCdlBiOjE2MjIxNDc3NDM5MTQ6MToxOmF0OjE'
+```
+
+**Step 5: POST oauth2/token - refresh token**
+
+A refresh token allows an application to obtain a new access token without prompting the user. You can create a refresh token by making a POST request to the following endpoint: [https://api.x.com/2/oauth2/token](https://api.x.com/2/oauth2/token) You will need to add in the `Content-Type` of `application/x-www-form-urlencoded` via a header. In addition, you will also need to pass in your refresh\_token, set your grant\_type to be a `refresh_token`, and define your `client_id`.
+
+This request will work for public clients:
+
+```json  theme={null}
+POST 'https://api.x.com/2/oauth2/token' \
+--header 'Content-Type: application/x-www-form-urlencoded' \
+--data-urlencode 'refresh_token=bWRWa3gzdnk3WHRGU1o0bmRRcTJ5VUxWX1lZTDdJSUtmaWcxbTVxdEFXcW5tOjE2MjIxNDc3NDM5MTQ6MToxOnJ0OjE' \
+--data-urlencode 'grant_type=refresh_token' \
+--data-urlencode 'client_id=rG9n6402A3dbUJKzXTNX4oWHJ'
+```
+
+Here is an example of one for confidential clients:
+
+```json  theme={null}
+POST 'https://api.x.com/2/oauth2/token' \
+--header 'Content-Type: application/x-www-form-urlencoded' \
+--header 'Authorization: Basic V1ROclFTMTRiVWhwTWw4M2FVNWFkVGQyTldNNk1UcGphUTotUm9LeDN4NThKQThTbTlKSXQyZm1BanEzcTVHWC1icVozdmpKeFNlR3NkbUd0WEViUA=='\
+--data-urlencode 'refresh_token=bWRWa3gzdnk3WHRGU1o0bmRRcTJ5VUxWX1lZTDdJSUtmaWcxbTVxdEFXcW5tOjE2MjIxNDc3NDM5MTQ6MToxOnJ0OjE'\
+--data-urlencode 'grant_type=refresh_token'
+```
+
+**Step 6: POST oauth2/revoke - Revoke Token**
+
+A revoke token invalidates an access token or refresh token. This is used to enable a "log out" feature in clients, allowing you to clean up any security credentials associated with the authorization flow that may no longer be necessary. The revoke token is for an App to revoke a token and not a user. You can create a revoke token request by making a POST request to the following URL if the App wants to programmatically revoke the access given to it:
+
+```
+https://api.x.com/2/oauth2/revoke
+```
+
+You will need to pass in the `Content-Type` of `application/x-www-form-urlencoded` via a header, your token, and your client\_id.
+
+In some cases, a user may wish to revoke access given to an App, they can revoke access by visiting the [connected Apps page](https://x.com/settings/connected_apps).
+
+```bash  theme={null}
+curl --location --request POST 'https://api.x.com/2/oauth2/revoke' \
+--header 'Content-Type: application/x-www-form-urlencoded' \
+--data-urlencode 'token=Q0Mzb0VhZ0V5dmNXSTEyNER2MFNfVW50RzdXdTN6STFxQlVkTGhTc1lCdlBiOjE2MjIxNDc3NDM5MTQ6MToxOmF0OjE' \
+--data-urlencode 'client_id=rG9n6402A3dbUJKzXTNX4oWHJ'
+```
+
+This request will work for confidential clients:
+
+```bash  theme={null}
+curl --location --request POST 'https://api.x.com/2/oauth2/revoke' \
+--header 'Content-Type: application/x-www-form-urlencoded' \
+--header 'Authorization: Basic V1ROclFTMTRiVWhwTWw4M2FVNWFkVGQyTldNNk1UcGphUTotUm9LeDN4NThKQThTbTlKSXQyZm1BanEzcTVHWC1icVozdmpKeFNlR3NkbUd0WEViUA=='\
+--data-urlencode 'token=Q0Mzb0VhZ0V5dmNXSTEyNER2MFNfVW50RzdXdTN6STFxQlVkTGhTc1lCdlBiOjE2MjIxNDc3NDM5MTQ6MToxOmF0OjE'
+```
+
+
+---
+
+> To find navigation and other pages in this documentation, fetch the llms.txt file at: https://docs.x.com/llms.txt
+
+# Introduction
+
+export const Button = ({href, children}) => {
+  return <div className="not-prose group">
+    <a href={href}>
+      <button className="flex items-center space-x-2.5 py-1 px-4 bg-primary-dark dark:bg-white text-white dark:text-gray-950 rounded-full group-hover:opacity-[0.9] font-medium">
+        <span>
+          {children}
+        </span>
+        <svg width="3" height="24" viewBox="0 -9 3 24" class="h-6 rotate-0 overflow-visible"><path d="M0 0L3 3L0 6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path></svg>
+      </button>
+    </a>
+  </div>;
+};
+
+Creating and deleting Posts using the X API is essential for engaging with the public conversation. The new manage Posts endpoints allow you to do just that and much more.
+
+We have two available methods for managing Posts, POST and DELETE. The POST method lets you post polls, quote Tweets, post with reply settings, post with geo, post with media and tag users, and post to Super Followers, in addition to other features. Likewise, the DELETE method allows you to delete a specific Post. For the POST method, you can pass in [the parameters](/x-api/posts/creation-of-a-post) you are looking for to enable you to further customize your request.
+
+The 'delete Post' method has been updated to support edited Posts. When any Post in a chain of Post edits is deleted, all Posts in that edit chain are also deleted. To learn more about Edit Post metadata, check out the [Edit Posts fundamentals](/x-api/fundamentals/edit-posts) page.
+
+There is a user rate limit of 200 requests per 15 minutes for the POST method. The DELETE method has a rate limit of 50 requests per 15 minutes. Additionally, there is a limit of 300 requests per 3 hours, including Posts created with either manage Posts or manage Retweets.
+
+Since you are making requests on behalf of a user with the manage Posts endpoints, you must authenticate with either [OAuth 1.0a User Context](https://en.docs/authentication/oauth-1-0a) or [OAuth 2.0 Authorization Code with PKCE](https://en.docs/authentication/oauth-2-0/authorization-code), and use user Access Tokens associated with a user that has authorized your App. To generate this user Access Token with OAuth 1.0a, you can use the [3-legged OAuth flow](https://en.docs/authentication/oauth-2-0/bearer-tokens). To generate a user Access Token with OAuth 2.0, you can use the [Authorization Code with PKCE grant flow](https://en.docs/authentication/oauth-2-0/user-access-token).
+
+<Info>
+  **Account setup**
+
+  To access these endpoints, you will need:
+
+  * An approved [developer account](https://en/portal/petition/essential/basic-info).
+  * To authenticate using the keys and tokens from a [developer App](/resources/fundamentals/developer-apps) that is located within a [Project](/resources/fundamentals/projects).
+
+  Learn more about getting access to the X API v2 endpoints in our [getting started guide](/x-api/getting-started/getting-access).
+</Info>
+
+<Button href="/x-api/posts/manage-tweets/quickstart">
+  Quick start
+</Button>
+
+<br />
+
+<Button href="https://github.com/xdevplatform/Twitter-API-v2-sample-code">
+  Sample code
+</Button>
+
+<br />
+
+<Button href="https://www.postman.com/xapidevelopers/">
+  Run in Postman
+</Button>
+
+<br />
+
+<Button href="https://developer.x.com/apitools/api?endpoint=/2/tweets&method=post">
+  Try with API Explorer
+</Button>
+
+## Supporting resources
+
+* [Learn how to use Postman](/tutorials/postman-getting-started)
+* [Troubleshoot an error](https://en/support/twitter-api)
+* [API Reference](/x-api/posts/manage-tweets/introduction)
+
+
+---
+
+> To find navigation and other pages in this documentation, fetch the llms.txt file at: https://docs.x.com/llms.txt

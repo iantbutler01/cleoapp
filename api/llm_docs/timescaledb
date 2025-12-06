@@ -1,0 +1,347 @@
+Skip to content
+Navigation Menu
+timescale
+timescaledb
+
+Type / to search
+Code
+Issues
+422
+Pull requests
+33
+Actions
+Security
+2
+Insights
+Owner avatar
+timescaledb
+Public
+timescale/timescaledb
+Go to file
+t
+Name		
+svenklemm
+svenklemm
+Remove cagg_try_repair
+399a82d
+ · 
+yesterday
+.github
+Use UTF-8 encoding for make installcheck for APT packages (#9014)
+2 days ago
+.unreleased
+Move bgw_job table into _timescaledb_catalog schema
+2 days ago
+cmake
+Remove deprecated partialize/finalize functions
+2 days ago
+coccinelle
+Add support for foreign keys to hypertables
+last year
+coverage
+Enable code coverage for ARM builds in CI
+3 months ago
+docs
+Remove support for PG14
+9 months ago
+scripts
+Run update tests for PG18
+2 weeks ago
+sql
+Remove cagg_try_repair
+yesterday
+src
+Remove cagg_try_repair
+yesterday
+test
+Remove cagg_try_repair
+yesterday
+tsl
+Remove cagg_try_repair
+yesterday
+.clang-format
+Make clang-format sort includes
+last year
+.codecov.yml
+Fix our codecov repository yaml
+2 years ago
+.dir-locals.el
+Update emacs configuration
+2 years ago
+.editorconfig
+Add .editorconfig for better github display
+6 years ago
+.git-blame-ignore-revs
+Add clang-tidy changes to git blame ignore list
+2 years ago
+.gitignore
+Update gitignore
+11 months ago
+.perltidyrc
+Move perltidyrc to root
+3 years ago
+.pull-review
+Remove Philip from the reviewers list (#8492)
+4 months ago
+.yamllint.yaml
+Reindex recompressed chunks in compression policy
+7 months ago
+CHANGELOG.md
+Forwardport 2.24.0 (#9012)
+3 days ago
+CMakeLists.txt
+Add PG18 support
+2 months ago
+CONTRIBUTING.md
+Remove outdated windows CI information
+2 years ago
+LICENSE
+Add new top-level licensing information
+7 years ago
+LICENSE-APACHE
+Add new top-level licensing information
+7 years ago
+NOTICE
+Bump year in copyright notice to 2025
+8 months ago
+README.md
+fix: fixing readme tigerdata logo (#8665)
+3 months ago
+SECURITY.md
+Add security policy to repositoy
+3 years ago
+bootstrap
+Add shellcheck to CI
+4 years ago
+bootstrap.bat
+Refactor telemetry and fixes
+7 years ago
+timescaledb.control.in
+Set license specific extension comment in install script
+last year
+version.config
+Forwardport 2.24.0 (#9012)
+3 days ago
+Repository files navigation
+README
+Code of conduct
+Contributing
+License
+Apache-2.0 license
+Security
+TigerData logo
+TimescaleDB is a PostgreSQL extension for high-performance real-time analytics on time-series and event data
+Docs SLACK Try TimescaleDB for free
+
+Install TimescaleDB
+Install from a Docker container:
+
+Run the TimescaleDB container:
+
+docker run -d --name timescaledb -p 5432:5432 -e POSTGRES_PASSWORD=password timescale/timescaledb-ha:pg17
+Connect to a database:
+
+docker exec -it timescaledb psql -d "postgres://postgres:password@localhost/postgres"
+See other installation options or try Tiger Cloud for free.
+
+Create a hypertable
+TimescaleDB's hypercore is a hybrid row-columnar store that boosts analytical query performance on your time-series and event data, while reducing data size by more than 90%. This keeps your analytics operating at lightning speed and ensures low storage costs as you scale. Data is inserted in row format in the rowstore and converted to columnar format in the columnstore based on your configuration.
+
+-- Create a hypertable, with the columnstore from the hypercore engine
+-- "time" as partitioning column and a segment by on location
+CREATE TABLE conditions (
+  time        TIMESTAMPTZ       NOT NULL,
+  location    TEXT              NOT NULL,
+  temperature DOUBLE PRECISION  NULL,
+  humidity    DOUBLE PRECISION  NULL
+)
+WITH (
+  timescaledb.hypertable,
+  timescaledb.partition_column='time',
+  timescaledb.segmentby='location'
+);
+See more:
+
+About hypertables
+API reference
+About columnstore
+Enable columnstore manually
+API reference
+Insert and query data
+Insert and query data in a hypertable via regular SQL commands. For example:
+
+Insert data into a hypertable named conditions:
+
+INSERT INTO conditions
+  VALUES
+    (NOW(), 'office',   70.0, 50.0),
+    (NOW(), 'basement', 66.5, 60.0),
+    (NOW(), 'garage',   77.0, 65.2);
+Return the number of entries written to the table conditions in the last 12 hours:
+
+SELECT
+  COUNT(*)
+FROM
+  conditions
+WHERE
+  time > NOW() - INTERVAL '12 hours';
+See more:
+
+Query data
+Write data
+Create time buckets
+Time buckets enable you to aggregate data in hypertables by time interval and calculate summary values.
+
+For example, calculate the average daily temperature in a table named conditions. The table has a time and temperature columns:
+
+SELECT
+  time_bucket('1 day', time) AS bucket,
+  AVG(temperature) AS avg_temp
+FROM
+  conditions
+GROUP BY
+  bucket
+ORDER BY
+  bucket ASC;
+See more:
+
+About time buckets
+API reference
+All TimescaleDB features
+Tutorials
+Create continuous aggregates
+Continuous aggregates make real-time analytics run faster on very large datasets. They continuously and incrementally refresh a query in the background, so that when you run such query, only the data that has changed needs to be computed, not the entire dataset. This is what makes them different from regular PostgreSQL materialized views, which cannot be incrementally materialized and have to be rebuilt from scratch every time you want to refresh it.
+
+For example, create a continuous aggregate view for daily weather data in two simple steps:
+
+Create a materialized view:
+
+CREATE MATERIALIZED VIEW conditions_summary_daily
+WITH (timescaledb.continuous) AS
+SELECT
+  location,
+  time_bucket(INTERVAL '1 day', time) AS bucket,
+  AVG(temperature),
+  MAX(temperature),
+  MIN(temperature)
+FROM
+  conditions
+GROUP BY
+  location,
+  bucket;
+Create a policy to refresh the view every hour:
+
+SELECT
+  add_continuous_aggregate_policy(
+    'conditions_summary_daily',
+    start_offset => INTERVAL '1 month',
+    end_offset => INTERVAL '1 day',
+    schedule_interval => INTERVAL '1 hour'
+);
+See more:
+
+About continuous aggregates
+API reference
+Want TimescaleDB hosted and managed for you? Try Tiger Cloud
+Tiger Cloud is the modern PostgreSQL data platform for all your applications. It enhances PostgreSQL to handle time series, events, real-time analytics, and vector search—all in a single database alongside transactional workloads. You get one system that handles live data ingestion, late and out-of-order updates, and low latency queries, with the performance, reliability, and scalability your app needs. Ideal for IoT, crypto, finance, SaaS, and a myriad other domains, Tiger Cloud allows you to build data-heavy, mission-critical apps while retaining the familiarity and reliability of PostgreSQL. See our whitepaper for a deep dive into Tiger Cloud's architecture and how it meets the needs of even the most demanding applications.
+
+A Tiger Cloud service is a single optimized 100% PostgreSQL database instance that you use as is, or extend with capabilities specific to your business needs. The available capabilities are:
+
+Time-series and analytics: PostgreSQL with TimescaleDB. The PostgreSQL you know and love, supercharged with functionality for storing and querying time-series data at scale for real-time analytics and other use cases. Get faster time-based queries with hypertables, continuous aggregates, and columnar storage. Save on storage with native compression, data retention policies, and bottomless data tiering to Amazon S3.
+AI and vector: PostgreSQL with vector extensions. Use PostgreSQL as a vector database with purpose built extensions for building AI applications from start to scale. Get fast and accurate similarity search with the pgvector and pgvectorscale extensions. Create vector embeddings and perform LLM reasoning on your data with the pgai extension.
+PostgreSQL: the trusted industry-standard RDBMS. Ideal for applications requiring strong data consistency, complex relationships, and advanced querying capabilities. Get ACID compliance, extensive SQL support, JSON handling, and extensibility through custom functions, data types, and extensions. All services include all the cloud tooling you'd expect for production use: automatic backups, high availability, read replicas, data forking, connection pooling, tiered storage, usage-based storage, and much more.
+Check build status
+Linux/macOS	Linux i386	Windows	Coverity	Code Coverage	OpenSSF
+Build Status Linux/macOS	Build Status Linux i386	Windows build status	Coverity Scan Build Status	Code Coverage	OpenSSF Best Practices
+Get involved
+We welcome contributions to TimescaleDB! See Contributing and Code style guide for details.
+
+Learn about TigerData
+TigerData is the fastest PostgreSQL for transactional, analytical and agentic workloads. To learn more about the company and its products, visit tigerdata.com.
+
+About
+A time-series database for high-performance real-time analytics packaged as a Postgres extension
+
+www.tigerdata.com/
+Topics
+iot postgres sql database time-series analytics postgresql financial-analysis tsdb hacktoberfest time-series-database timescaledb tigerdata
+Resources
+ Readme
+License
+ Unknown, Apache-2.0 licenses found
+Code of conduct
+ Code of conduct
+Contributing
+ Contributing
+Security policy
+ Security policy
+ Activity
+ Custom properties
+Stars
+ 21k stars
+Watchers
+ 302 watching
+Forks
+ 1k forks
+Report repository
+Releases 123
+2.24.0 (2025-12-03)
+Latest
+3 days ago
++ 122 releases
+Packages
+No packages published
+Contributors
+111
+@svenklemm
+@erimatnor
+@mkindahl
+@cevian
+@fabriziomello
+@akuzm
+@RobAtticus
+@gayyappan
+@jnidzwetzki
+@JLockerman
+@pmwkaa
+@antekresic
+@nikkhils
+@konskov
++ 97 contributors
+Deployments
+29
+ Release Ceremonies 2 weeks ago
++ 28 deployments
+Languages
+C
+66.0%
+ 
+PLpgSQL
+27.1%
+ 
+Python
+2.6%
+ 
+CMake
+1.7%
+ 
+Shell
+1.2%
+ 
+Ruby
+0.8%
+ 
+Other
+0.6%
+Footer
+© 2025 GitHub, Inc.
+Footer navigation
+Terms
+Privacy
+Security
+Status
+Community
+Docs
+Contact
+Manage cookies
+Do not share my personal information
