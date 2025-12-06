@@ -499,6 +499,53 @@ async fn dismiss_tweet(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ============== Capture Media Endpoints ==============
+
+#[derive(Serialize)]
+struct SignedUrlResponse {
+    url: String,
+    content_type: String,
+}
+
+/// GET /captures/:id/url - Get a signed URL for a capture
+async fn get_capture_url(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(capture_id): Path<i64>,
+) -> Result<Json<SignedUrlResponse>, StatusCode> {
+    let user_id = get_user_id_from_headers(&headers)?;
+
+    // Get capture info and verify ownership
+    let capture: Option<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT gcs_path, content_type FROM captures
+        WHERE id = $1 AND user_id = $2
+        "#,
+    )
+    .bind(capture_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let (gcs_path, content_type) = capture.ok_or(StatusCode::NOT_FOUND)?;
+
+    // Generate signed URL (15 min expiry)
+    let bucket = state.gcs.bucket(BUCKET_NAME);
+    let signed_url = bucket
+        .sign_url(&gcs_path, 15 * 60, Default::default())
+        .await
+        .map_err(|e| {
+            eprintln!("Signed URL error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(SignedUrlResponse {
+        url: signed_url,
+        content_type,
+    }))
+}
+
 /// GET /me - Get current user info
 async fn get_me(
     State(state): State<Arc<AppState>>,
@@ -637,6 +684,8 @@ async fn main() {
         // User
         .route("/me", get(get_me))
         .route("/me/token", get(get_api_token).post(generate_api_token))
+        // Captures
+        .route("/captures/{id}/url", get(get_capture_url))
         // Tweets
         .route("/tweets", get(list_tweets))
         .route("/tweets/{id}/post", post(post_tweet))

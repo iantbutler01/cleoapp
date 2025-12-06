@@ -109,6 +109,14 @@ class ApiClient {
     if (!res.ok) throw new Error('Failed to generate API token');
     return res.json();
   }
+
+  async getCaptureUrl(captureId: number): Promise<{ url: string; content_type: string }> {
+    const res = await fetch(`${API_BASE}/captures/${captureId}/url`, {
+      headers: this.headers(),
+    });
+    if (!res.ok) throw new Error('Failed to get capture URL');
+    return res.json();
+  }
 }
 
 export const api = new ApiClient();

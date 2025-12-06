@@ -2,14 +2,49 @@ import { LitElement, html } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { PendingTweet, api } from '../api';
 
+interface MediaUrl {
+  url: string;
+  content_type: string;
+}
+
 @customElement('tweet-card')
 export class TweetCard extends LitElement {
   @property({ type: Object }) tweet!: PendingTweet;
   @state() posting = false;
   @state() dismissing = false;
+  @state() imageUrls: MediaUrl[] = [];
+  @state() videoUrl: MediaUrl | null = null;
+  @state() loadingMedia = true;
 
   createRenderRoot() {
     return this;
+  }
+
+  async connectedCallback() {
+    super.connectedCallback();
+    await this.loadMedia();
+  }
+
+  async loadMedia() {
+    this.loadingMedia = true;
+    try {
+      // Load image URLs
+      const imagePromises = this.tweet.image_capture_ids.map((id) =>
+        api.getCaptureUrl(id)
+      );
+      this.imageUrls = await Promise.all(imagePromises);
+
+      // Load video URL if present
+      if (this.tweet.video_clip) {
+        this.videoUrl = await api.getCaptureUrl(
+          this.tweet.video_clip.source_capture_id
+        );
+      }
+    } catch (e) {
+      console.error('Failed to load media:', e);
+    } finally {
+      this.loadingMedia = false;
+    }
   }
 
   async handlePost() {
@@ -40,23 +75,78 @@ export class TweetCard extends LitElement {
     return new Date(dateStr).toLocaleString();
   }
 
+  renderMedia() {
+    if (this.loadingMedia) {
+      return html`
+        <div class="flex justify-center py-4">
+          <span class="loading loading-spinner loading-md"></span>
+        </div>
+      `;
+    }
+
+    const hasMedia = this.imageUrls.length > 0 || this.videoUrl;
+    if (!hasMedia) return '';
+
+    return html`
+      <div class="mt-4 space-y-3">
+        ${this.videoUrl
+          ? html`
+              <video
+                controls
+                class="w-full rounded-lg max-h-80 object-contain bg-black"
+                src=${this.videoUrl.url}
+              >
+                Your browser does not support the video tag.
+              </video>
+              ${this.tweet.video_clip
+                ? html`
+                    <div class="text-xs opacity-60">
+                      Clip: ${this.tweet.video_clip.start_timestamp} (${this.tweet.video_clip.duration_secs}s)
+                    </div>
+                  `
+                : ''}
+            `
+          : ''}
+        ${this.imageUrls.length > 0
+          ? html`
+              <div class="grid gap-2 ${this.imageUrls.length > 1 ? 'grid-cols-2' : 'grid-cols-1'}">
+                ${this.imageUrls.map(
+                  (img) => html`
+                    <img
+                      src=${img.url}
+                      class="rounded-lg w-full object-cover max-h-60 cursor-pointer hover:opacity-90 transition-opacity"
+                      @click=${() => window.open(img.url, '_blank')}
+                    />
+                  `
+                )}
+              </div>
+            `
+          : ''}
+      </div>
+    `;
+  }
+
   render() {
     return html`
       <div class="card bg-base-100 shadow-xl">
         <div class="card-body">
           <div class="flex justify-between items-start">
             <span class="badge badge-ghost">${this.formatDate(this.tweet.created_at)}</span>
-            ${this.tweet.video_clip
-              ? html`<span class="badge badge-secondary">Video Clip</span>`
-              : ''}
-            ${this.tweet.image_capture_ids.length > 0
-              ? html`<span class="badge badge-accent">${this.tweet.image_capture_ids.length} Images</span>`
-              : ''}
+            <div class="flex gap-1">
+              ${this.tweet.video_clip
+                ? html`<span class="badge badge-secondary">Video</span>`
+                : ''}
+              ${this.tweet.image_capture_ids.length > 0
+                ? html`<span class="badge badge-accent">${this.tweet.image_capture_ids.length} Image${this.tweet.image_capture_ids.length > 1 ? 's' : ''}</span>`
+                : ''}
+            </div>
           </div>
 
           <div class="mt-4 p-4 bg-base-200 rounded-lg">
             <p class="text-lg whitespace-pre-wrap">${this.tweet.text}</p>
           </div>
+
+          ${this.renderMedia()}
 
           <div class="collapse collapse-arrow bg-base-200 mt-4">
             <input type="checkbox" />
@@ -65,15 +155,6 @@ export class TweetCard extends LitElement {
               <p class="text-sm opacity-70">${this.tweet.rationale}</p>
             </div>
           </div>
-
-          ${this.tweet.video_clip
-            ? html`
-                <div class="mt-2 text-sm opacity-70">
-                  Video: ${this.tweet.video_clip.start_timestamp} -
-                  ${this.tweet.video_clip.duration_secs}s
-                </div>
-              `
-            : ''}
 
           <div class="card-actions justify-end mt-4">
             <button
