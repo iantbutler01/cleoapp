@@ -31,13 +31,15 @@ struct AppState {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
-enum ActivityEvent {
+pub enum ActivityEvent {
+    #[serde(rename = "ForegroundSwitch")]
     ForegroundSwitch {
-        #[serde(rename = "newApplication")]
-        new_application: String,
-        #[serde(rename = "newWindow")]
-        new_window: String,
+        #[serde(rename = "newActive")]
+        new_active: String,
+        #[serde(rename = "windowTitle")]
+        window_title: String,
     },
+    #[serde(rename = "MouseClick")]
     MouseClick,
 }
 
@@ -146,12 +148,12 @@ async fn activity(
     for activity in activities {
         let (event_type, application, window) = match &activity.event {
             ActivityEvent::ForegroundSwitch {
-                new_application,
-                new_window,
+                new_active,
+                window_title,
             } => (
                 "ForegroundSwitch",
-                Some(new_application.as_str()),
-                Some(new_window.as_str()),
+                Some(new_active.as_str()),
+                Some(window_title.as_str()),
             ),
             ActivityEvent::MouseClick => ("MouseClick", None, None),
         };

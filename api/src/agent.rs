@@ -5,7 +5,10 @@ use reson_agentic::Tool;
 use reson_agentic::agentic;
 use reson_agentic::providers::{FileState, GoogleGenAIClient};
 use reson_agentic::runtime::ToolFunction;
-use reson_agentic::types::{ChatRole, MediaPart, MediaSource, MultimodalMessage};
+use reson_agentic::types::{
+    ChatMessage, ChatRole, CreateResult, MediaPart, MediaSource, MultimodalMessage, ToolCall,
+    ToolResult,
+};
 use reson_agentic::utils::ConversationMessage;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -13,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 const BUCKET_NAME: &str = "cleo_multimedia_data";
-const MAX_TURNS: usize = 1;
+const MAX_TURNS: usize = 40;
 
 // Tool definitions
 
@@ -509,6 +512,7 @@ Focus on:
 
 Be selective - only create tweets for genuinely interesting content. Quality over quantity.
 "#,
+        // TODO: BAD. Change this to not require locking the context here.
         { ctx.lock().await.window_start.format("%Y-%m-%d %H:%M") },
         { ctx.lock().await.window_end.format("%Y-%m-%d %H:%M") },
         activity_summary,
@@ -523,6 +527,8 @@ Be selective - only create tweets for genuinely interesting content. Quality ove
         cache_marker: None,
     };
 
+    let mut history = vec![ConversationMessage::Multimodal(message.clone())];
+
     // Run agent loop
     for _turn in 0..MAX_TURNS {
         println!("[agent] Starting turn {}", _turn + 1);
@@ -534,7 +540,7 @@ Be selective - only create tweets for genuinely interesting content. Quality ove
             .run(
                 None,
                 Some("You are a social media content curator. Find tweet-worthy moments from screen recordings."),
-                Some(vec![ConversationMessage::Multimodal(message.clone())]),
+                Some(history.clone()),
                 None,
                 None,
                 None,
@@ -544,15 +550,85 @@ Be selective - only create tweets for genuinely interesting content. Quality ove
             )
             .await?;
 
+        println!("[agent] Turn {} response: {:?}", _turn + 1, response);
+
+        // Append tool call + result messages back into the running history
+        let response_is_tool_array = response
+            .as_array()
+            .map(|arr| arr.iter().all(|value| runtime.is_tool_call(value)))
+            .unwrap_or(false);
+
+        let mut tool_call_values: Vec<serde_json::Value> = Vec::new();
+        if runtime.is_tool_call(&response) {
+            tool_call_values.push(response.clone());
+        } else if response_is_tool_array {
+            if let Some(arr) = response.as_array() {
+                tool_call_values.extend(arr.iter().cloned());
+            }
+        }
+
+        for call_value in &tool_call_values {
+            match ToolCall::create(call_value.clone()) {
+                Ok(CreateResult::Single(tool_call)) => {
+                    history.push(ConversationMessage::ToolCall(tool_call.clone()));
+
+                    let execution_result = runtime.execute_tool(call_value).await;
+                    let tool_result = match execution_result {
+                        Ok(content) => ToolResult::success_with_name(
+                            tool_call.tool_use_id.clone(),
+                            tool_call.tool_name.clone(),
+                            content,
+                        )
+                        .with_tool_obj(tool_call.args.clone()),
+                        Err(err) => ToolResult::error(
+                            tool_call.tool_use_id.clone(),
+                            format!("Tool execution failed: {}", err),
+                        )
+                        .with_tool_name(tool_call.tool_name.clone())
+                        .with_tool_obj(tool_call.args.clone()),
+                    };
+
+                    history.push(ConversationMessage::ToolResult(tool_result));
+                }
+                Ok(CreateResult::Multiple(_)) => {
+                    eprintln!(
+                        "[agent] Unexpected nested tool call payload when updating history"
+                    );
+                }
+                Ok(CreateResult::Empty) => {}
+                Err(err) => {
+                    eprintln!(
+                        "[agent] Failed to parse tool call for history reinjection: {}",
+                        err
+                    );
+                }
+            }
+        }
+
+        if tool_call_values.is_empty() {
+            if !response.is_null() {
+                let assistant_text = response
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| serde_json::to_string(&response).unwrap_or_default());
+
+                if !assistant_text.is_empty() {
+                    history.push(ConversationMessage::Chat(ChatMessage::assistant(
+                        assistant_text,
+                    )));
+                }
+            }
+        }
+
         // Check if agent is done (marked complete via tool)
         if ctx.lock().await.completed {
             break;
         }
 
         // If no tool calls in response, agent is done thinking
-        if response.is_string() {
-            break;
-        }
+        // if response.is_string() {
+        //     break;
+        // }
     }
 
     Ok(())
