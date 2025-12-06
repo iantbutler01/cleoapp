@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 const BUCKET_NAME: &str = "cleo_multimedia_data";
-const MAX_TURNS: usize = 100;
+const MAX_TURNS: usize = 1;
 
 // Tool definitions
 
@@ -282,6 +282,7 @@ pub async fn run_collateral_agent(
                     let ctx = ctx.clone();
                     let media = media.clone();
                     Box::pin(async move {
+                        println!("[agent] WriteTweet tool called with args: {:?}", args);
                         let tweet: WriteTweet = serde_json::from_value(args)?;
                         let mut guard = ctx.lock().await;
 
@@ -324,6 +325,7 @@ pub async fn run_collateral_agent(
                 move |args| {
                     let ctx = ctx.clone();
                     Box::pin(async move {
+                        println!("[agent] MarkComplete tool called with args: {:?}", args);
                         let complete: MarkComplete = serde_json::from_value(args)?;
                         let mut guard = ctx.lock().await;
                         guard.completed = true;
@@ -348,6 +350,7 @@ pub async fn run_collateral_agent(
                 move |args| {
                     let ctx = ctx.clone();
                     Box::pin(async move {
+                        println!("[agent] GetMoreContext tool called with args: {:?}", args);
                         let request: GetMoreContext = serde_json::from_value(args)?;
                         let guard = ctx.lock().await;
 
@@ -506,8 +509,8 @@ Focus on:
 
 Be selective - only create tweets for genuinely interesting content. Quality over quantity.
 "#,
-        ctx.lock().await.window_start.format("%Y-%m-%d %H:%M"),
-        ctx.lock().await.window_end.format("%Y-%m-%d %H:%M"),
+        { ctx.lock().await.window_start.format("%Y-%m-%d %H:%M") },
+        { ctx.lock().await.window_end.format("%Y-%m-%d %H:%M") },
         activity_summary,
         capture_summary
     );
@@ -522,6 +525,7 @@ Be selective - only create tweets for genuinely interesting content. Quality ove
 
     // Run agent loop
     for _turn in 0..MAX_TURNS {
+        println!("[agent] Starting turn {}", _turn + 1);
         if ctx.lock().await.completed {
             break;
         }
@@ -569,11 +573,17 @@ pub async fn run_collateral_job(
         .unwrap_or_else(|| now - Duration::hours(4));
     let window_end = now;
 
+    println!(
+        "[agent] User {} - processing window {} to {}",
+        user_id, window_start, window_end
+    );
+
     // Fetch data
     let captures = fetch_captures_in_window(&db, user_id, window_start, window_end).await?;
     let activities = fetch_activities_in_window(&db, user_id, window_start, window_end).await?;
 
     if captures.is_empty() {
+        println!("[agent] User {} - no captures found in window", user_id);
         // Nothing to process
         record_run(&db, user_id, window_start, window_end, 0).await?;
         return Ok(vec![]);
@@ -588,12 +598,24 @@ pub async fn run_collateral_job(
     for capture in &captures {
         // Download from GCS
         let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
+
+        println!(
+            "[agent] User {} - downloading capture {} from GCS: {}",
+            user_id, capture.id, capture.gcs_path
+        );
         let mut resp = gcs.read_object(&bucket, &capture.gcs_path).send().await?;
 
         let mut data = Vec::new();
         while let Some(chunk) = resp.next().await {
             data.extend_from_slice(&chunk?);
         }
+
+        println!(
+            "[agent] User {} - downloaded capture {} ({} bytes)",
+            user_id,
+            capture.id,
+            data.len()
+        );
 
         if capture.media_type == "video" {
             // Upload video to Gemini File API
@@ -605,10 +627,19 @@ pub async fn run_collateral_job(
                 )
                 .await?;
 
+            println!(
+                "[agent] User {} - uploaded video capture {} to Gemini File API: {} {:#?}",
+                user_id, capture.id, uploaded.name, uploaded.state
+            );
+
             if uploaded.state == FileState::Processing {
-                gemini_client
+                let out = gemini_client
                     .wait_for_file_processing(&uploaded.name, Some(120))
                     .await?;
+                println!(
+                    "[agent] User {} - video capture {} processing complete: {:#?}",
+                    user_id, capture.id, out
+                );
             }
 
             uploaded_media.push(UploadedMedia {
