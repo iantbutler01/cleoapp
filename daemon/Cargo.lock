@@ -140,7 +140,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "client"
+name = "cleo"
 version = "0.1.0"
 dependencies = [
  "block",

@@ -48,8 +48,8 @@ const API_BASE_ENV: &str = "CLEO_CAPTURE_API_URL";
 const DEFAULT_API_BASE: &str = "http://localhost:8080";
 const SCREENSHOT_INTERVAL_SECS: u64 = 15;
 const BURST_WINDOW_SECS: u64 = 5;
-const BURST_THRESHOLD: usize = 3;
-const AUTO_RECORDING_TAIL_SECS: u64 = 30;
+const BURST_THRESHOLD: usize = 5;
+const AUTO_RECORDING_TAIL_SECS: u64 = 15;
 const TASK_SLEEP_CHUNK_MS: u64 = 100;
 
 #[derive(Default)]
