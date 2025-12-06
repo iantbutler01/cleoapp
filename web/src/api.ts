@@ -94,6 +94,21 @@ class ApiClient {
     });
     if (!res.ok) throw new Error('Failed to dismiss tweet');
   }
+
+  async getApiToken(): Promise<string | null> {
+    const res = await fetch(`${API_BASE}/me/token`, { headers: this.headers() });
+    if (!res.ok) throw new Error('Failed to get API token');
+    return res.json();
+  }
+
+  async generateApiToken(): Promise<{ api_token: string }> {
+    const res = await fetch(`${API_BASE}/me/token`, {
+      method: 'POST',
+      headers: this.headers(),
+    });
+    if (!res.ok) throw new Error('Failed to generate API token');
+    return res.json();
+  }
 }
 
 export const api = new ApiClient();

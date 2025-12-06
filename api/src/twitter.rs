@@ -403,3 +403,54 @@ pub async fn update_user_tokens(
     .await?;
     Ok(())
 }
+
+/// Generate a new API token for a user
+pub fn generate_api_token() -> String {
+    let bytes: [u8; 32] = rand::rng().random();
+    format!("cleo_{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Set a user's API token
+pub async fn set_user_api_token(
+    db: &PgPool,
+    user_id: i64,
+    api_token: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE users SET api_token = $2, updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(user_id)
+    .bind(api_token)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Get user ID by API token (for bearer auth)
+pub async fn get_user_by_api_token(db: &PgPool, api_token: &str) -> Result<Option<i64>, sqlx::Error> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        r#"
+        SELECT id FROM users WHERE api_token = $1
+        "#,
+    )
+    .bind(api_token)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
+/// Get a user's current API token
+pub async fn get_user_api_token(db: &PgPool, user_id: i64) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        r#"
+        SELECT api_token FROM users WHERE id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.and_then(|r| r.0))
+}

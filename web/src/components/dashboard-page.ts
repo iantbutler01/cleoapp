@@ -8,6 +8,9 @@ export class DashboardPage extends LitElement {
   @state() user: User | null = null;
   @state() tweets: PendingTweet[] = [];
   @state() loading = true;
+  @state() apiToken: string | null = null;
+  @state() showTokenModal = false;
+  @state() generatingToken = false;
 
   createRenderRoot() {
     return this;
@@ -40,6 +43,37 @@ export class DashboardPage extends LitElement {
     this.loadData();
   }
 
+  async openTokenModal() {
+    this.showTokenModal = true;
+    try {
+      this.apiToken = await api.getApiToken();
+    } catch (e) {
+      console.error('Failed to get token:', e);
+    }
+  }
+
+  closeTokenModal() {
+    this.showTokenModal = false;
+  }
+
+  async generateToken() {
+    this.generatingToken = true;
+    try {
+      const result = await api.generateApiToken();
+      this.apiToken = result.api_token;
+    } catch (e) {
+      console.error('Failed to generate token:', e);
+    } finally {
+      this.generatingToken = false;
+    }
+  }
+
+  copyToken() {
+    if (this.apiToken) {
+      navigator.clipboard.writeText(this.apiToken);
+    }
+  }
+
   render() {
     if (this.loading) {
       return html`
@@ -70,6 +104,7 @@ export class DashboardPage extends LitElement {
                 <li class="menu-title">
                   <span>@${this.user?.twitter_username}</span>
                 </li>
+                <li><a @click=${this.openTokenModal}>API Token</a></li>
                 <li><a @click=${this.handleLogout}>Logout</a></li>
               </ul>
             </div>
@@ -117,6 +152,58 @@ export class DashboardPage extends LitElement {
                 </div>
               `}
         </div>
+
+        <!-- API Token Modal -->
+        ${this.showTokenModal
+          ? html`
+              <div class="modal modal-open">
+                <div class="modal-box">
+                  <h3 class="font-bold text-lg">API Token</h3>
+                  <p class="py-2 text-sm opacity-70">
+                    Use this token to authenticate the Cleo daemon on your machine.
+                  </p>
+
+                  ${this.apiToken
+                    ? html`
+                        <div class="form-control mt-4">
+                          <div class="join w-full">
+                            <input
+                              type="text"
+                              readonly
+                              value=${this.apiToken}
+                              class="input input-bordered join-item flex-1 font-mono text-sm"
+                            />
+                            <button class="btn join-item" @click=${this.copyToken}>
+                              Copy
+                            </button>
+                          </div>
+                        </div>
+                      `
+                    : html`
+                        <div class="mt-4 text-center py-4">
+                          <p class="opacity-70">No token generated yet</p>
+                        </div>
+                      `}
+
+                  <div class="modal-action">
+                    <button
+                      class="btn btn-primary"
+                      @click=${this.generateToken}
+                      ?disabled=${this.generatingToken}
+                    >
+                      ${this.generatingToken
+                        ? html`<span class="loading loading-spinner loading-sm"></span>`
+                        : this.apiToken
+                          ? 'Regenerate'
+                          : 'Generate Token'}
+                    </button>
+                    <button class="btn" @click=${this.closeTokenModal}>Close</button>
+                  </div>
+                </div>
+                <div class="modal-backdrop" @click=${this.closeTokenModal}></div>
+              </div>
+            `
+          : ''}
       </div>
     `;
   }

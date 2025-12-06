@@ -71,6 +71,8 @@ async fn capture(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<CaptureResponse>, StatusCode> {
+    let user_id = get_user_id_from_bearer(&state.db, &headers).await?;
+
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -78,12 +80,6 @@ async fn capture(
 
     let interval_id: i64 = headers
         .get("x-interval-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok())
-        .ok_or(StatusCode::BAD_REQUEST)?;
-
-    let user_id: i64 = headers
-        .get("x-user-id")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
         .ok_or(StatusCode::BAD_REQUEST)?;
@@ -140,8 +136,12 @@ async fn capture(
 
 async fn activity(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(activities): Json<Vec<Activity>>,
 ) -> Result<StatusCode, StatusCode> {
+    // Authenticate via bearer token
+    let _user_id = get_user_id_from_bearer(&state.db, &headers).await?;
+
     for activity in activities {
         let (event_type, application, window) = match &activity.event {
             ActivityEvent::ForegroundSwitch {
@@ -488,11 +488,7 @@ async fn get_me(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<twitter::User>, StatusCode> {
-    let user_id: i64 = headers
-        .get("x-user-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok())
-        .ok_or(StatusCode::BAD_REQUEST)?;
+    let user_id = get_user_id_from_headers(&headers)?;
 
     let user = twitter::get_user_by_id(&state.db, user_id)
         .await
@@ -500,6 +496,66 @@ async fn get_me(
         .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(user))
+}
+
+#[derive(Serialize)]
+struct ApiTokenResponse {
+    api_token: String,
+}
+
+/// POST /me/token - Generate a new API token for the daemon
+async fn generate_api_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<ApiTokenResponse>, StatusCode> {
+    let user_id = get_user_id_from_headers(&headers)?;
+
+    let token = twitter::generate_api_token();
+    twitter::set_user_api_token(&state.db, user_id, &token)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(ApiTokenResponse { api_token: token }))
+}
+
+/// GET /me/token - Get current API token (if exists)
+async fn get_api_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Option<String>>, StatusCode> {
+    let user_id = get_user_id_from_headers(&headers)?;
+
+    let token = twitter::get_user_api_token(&state.db, user_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(token))
+}
+
+/// Helper to extract user_id from X-User-Id header (for frontend session auth)
+fn get_user_id_from_headers(headers: &HeaderMap) -> Result<i64, StatusCode> {
+    headers
+        .get("x-user-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)
+}
+
+/// Helper to extract user_id from Bearer token (for daemon auth)
+async fn get_user_id_from_bearer(db: &PgPool, headers: &HeaderMap) -> Result<i64, StatusCode> {
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    twitter::get_user_by_api_token(db, token)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::UNAUTHORIZED)
 }
 
 #[tokio::main]
@@ -563,6 +619,7 @@ async fn main() {
         .route("/auth/twitter/token", post(auth_twitter_token))
         // User
         .route("/me", get(get_me))
+        .route("/me/token", get(get_api_token).post(generate_api_token))
         // Tweets
         .route("/tweets", get(list_tweets))
         .route("/tweets/{id}/post", post(post_tweet))
