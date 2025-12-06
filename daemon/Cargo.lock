@@ -157,6 +157,7 @@ dependencies = [
  "screencapturekit",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]

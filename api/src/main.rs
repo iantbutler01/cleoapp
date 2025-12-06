@@ -2,23 +2,24 @@ mod agent;
 mod twitter;
 
 use axum::{
+    Json, Router,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
-    Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
 use google_cloud_storage::client::Storage;
 use reson_agentic::providers::GoogleGenAIClient;
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 
 use twitter::TwitterClient;
 
 const BUCKET_NAME: &str = "cleo_multimedia_data";
+const MAX_CAPTURE_UPLOAD_SIZE: usize = 200 * 1024 * 1024; // 200 MB limit for uploads
 
 #[derive(Clone)]
 struct AppState {
@@ -228,7 +229,8 @@ async fn auth_twitter(State(state): State<Arc<AppState>>) -> Json<AuthUrlRespons
     ]);
 
     // Store state and code_verifier for callback
-    let _ = twitter::save_oauth_state(&state.db, &auth_request.state, &auth_request.code_verifier).await;
+    let _ = twitter::save_oauth_state(&state.db, &auth_request.state, &auth_request.code_verifier)
+        .await;
 
     Json(AuthUrlResponse {
         url: auth_request.url,
@@ -326,7 +328,17 @@ async fn list_tweets(
         .and_then(|v| v.parse().ok())
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    let tweets: Vec<PendingTweet> = sqlx::query_as::<_, (i64, String, Option<serde_json::Value>, Vec<i64>, String, DateTime<Utc>)>(
+    let tweets: Vec<PendingTweet> = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            Option<serde_json::Value>,
+            Vec<i64>,
+            String,
+            DateTime<Utc>,
+        ),
+    >(
         r#"
         SELECT id, text, video_clip, image_capture_ids, rationale, created_at
         FROM tweet_collateral
@@ -339,14 +351,16 @@ async fn list_tweets(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .into_iter()
-    .map(|(id, text, video_clip, image_capture_ids, rationale, created_at)| PendingTweet {
-        id,
-        text,
-        video_clip,
-        image_capture_ids,
-        rationale,
-        created_at,
-    })
+    .map(
+        |(id, text, video_clip, image_capture_ids, rationale, created_at)| PendingTweet {
+            id,
+            text,
+            video_clip,
+            image_capture_ids,
+            rationale,
+            created_at,
+        },
+    )
     .collect();
 
     Ok(Json(tweets))
@@ -560,8 +574,8 @@ async fn get_user_id_from_bearer(db: &PgPool, headers: &HeaderMap) -> Result<i64
 
 #[tokio::main]
 async fn main() {
-    let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://cleo:cleo@localhost/cleo".to_string());
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://cleo:cleo@localhost/cleo".to_string());
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -576,18 +590,22 @@ async fn main() {
         .expect("Failed to create GCS client");
 
     // Gemini client for File API operations
-    let gemini_api_key = std::env::var("GOOGLE_GEMINI_API_KEY")
-        .expect("GOOGLE_GEMINI_API_KEY must be set");
+    let gemini_api_key =
+        std::env::var("GOOGLE_GEMINI_API_KEY").expect("GOOGLE_GEMINI_API_KEY must be set");
     let gemini = GoogleGenAIClient::new(&gemini_api_key, "gemini-2.0-flash");
 
     // Twitter OAuth 2.0 client
-    let twitter_client_id = std::env::var("TWITTER_CLIENT_ID")
-        .expect("TWITTER_CLIENT_ID must be set");
-    let twitter_client_secret = std::env::var("TWITTER_CLIENT_SECRET")
-        .expect("TWITTER_CLIENT_SECRET must be set");
+    let twitter_client_id =
+        std::env::var("TWITTER_CLIENT_ID").expect("TWITTER_CLIENT_ID must be set");
+    let twitter_client_secret =
+        std::env::var("TWITTER_CLIENT_SECRET").expect("TWITTER_CLIENT_SECRET must be set");
     let twitter_redirect_uri = std::env::var("TWITTER_REDIRECT_URI")
         .unwrap_or_else(|_| "http://localhost:3000/auth/twitter/callback".to_string());
-    let twitter = TwitterClient::new(&twitter_client_id, &twitter_client_secret, &twitter_redirect_uri);
+    let twitter = TwitterClient::new(
+        &twitter_client_id,
+        &twitter_client_secret,
+        &twitter_redirect_uri,
+    );
 
     let state = Arc::new(AppState {
         db: pool.clone(),
@@ -599,11 +617,8 @@ async fn main() {
     // Start background scheduler for idle user processing
     // Checks every 5 minutes for users idle for 30+ minutes
     tokio::spawn(agent::start_background_scheduler(
-        pool,
-        gcs,
-        gemini,
-        30,  // idle_minutes
-        300, // check_interval_secs (5 min)
+        pool, gcs, gemini, 1,  // idle_minutes
+        30, // check_interval_secs (5 min)
     ));
 
     let app = Router::new()
@@ -624,6 +639,7 @@ async fn main() {
         .route("/tweets", get(list_tweets))
         .route("/tweets/{id}/post", post(post_tweet))
         .route("/tweets/{id}", axum::routing::delete(dismiss_tweet))
+        .layer(DefaultBodyLimit::max(MAX_CAPTURE_UPLOAD_SIZE))
         .with_state(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());

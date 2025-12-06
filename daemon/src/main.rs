@@ -37,7 +37,8 @@ use screencapturekit::recording_output::{
     SCRecordingOutputFileType,
 };
 use screencapturekit::screenshot_manager::SCScreenshotManager;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::accessibility::ActiveWindowInfo;
 use crate::api::{ActivityEntry, ActivityEvent, ApiClient, ApiError, ImageFormat, VideoFormat};
@@ -53,8 +54,9 @@ const BURST_WINDOW_SECS: u64 = 5;
 const BURST_THRESHOLD: usize = 5;
 const AUTO_RECORDING_TAIL_SECS: u64 = 5;
 const TASK_SLEEP_CHUNK_MS: u64 = 100;
+const ACTIVITY_FLUSH_INTERVAL_SECS: u64 = 30;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct CleoConfig {
     api_token: String,
 }
@@ -69,6 +71,7 @@ struct MenuBarApp {
     tracker: RefCell<Option<WorkspaceTracker>>,
     mouse_tracker: RefCell<Option<MouseTracker>>,
     screenshot_task: RefCell<Option<RepeatingTask>>,
+    activity_flush_task: RefCell<Option<RepeatingTask>>,
     auto_stop_task: RefCell<Option<DelayedTask>>,
     activity_window: RefCell<VecDeque<Instant>>,
     manual_recording: Cell<bool>,
@@ -81,6 +84,7 @@ enum AppMessage {
     TakeScreenshot,
     MouseClick,
     AutoStopRecording,
+    FlushActivity,
 }
 
 impl Dispatcher for MenuBarApp {
@@ -103,6 +107,7 @@ impl Dispatcher for MenuBarApp {
             AppMessage::TakeScreenshot => self.take_screenshot(),
             AppMessage::MouseClick => self.record_mouse_click(),
             AppMessage::AutoStopRecording => self.stop_recording_if_auto(),
+            AppMessage::FlushActivity => self.flush_activity_events(),
         }
     }
 }
@@ -125,6 +130,16 @@ impl AppDelegate for MenuBarApp {
         self.start_activity_tracking();
         self.start_mouse_tracking();
         self.start_screenshot_timer();
+        self.start_activity_flush_timer();
+    }
+
+    fn open_urls(&self, urls: Vec<Url>) {
+        for url in urls {
+            let url_text = url.to_string();
+            if let Err(err) = self.handle_deep_link(url) {
+                error!("Failed to handle URL {url_text}: {err}");
+            }
+        }
     }
 
     fn will_terminate(&self) {
@@ -133,6 +148,8 @@ impl AppDelegate for MenuBarApp {
         self.stop_tracker();
         self.stop_mouse_tracking();
         self.stop_screenshot_timer();
+        self.stop_activity_flush_timer();
+        self.flush_activity_events();
     }
 }
 
@@ -249,6 +266,34 @@ impl MenuBarApp {
         self.handle_activity_event();
     }
 
+    fn flush_activity_events(&self) {
+        let pending = {
+            let buffer = self.activity_events.borrow();
+            if buffer.is_empty() {
+                return;
+            }
+            buffer.clone()
+        };
+
+        let api = match self.api_client() {
+            Ok(client) => client,
+            Err(err) => {
+                error!("Cannot upload activity events: {err}");
+                return;
+            }
+        };
+
+        if let Err(err) = api.upload_activity(&pending) {
+            error!("Failed to upload activity events: {err}");
+            return;
+        }
+
+        let mut buffer = self.activity_events.borrow_mut();
+        let sent = pending.len().min(buffer.len());
+        buffer.drain(0..sent);
+        info!(target: "activity", "Flushed {sent} activity event(s) to API");
+    }
+
     fn ensure_api_client(&self) {
         if self.api.borrow().is_some() {
             return;
@@ -284,6 +329,20 @@ impl MenuBarApp {
 
     fn stop_screenshot_timer(&self) {
         self.screenshot_task.borrow_mut().take();
+    }
+
+    fn start_activity_flush_timer(&self) {
+        if self.activity_flush_task.borrow().is_some() {
+            return;
+        }
+        let task = RepeatingTask::start(Duration::from_secs(ACTIVITY_FLUSH_INTERVAL_SECS), || {
+            App::<MenuBarApp, AppMessage>::dispatch_main(AppMessage::FlushActivity);
+        });
+        self.activity_flush_task.replace(Some(task));
+    }
+
+    fn stop_activity_flush_timer(&self) {
+        self.activity_flush_task.borrow_mut().take();
     }
 
     fn handle_activity_event(&self) {
@@ -346,6 +405,28 @@ impl MenuBarApp {
             self.stop_recording();
         }
     }
+
+    fn handle_deep_link(&self, url: Url) -> Result<(), CaptureError> {
+        if !url.scheme().eq_ignore_ascii_case("cleo") {
+            warn!("Ignoring unsupported URL {}", url);
+            return Ok(());
+        }
+        match CleoRoute::from_url(&url)? {
+            CleoRoute::Login { api_key } => {
+                info!("Received cleo://login callback");
+                self.apply_api_token(api_key)
+            }
+        }
+    }
+
+    fn apply_api_token(&self, api_key: String) -> Result<(), CaptureError> {
+        save_api_token(&api_key)?;
+        let base = env::var(API_BASE_ENV).unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
+        let client = ApiClient::new(base, Some(api_key)).map_err(CaptureError::from)?;
+        self.api.replace(Some(client));
+        info!("API token saved from login link");
+        Ok(())
+    }
 }
 
 fn main() {
@@ -384,7 +465,7 @@ fn load_api_token() -> Result<String, CaptureError> {
         Ok(contents) => contents,
         Err(err) if err.kind() == ErrorKind::NotFound => {
             return Err(CaptureError::Config(format!(
-                "Missing Cleo config at {}. Create the file with an `api_token` field.",
+                "Missing Cleo config at {}. Use cleo://login/<api_key> or create the file with an `api_token` field.",
                 path.display()
             )));
         }
@@ -398,15 +479,7 @@ fn load_api_token() -> Result<String, CaptureError> {
         ))
     })?;
 
-    let token = config.api_token.trim().to_owned();
-    if token.is_empty() {
-        return Err(CaptureError::Config(format!(
-            "Config {} must define a non-empty `api_token` value",
-            path.display()
-        )));
-    }
-
-    Ok(token)
+    validate_api_token(&config.api_token, &format!("Config {}", path.display()))
 }
 
 fn cleo_config_path() -> Result<PathBuf, CaptureError> {
@@ -419,6 +492,89 @@ fn cleo_config_path() -> Result<PathBuf, CaptureError> {
     path.push(".config");
     path.push("cleo.json");
     Ok(path)
+}
+
+fn save_api_token(token: &str) -> Result<(), CaptureError> {
+    let path = cleo_config_path()?;
+    let api_token = validate_api_token(token, "cleo://login token")?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(CaptureError::from)?;
+    }
+
+    let config = CleoConfig { api_token };
+    let payload = serde_json::to_string_pretty(&config).map_err(|err| {
+        CaptureError::Config(format!(
+            "Failed to serialize Cleo config at {}: {err}",
+            path.display()
+        ))
+    })?;
+
+    fs::write(&path, payload).map_err(CaptureError::from)
+}
+
+fn validate_api_token(token: &str, context: &str) -> Result<String, CaptureError> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        Err(CaptureError::Config(format!(
+            "{context} must provide a non-empty API token"
+        )))
+    } else {
+        Ok(trimmed.to_owned())
+    }
+}
+
+enum CleoRoute {
+    Login { api_key: String },
+}
+
+impl CleoRoute {
+    fn from_url(url: &Url) -> Result<Self, CaptureError> {
+        if !url.scheme().eq_ignore_ascii_case("cleo") {
+            return Err(CaptureError::Config(format!(
+                "Unsupported URL scheme `{}` for {}",
+                url.scheme(),
+                url
+            )));
+        }
+
+        if url
+            .host_str()
+            .map(|host| host.eq_ignore_ascii_case("login"))
+            .unwrap_or(false)
+        {
+            let api_key = url
+                .path_segments()
+                .and_then(|mut segments| segments.next().map(|segment| segment.to_owned()))
+                .ok_or_else(|| {
+                    CaptureError::Config(format!(
+                        "URL {url} must include an API key, e.g. cleo://login/<api_key>"
+                    ))
+                })?;
+            let api_key = validate_api_token(&api_key, &format!("URL {url}"))?;
+            return Ok(CleoRoute::Login { api_key });
+        }
+
+        let mut segments = url.path_segments().ok_or_else(|| {
+            CaptureError::Config(format!(
+                "URL {url} must include a route like cleo://login/<api_key>"
+            ))
+        })?;
+
+        match segments.next() {
+            Some(segment) if segment.eq_ignore_ascii_case("login") => {
+                let api_key = segments.next().ok_or_else(|| {
+                    CaptureError::Config(format!(
+                        "URL {url} must include an API key, e.g. cleo://login/<api_key>"
+                    ))
+                })?;
+                let api_key = validate_api_token(api_key, &format!("URL {url}"))?;
+                Ok(CleoRoute::Login { api_key })
+            }
+            _ => Err(CaptureError::Config(format!(
+                "Unrecognized cleo:// route in {url}. Expected cleo://login/<api_key>"
+            ))),
+        }
+    }
 }
 
 fn action_item(title: &str, message: AppMessage) -> (MenuItemHandle, MenuItem) {
@@ -739,6 +895,7 @@ impl ScreenRecorder {
 
     fn stop(mut self) -> Result<(), CaptureError> {
         self.stop_stream()?;
+        thread::sleep(Duration::from_millis(100));
         let bytes = fs::read(&self.file_path)?;
         self.api
             .upload_video(bytes, VideoFormat::QuickTime)

@@ -1,12 +1,12 @@
 use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use google_cloud_storage::client::Storage;
+use reson_agentic::Tool;
 use reson_agentic::agentic;
 use reson_agentic::providers::{FileState, GoogleGenAIClient};
 use reson_agentic::runtime::ToolFunction;
 use reson_agentic::types::{ChatRole, MediaPart, MediaSource, MultimodalMessage};
 use reson_agentic::utils::ConversationMessage;
-use reson_agentic::Tool;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -134,7 +134,7 @@ pub async fn fetch_activities_in_window(
     // For now, fetch all in window - adjust based on your schema
     sqlx::query_as::<_, ActivityRecord>(
         r#"
-        SELECT id, timestamp, event_type, application, window
+        SELECT id, timestamp, event_type, application, "window"
         FROM activities
         WHERE timestamp >= $1 AND timestamp < $2
         ORDER BY timestamp ASC
@@ -217,8 +217,15 @@ pub async fn record_run(
     Ok(())
 }
 
-pub async fn save_tweet(db: &PgPool, user_id: i64, tweet: &TweetCollateral) -> Result<i64, sqlx::Error> {
-    let video_clip_json = tweet.video_clip.as_ref().map(|c| serde_json::to_value(c).unwrap());
+pub async fn save_tweet(
+    db: &PgPool,
+    user_id: i64,
+    tweet: &TweetCollateral,
+) -> Result<i64, sqlx::Error> {
+    let video_clip_json = tweet
+        .video_clip
+        .as_ref()
+        .map(|c| serde_json::to_value(c).unwrap());
     let image_ids: Vec<i64> = tweet.image_capture_ids.clone();
 
     let row: (i64,) = sqlx::query_as(
@@ -581,10 +588,7 @@ pub async fn run_collateral_job(
     for capture in &captures {
         // Download from GCS
         let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
-        let mut resp = gcs
-            .read_object(&bucket, &capture.gcs_path)
-            .send()
-            .await?;
+        let mut resp = gcs.read_object(&bucket, &capture.gcs_path).send().await?;
 
         let mut data = Vec::new();
         while let Some(chunk) = resp.next().await {
@@ -594,7 +598,11 @@ pub async fn run_collateral_job(
         if capture.media_type == "video" {
             // Upload video to Gemini File API
             let uploaded = gemini_client
-                .upload_file(&data, &capture.content_type, Some(&format!("capture_{}", capture.id)))
+                .upload_file(
+                    &data,
+                    &capture.content_type,
+                    Some(&format!("capture_{}", capture.id)),
+                )
                 .await?;
 
             if uploaded.state == FileState::Processing {
