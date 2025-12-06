@@ -4,7 +4,7 @@ mod twitter;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
@@ -530,15 +530,19 @@ async fn get_capture_url(
 
     let (gcs_path, content_type) = capture.ok_or(StatusCode::NOT_FOUND)?;
 
-    // Generate signed URL (15 min expiry)
-    let bucket = state.gcs.bucket(BUCKET_NAME);
-    let signed_url = bucket
-        .sign_url(&gcs_path, 15 * 60, Default::default())
+    // Generate signed URL (15 min expiry) using cloud-storage crate
+    let client = cloud_storage::Client::default();
+    let object = client.object().read(BUCKET_NAME, &gcs_path)
         .await
         .map_err(|e| {
-            eprintln!("Signed URL error: {}", e);
+            eprintln!("Object read error: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+
+    let signed_url = object.download_url(15 * 60).map_err(|e| {
+        eprintln!("Signed URL error: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok(Json(SignedUrlResponse {
         url: signed_url,
