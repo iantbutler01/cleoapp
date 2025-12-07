@@ -2,6 +2,8 @@
 
 Cleo is an AI-powered social media assistant that captures your screen activity and suggests tweets based on interesting moments it discovers. A macOS menu bar daemon takes periodic screenshots and automatically records video when it detects activity bursts (rapid mouse clicks or window switches). An AI agent then reviews your captures looking for tweet-worthy moments.
 
+![signal-2025-12-06-155923_002](https://github.com/user-attachments/assets/51d22568-bf91-45db-aea8-ebaa35f33880)
+
 ## How It Works
 
 1. **Capture** - A macOS menu bar daemon takes screenshots every 5 seconds and auto-records video during activity bursts
