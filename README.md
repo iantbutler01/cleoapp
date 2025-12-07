@@ -158,4 +158,4 @@ The daemon runs as a menu bar app with the following behavior:
 
 ## License
 
-MIT
+AGPLv3
