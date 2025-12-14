@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = "0.8.7"
+axum = { version = "0.8.7", features = ["multipart"] }
 axum-extra = { version = "0.10", features = ["cookie"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.42", features = ["serde"] }

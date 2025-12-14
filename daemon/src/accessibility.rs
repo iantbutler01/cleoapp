@@ -423,6 +423,23 @@ impl StaticCFString {
 unsafe impl Send for StaticCFString {}
 unsafe impl Sync for StaticCFString {}
 
+/// Check if the app has accessibility permissions, optionally prompting the user
+pub fn check_accessibility_trusted(prompt: bool) -> bool {
+    if prompt {
+        // Create a dictionary with kAXTrustedCheckOptionPrompt = true
+        use core_foundation::boolean::CFBoolean;
+        use core_foundation::dictionary::CFDictionary;
+        use core_foundation::string::CFString;
+
+        let key = CFString::from_static_string("AXTrustedCheckOptionPrompt");
+        let value = CFBoolean::true_value();
+        let dict = CFDictionary::from_CFType_pairs(&[(key, value)]);
+        unsafe { AXIsProcessTrustedWithOptions(dict.as_concrete_TypeRef()) }
+    } else {
+        unsafe { AXIsProcessTrustedWithOptions(ptr::null()) }
+    }
+}
+
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;

@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
-use reqwest::blocking::{Client, RequestBuilder, Response};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::blocking::{Client, RequestBuilder, Response, multipart};
+use reqwest::header::AUTHORIZATION;
 use serde::{Deserialize, Serialize};
 
 use crate::interval::current_interval_id;
@@ -28,6 +28,40 @@ impl fmt::Display for ApiError {
 }
 
 impl std::error::Error for ApiError {}
+
+/// Result from batch upload endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchUploadResult {
+    pub uploaded: usize,
+    pub failed: usize,
+}
+
+/// Recording limits fetched from the API.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordingLimits {
+    /// Maximum duration of a single recording in seconds
+    pub max_recording_duration_secs: u64,
+    /// Recording budget per hour in seconds
+    pub recording_budget_secs: u64,
+    /// Inactivity duration before recording stops in seconds
+    pub inactivity_timeout_secs: u64,
+    /// Total storage limit in bytes
+    pub storage_limit_bytes: u64,
+    /// Current storage used in bytes
+    pub storage_used_bytes: u64,
+}
+
+impl RecordingLimits {
+    /// Returns remaining storage in bytes
+    pub fn storage_remaining(&self) -> u64 {
+        self.storage_limit_bytes.saturating_sub(self.storage_used_bytes)
+    }
+
+    /// Returns true if storage limit has been exceeded
+    pub fn storage_exceeded(&self) -> bool {
+        self.storage_used_bytes >= self.storage_limit_bytes
+    }
+}
 
 impl From<reqwest::Error> for ApiError {
     fn from(value: reqwest::Error) -> Self {
@@ -55,22 +89,50 @@ impl ApiClient {
         })
     }
 
-    /// Uploads an image capture to the `/capture` endpoint.
-    pub fn upload_image(
-        &self,
-        bytes: impl Into<Vec<u8>>,
-        format: ImageFormat,
-    ) -> Result<(), ApiError> {
-        self.upload_capture(bytes.into(), format.mime_type())
+    /// Uploads a batch of images to the `/captures/batch` endpoint.
+    pub fn upload_images(&self, captures: Vec<(Vec<u8>, ImageFormat)>) -> Result<BatchUploadResult, ApiError> {
+        let parts: Vec<_> = captures.into_iter().map(|(b, f)| (b, f.mime_type())).collect();
+        self.upload_batch(parts)
     }
 
-    /// Uploads a video capture to the `/capture` endpoint.
-    pub fn upload_video(
-        &self,
-        bytes: impl Into<Vec<u8>>,
-        format: VideoFormat,
-    ) -> Result<(), ApiError> {
-        self.upload_capture(bytes.into(), format.mime_type())
+    /// Uploads a batch of videos to the `/captures/batch` endpoint.
+    pub fn upload_videos(&self, captures: Vec<(Vec<u8>, VideoFormat)>) -> Result<BatchUploadResult, ApiError> {
+        let parts: Vec<_> = captures.into_iter().map(|(b, f)| (b, f.mime_type())).collect();
+        self.upload_batch(parts)
+    }
+
+    fn upload_batch(&self, captures: Vec<(Vec<u8>, &'static str)>) -> Result<BatchUploadResult, ApiError> {
+        if captures.is_empty() {
+            return Ok(BatchUploadResult { uploaded: 0, failed: 0 });
+        }
+
+        let url = format!("{}/captures/batch", self.base_url);
+        let interval_id = current_interval_id();
+
+        let mut form = multipart::Form::new();
+        for (i, (bytes, mime_type)) in captures.into_iter().enumerate() {
+            let part = multipart::Part::bytes(bytes)
+                .mime_str(mime_type)
+                .map_err(|e| ApiError::Http(e.into()))?
+                .file_name(format!("file_{}", i));
+            form = form.part("file", part);
+        }
+
+        let request = self
+            .http
+            .post(url)
+            .header("X-Interval-ID", interval_id.to_string())
+            .multipart(form);
+        let response = self.authorized(request).send()?;
+
+        if response.status().is_success() {
+            let result: BatchUploadResult = response.json().unwrap_or(BatchUploadResult { uploaded: 0, failed: 0 });
+            Ok(result)
+        } else {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            Err(ApiError::UnexpectedStatus { status, body })
+        }
     }
 
     /// Sends a batch of activity events to the `/activity` endpoint.
@@ -81,17 +143,19 @@ impl ApiClient {
         Self::handle_response(response)
     }
 
-    fn upload_capture(&self, bytes: Vec<u8>, content_type: &'static str) -> Result<(), ApiError> {
-        let url = format!("{}/capture", self.base_url);
-        let interval_id = current_interval_id();
-        let request = self
-            .http
-            .post(url)
-            .header(CONTENT_TYPE, content_type)
-            .header("X-Interval-ID", interval_id.to_string())
-            .body(bytes);
+    /// Fetches recording limits from the `/me/limits` endpoint.
+    pub fn fetch_limits(&self) -> Result<RecordingLimits, ApiError> {
+        let url = format!("{}/me/limits", self.base_url);
+        let request = self.http.get(url);
         let response = self.authorized(request).send()?;
-        Self::handle_response(response)
+
+        if response.status().is_success() {
+            response.json().map_err(ApiError::from)
+        } else {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            Err(ApiError::UnexpectedStatus { status, body })
+        }
     }
 
     /// Returns the base URL configured for this client.

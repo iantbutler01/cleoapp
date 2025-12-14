@@ -53,14 +53,17 @@ Cleo is an AI-powered social media assistant that captures your screen activity 
 
 ### Prerequisites
 
-- macOS (for the daemon - uses ScreenCaptureKit)
-- Rust (latest stable)
+- macOS 14+ (for the daemon - uses ScreenCaptureKit)
+- Rust nightly (for edition 2024)
 - Node.js 18+
 - PostgreSQL with TimescaleDB extension
 - Google Cloud account (for storage + Gemini API)
 - Twitter Developer App credentials
+- ffmpeg (optional, for video content filtering)
 
 ### Environment Variables
+
+Create a `.env` file or export these variables:
 
 ```bash
 # Database
@@ -69,6 +72,7 @@ export DATABASE_URL=postgres://cleo:cleo@localhost/cleo
 # Google Cloud
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 export GOOGLE_GEMINI_API_KEY=your_gemini_api_key
+export GCS_BUCKET_NAME=your-bucket-name
 
 # Twitter OAuth 2.0
 export TWITTER_CLIENT_ID=your_client_id
@@ -76,40 +80,148 @@ export TWITTER_CLIENT_SECRET=your_client_secret
 export TWITTER_REDIRECT_URI=http://localhost:5173/auth/twitter/callback
 ```
 
-### Running Locally
+---
 
-**Start the API:**
+## Running Each Subsystem
+
+### 1. Database Setup
+
+```bash
+# Install PostgreSQL with TimescaleDB
+brew install postgresql timescaledb
+
+# Start PostgreSQL
+brew services start postgresql
+
+# Create database and user
+createdb cleo
+psql -d cleo -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
+
+# Run migrations (from api directory)
+cd api
+sqlx database create
+sqlx migrate run
+```
+
+### 2. API Server (`/api`)
+
+The Rust/Axum backend handles authentication, capture storage, and AI agent orchestration.
+
 ```bash
 cd api
+
+# Install Rust nightly (required for edition 2024)
+rustup install nightly
+rustup override set nightly
+
+# Run the server (defaults to port 3000)
 cargo run
+
+# Or specify a port
+PORT=3000 cargo run
 ```
 
-**Start the Web UI:**
+The API will be available at `http://localhost:3000`.
+
+### 3. Web Dashboard (`/web`)
+
+The Lit + TailwindCSS + DaisyUI frontend for reviewing and posting tweets.
+
 ```bash
 cd web
+
+# Install dependencies
 npm install
+
+# Start development server (port 5173)
 npm run dev
+
+# Or build for production
+npm run build
+npm run preview
 ```
 
-**Start the Daemon:**
+The dashboard will be available at `http://localhost:5173`.
+
+### 4. macOS Daemon (`/daemon`)
+
+The menu bar app that captures screenshots, records video, and tracks activity.
+
 ```bash
 cd daemon
+
+# Install Rust nightly
+rustup install nightly
+rustup override set nightly
+
+# Run with CPU inference (slower, but works everywhere)
 cargo run
+
+# Run with Metal GPU acceleration (recommended for Apple Silicon)
+cargo run --features metal
+
+# Run with Accelerate framework (optimized for macOS)
+cargo run --features accelerate
 ```
 
-Visit `http://localhost:5173` to log in with Twitter, generate an API token, and configure the daemon.
+**First Run Notes:**
+- Grant Screen Recording permission when prompted (System Settings → Privacy & Security → Screen Recording)
+- Grant Accessibility permission for mouse/keyboard tracking
+- The NSFW model (~350MB) downloads from Hugging Face on first launch
+- If ffmpeg is not installed, video content filtering is skipped
 
-### Daemon Configuration
+### 5. Connect the Daemon
 
-The daemon reads its API token from `~/.config/cleo.json`:
+Once all services are running:
 
-```json
-{
-  "api_token": "cleo_your_token_here"
-}
+1. Visit `http://localhost:5173`
+2. Log in with Twitter
+3. Click "Generate API Token"
+4. Either:
+   - Copy the token to `~/.config/cleo.json`:
+     ```json
+     {
+       "api_token": "cleo_your_token_here"
+     }
+     ```
+   - Or click the deep link: `cleo://login/<api_token>`
+
+The daemon will now upload captures to your account.
+
+---
+
+## Development
+
+### Running All Services
+
+For convenience, run each in a separate terminal:
+
+```bash
+# Terminal 1 - API
+cd api && cargo run
+
+# Terminal 2 - Web
+cd web && npm run dev
+
+# Terminal 3 - Daemon
+cd daemon && cargo run --features metal
 ```
 
-You can also configure it via deep link: `cleo://login/<api_token>`
+### Useful Commands
+
+```bash
+# Check API compilation
+cd api && cargo check
+
+# Check daemon compilation
+cd daemon && cargo check
+
+# Run API tests
+cd api && cargo test
+
+# Build web for production
+cd web && npm run build
+```
 
 ## API Endpoints
 

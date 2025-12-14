@@ -3,9 +3,9 @@ mod twitter;
 
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{DefaultBodyLimit, Multipart, Path, State},
+    http::{HeaderMap, StatusCode, header},
+    response::IntoResponse,
     routing::{get, post},
 };
 use chrono::{DateTime, Duration, Utc};
@@ -14,6 +14,7 @@ use reson_agentic::providers::GoogleGenAIClient;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use twitter::TwitterClient;
@@ -25,8 +26,10 @@ const MAX_CAPTURE_UPLOAD_SIZE: usize = 200 * 1024 * 1024; // 200 MB limit for up
 struct AppState {
     db: PgPool,
     gcs: Storage,
-    gemini: GoogleGenAIClient,
+    gemini: Option<GoogleGenAIClient>,
     twitter: TwitterClient,
+    /// Optional local storage path - if set, captures are written to disk instead of GCS
+    local_storage_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,8 +55,10 @@ struct Activity {
 }
 
 #[derive(Serialize)]
-struct CaptureResponse {
-    id: i64,
+struct BatchCaptureResponse {
+    ids: Vec<i64>,
+    uploaded: usize,
+    failed: usize,
 }
 
 fn get_extension(content_type: &str) -> &'static str {
@@ -69,17 +74,17 @@ fn get_extension(content_type: &str) -> &'static str {
     }
 }
 
-async fn capture(
+/// POST /captures/batch - Upload multiple captures in one request
+/// Accepts multipart form data with:
+/// - Multiple "file" fields containing the media bytes
+/// - Each file should have proper content-type (image/* or video/*)
+/// - X-Interval-ID header for all captures
+async fn capture_batch(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Bytes,
-) -> Result<Json<CaptureResponse>, StatusCode> {
+    mut multipart: Multipart,
+) -> Result<Json<BatchCaptureResponse>, StatusCode> {
     let user_id = get_user_id_from_bearer(&state.db, &headers).await?;
-
-    let content_type = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream");
 
     let interval_id: i64 = headers
         .get("x-interval-id")
@@ -87,54 +92,124 @@ async fn capture(
         .and_then(|v| v.parse().ok())
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    let media_type = if content_type.starts_with("image/") {
-        "image"
-    } else if content_type.starts_with("video/") {
-        "video"
-    } else {
-        return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    };
+    let mut ids = Vec::new();
+    let mut failed = 0usize;
 
-    let now = Utc::now();
-    let day_bucket = now.format("%Y-%m-%d").to_string();
-    let timestamp = now.timestamp_millis();
-    let ext = get_extension(content_type);
+    while let Some(field) = multipart.next_field().await.map_err(|_| StatusCode::BAD_REQUEST)? {
+        let content_type = field
+            .content_type()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    // Path: video/user_123/2025-12-06/1733500000000.mp4
-    // Path: image/user_123/2025-12-06/1733500000000.png
-    let gcs_path = format!(
-        "{}/user_{}/{}/{}.{}",
-        media_type, user_id, day_bucket, timestamp, ext
+        let media_type = if content_type.starts_with("image/") {
+            "image"
+        } else if content_type.starts_with("video/") {
+            "video"
+        } else {
+            eprintln!("[capture_batch] Skipping unsupported content type: {}", content_type);
+            failed += 1;
+            continue;
+        };
+
+        let body = match field.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[capture_batch] Failed to read field bytes: {}", e);
+                failed += 1;
+                continue;
+            }
+        };
+
+        let now = Utc::now();
+        let day_bucket = now.format("%Y-%m-%d").to_string();
+        let timestamp = now.timestamp_millis();
+        let ext = get_extension(&content_type);
+
+        let relative_path = format!(
+            "{}/user_{}/{}/{}.{}",
+            media_type, user_id, day_bucket, timestamp, ext
+        );
+
+        // Write to local storage or GCS
+        let write_result = if let Some(local_path) = &state.local_storage_path {
+            let full_path = local_path.join(&relative_path);
+            if let Some(parent) = full_path.parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    eprintln!("[capture_batch] Failed to create directory {:?}: {}", parent, e);
+                    failed += 1;
+                    continue;
+                }
+            }
+            match tokio::fs::write(&full_path, &body).await {
+                Ok(()) => {
+                    println!("[capture_batch] LOCAL: Saved {} bytes to {:?}", body.len(), full_path);
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("[capture_batch] Failed to write file {:?}: {}", full_path, e);
+                    Err(e)
+                }
+            }
+        } else {
+            let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
+            match state.gcs.write_object(&bucket, &relative_path, body.clone()).send_buffered().await {
+                Ok(_) => {
+                    println!("[capture_batch] GCS: Uploaded to {}", relative_path);
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("[capture_batch] GCS upload failed: {}", e);
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                }
+            }
+        };
+
+        if write_result.is_err() {
+            failed += 1;
+            continue;
+        }
+
+        // Store reference in DB
+        match sqlx::query_as::<_, (i64,)>(
+            r#"
+            INSERT INTO captures (interval_id, user_id, media_type, content_type, gcs_path, captured_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id
+            "#,
+        )
+        .bind(interval_id)
+        .bind(user_id)
+        .bind(media_type)
+        .bind(&content_type)
+        .bind(&relative_path)
+        .bind(now)
+        .fetch_one(&state.db)
+        .await
+        {
+            Ok(row) => {
+                ids.push(row.0);
+            }
+            Err(e) => {
+                eprintln!("[capture_batch] DB insert failed: {}", e);
+                failed += 1;
+            }
+        }
+
+        // Small delay between files to ensure unique timestamps
+        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+    }
+
+    println!(
+        "[capture_batch] Batch complete: {} uploaded, {} failed",
+        ids.len(),
+        failed
     );
 
-    // Upload to GCS
-    let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
-    state
-        .gcs
-        .write_object(&bucket, &gcs_path, body)
-        .send_buffered()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Store reference in DB
-    let row: (i64,) = sqlx::query_as(
-        r#"
-        INSERT INTO captures (interval_id, user_id, media_type, content_type, gcs_path, captured_at)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING id
-        "#,
-    )
-    .bind(interval_id)
-    .bind(user_id)
-    .bind(media_type)
-    .bind(content_type)
-    .bind(&gcs_path)
-    .bind(now)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Json(CaptureResponse { id: row.0 }))
+    Ok(Json(BatchCaptureResponse {
+        ids: ids.clone(),
+        uploaded: ids.len(),
+        failed,
+    }))
 }
 
 async fn activity(
@@ -160,7 +235,7 @@ async fn activity(
 
         sqlx::query(
             r#"
-            INSERT INTO activities (timestamp, interval_id, event_type, application, window)
+            INSERT INTO activities (timestamp, interval_id, event_type, application, "window")
             VALUES ($1, $2, $3, $4, $5)
             "#,
         )
@@ -192,10 +267,15 @@ async fn run_agent(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RunAgentRequest>,
 ) -> Result<Json<RunAgentResponse>, StatusCode> {
+    let gemini = state.gemini.clone().ok_or_else(|| {
+        eprintln!("Agent error: Gemini API key not configured");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
     let tweets = agent::run_collateral_job(
         state.db.clone(),
         state.gcs.clone(),
-        state.gemini.clone(),
+        gemini,
         req.user_id,
     )
     .await
@@ -530,6 +610,13 @@ async fn get_capture_url(
 
     let (gcs_path, content_type) = capture.ok_or(StatusCode::NOT_FOUND)?;
 
+    // If local storage is configured, return a local URL
+    if state.local_storage_path.is_some() {
+        // Return a URL that points to our /media endpoint
+        let url = format!("/media/{}", gcs_path);
+        return Ok(Json(SignedUrlResponse { url, content_type }));
+    }
+
     // Generate signed URL (15 min expiry) using cloud-storage crate
     let client = cloud_storage::Client::default();
     let object = client.object().read(BUCKET_NAME, &gcs_path)
@@ -550,6 +637,53 @@ async fn get_capture_url(
     }))
 }
 
+/// GET /media/*path - Serve local media files
+async fn serve_media(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let local_path = state
+        .local_storage_path
+        .as_ref()
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let full_path = local_path.join(&path);
+
+    // Security: ensure the path doesn't escape the storage directory
+    let canonical = full_path
+        .canonicalize()
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let storage_canonical = local_path
+        .canonicalize()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !canonical.starts_with(&storage_canonical) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Read file
+    let bytes = tokio::fs::read(&canonical)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    // Determine content type from extension
+    let content_type = match canonical.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mov") => "video/quicktime",
+        _ => "application/octet-stream",
+    };
+
+    Ok((
+        [(header::CONTENT_TYPE, content_type)],
+        bytes,
+    ))
+}
+
 /// GET /me - Get current user info
 async fn get_me(
     State(state): State<Arc<AppState>>,
@@ -563,6 +697,108 @@ async fn get_me(
         .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(user))
+}
+
+#[derive(Serialize)]
+struct RecordingLimits {
+    /// Maximum duration of a single recording in seconds
+    max_recording_duration_secs: u64,
+    /// Recording budget per hour in seconds (regenerates over time)
+    recording_budget_secs: u64,
+    /// Inactivity duration before recording stops in seconds
+    inactivity_timeout_secs: u64,
+    /// Total storage limit in bytes for this user's tier
+    storage_limit_bytes: u64,
+    /// Current storage used in bytes
+    storage_used_bytes: u64,
+}
+
+/// GET /me/limits - Get recording limits for the authenticated user (daemon auth)
+async fn get_limits(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<RecordingLimits>, StatusCode> {
+    let user_id = get_user_id_from_bearer(&state.db, &headers).await?;
+
+    // TODO: Look up user's subscription tier and return appropriate limits
+    // For now, use default free tier limits
+    let storage_limit: u64 = 5 * 1024 * 1024 * 1024; // 5 GB
+
+    // Calculate storage usage from actual storage (local folder or GCS)
+    let storage_used = calculate_user_storage(&state, user_id).await;
+
+    Ok(Json(RecordingLimits {
+        max_recording_duration_secs: 5 * 60,   // 5 minutes
+        recording_budget_secs: 30 * 60,        // 30 minutes per hour
+        inactivity_timeout_secs: 30,           // 30 seconds of inactivity
+        storage_limit_bytes: storage_limit,
+        storage_used_bytes: storage_used,
+    }))
+}
+
+/// Calculate total storage used by a user from local folder or GCS
+async fn calculate_user_storage(state: &AppState, user_id: i64) -> u64 {
+    if let Some(local_path) = &state.local_storage_path {
+        // Calculate from local filesystem
+        calculate_local_storage(local_path, user_id).await
+    } else {
+        // Calculate from GCS - list objects with user prefix and sum sizes
+        calculate_gcs_storage(&state.gcs, user_id).await
+    }
+}
+
+async fn calculate_local_storage(base_path: &std::path::Path, user_id: i64) -> u64 {
+    let mut total: u64 = 0;
+
+    // Check both image and video directories
+    for media_type in ["image", "video"] {
+        let user_dir = base_path.join(format!("{}/user_{}", media_type, user_id));
+        if let Ok(entries) = std::fs::read_dir(&user_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    // Day bucket directory
+                    if let Ok(files) = std::fs::read_dir(entry.path()) {
+                        for file in files.flatten() {
+                            if let Ok(meta) = file.metadata() {
+                                total += meta.len();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    total
+}
+
+async fn calculate_gcs_storage(_gcs: &Storage, user_id: i64) -> u64 {
+    use futures::{StreamExt, pin_mut};
+
+    // Use cloud-storage crate for listing (same one used for signed URLs)
+    let client = cloud_storage::Client::default();
+    let mut total: u64 = 0;
+
+    for media_type in ["image", "video"] {
+        let prefix = format!("{}/user_{}/", media_type, user_id);
+        let request = cloud_storage::ListRequest {
+            prefix: Some(prefix),
+            ..Default::default()
+        };
+
+        if let Ok(stream) = client.object().list(BUCKET_NAME, request).await {
+            pin_mut!(stream);
+            while let Some(result) = stream.next().await {
+                if let Ok(object_list) = result {
+                    for obj in object_list.items {
+                        total += obj.size;
+                    }
+                }
+            }
+        }
+    }
+
+    total
 }
 
 #[derive(Serialize)]
@@ -642,10 +878,17 @@ async fn main() {
         .await
         .expect("Failed to create GCS client");
 
-    // Gemini client for File API operations
-    let gemini_api_key =
-        std::env::var("GOOGLE_GEMINI_API_KEY").expect("GOOGLE_GEMINI_API_KEY must be set");
-    let gemini = GoogleGenAIClient::new(&gemini_api_key, "gemini-2.0-flash");
+    // Gemini client for File API operations (optional - if not set, background agent is disabled)
+    let gemini = match std::env::var("GOOGLE_GEMINI_API_KEY") {
+        Ok(key) => {
+            println!("[startup] Gemini API key found, AI agent enabled");
+            Some(GoogleGenAIClient::new(&key, "gemini-2.0-flash"))
+        }
+        Err(_) => {
+            println!("[startup] GOOGLE_GEMINI_API_KEY not set, AI agent disabled");
+            None
+        }
+    };
 
     // Twitter OAuth 2.0 client
     let twitter_client_id =
@@ -660,25 +903,38 @@ async fn main() {
         &twitter_redirect_uri,
     );
 
+    // Optional local storage path - if set, captures are saved locally instead of GCS
+    let local_storage_path = std::env::var("LOCAL_STORAGE_PATH").ok().map(PathBuf::from);
+    if let Some(ref path) = local_storage_path {
+        println!("[startup] LOCAL_STORAGE_PATH set: {:?}", path);
+        println!("[startup] Captures will be saved locally instead of GCS");
+    }
+
     let state = Arc::new(AppState {
         db: pool.clone(),
         gcs: gcs.clone(),
         gemini: gemini.clone(),
         twitter,
+        local_storage_path,
     });
 
-    // Start background scheduler for idle user processing
-    // Checks every 5 minutes for users idle for 30+ minutes
-    tokio::spawn(agent::start_background_scheduler(
-        pool, gcs, gemini, 1,  // idle_minutes
-        30, // check_interval_secs (5 min)
-    ));
+    // Start background scheduler for idle user processing (only if Gemini is configured)
+    if let Some(gemini_client) = gemini {
+        // Checks every 5 minutes for users idle for 30+ minutes
+        tokio::spawn(agent::start_background_scheduler(
+            pool, gcs, gemini_client, 1,  // idle_minutes
+            30, // check_interval_secs (5 min)
+        ));
+        println!("[scheduler] Background scheduler started (30min idle, 5min check)");
+    } else {
+        println!("[scheduler] Background scheduler DISABLED (no Gemini API key)");
+    }
 
     let app = Router::new()
         // Health
         .route("/health", get(health))
         // Capture & Activity
-        .route("/capture", post(capture))
+        .route("/captures/batch", post(capture_batch))
         .route("/activity", post(activity))
         // Agent
         .route("/agent/run", post(run_agent))
@@ -687,9 +943,12 @@ async fn main() {
         .route("/auth/twitter/token", post(auth_twitter_token))
         // User
         .route("/me", get(get_me))
+        .route("/me/limits", get(get_limits))
         .route("/me/token", get(get_api_token).post(generate_api_token))
         // Captures
         .route("/captures/{id}/url", get(get_capture_url))
+        // Local media serving (when LOCAL_STORAGE_PATH is set)
+        .route("/media/{*path}", get(serve_media))
         // Tweets
         .route("/tweets", get(list_tweets))
         .route("/tweets/{id}/post", post(post_tweet))
@@ -704,6 +963,5 @@ async fn main() {
         .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", addr, e));
 
     println!("Listening on http://{}", addr);
-    println!("[scheduler] Background scheduler started (30min idle, 5min check)");
     axum::serve(listener, app).await.expect("Server failed");
 }
