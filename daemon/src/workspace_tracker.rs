@@ -1,22 +1,23 @@
-use std::ffi::{CStr, c_void};
-use std::os::raw::c_char;
+use std::ffi::c_void;
 use std::ptr;
 use std::sync::OnceLock;
 
 use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
 use log::info;
-use objc::declare::ClassDecl;
-use objc::runtime::{Class, Object, Sel};
-use objc::{class, msg_send, sel, sel_impl};
-use objc_id::ShareId;
+use objc2::declare::ClassBuilder;
+use objc2::rc::Retained;
+use objc2::runtime::{AnyClass, AnyObject, Sel};
+use objc2::{msg_send, sel, ClassType};
+use objc2_app_kit::NSWorkspace;
+use objc2_foundation::{NSObject, NSString};
 
 use crate::accessibility::ActiveWindowInfo;
 
 type Callback = Box<dyn Fn(ActiveWindowInfo) + 'static>;
 
 pub struct WorkspaceTracker {
-    observer: ShareId<Object>,
+    observer: Retained<AnyObject>,
     state: *mut WorkspaceState,
 }
 
@@ -66,9 +67,9 @@ impl WorkspaceTracker {
 impl Drop for WorkspaceTracker {
     fn drop(&mut self) {
         unsafe {
-            let workspace: ObjcId = msg_send![class!(NSWorkspace), sharedWorkspace];
-            let center: ObjcId = msg_send![workspace, notificationCenter];
-            let _: () = msg_send![center, removeObserver:&*self.observer];
+            let workspace = NSWorkspace::sharedWorkspace();
+            let center = workspace.notificationCenter();
+            let _: () = msg_send![&center, removeObserver: &*self.observer];
             CFRelease((*self.state).system_element as CFTypeRef);
             drop(Box::from_raw(self.state));
         }
@@ -101,40 +102,39 @@ impl WorkspaceState {
 
 unsafe fn register_workspace_observer(
     state: *mut WorkspaceState,
-) -> Result<ShareId<Object>, WorkspaceTrackerError> {
+) -> Result<Retained<AnyObject>, WorkspaceTrackerError> {
     let cls = workspace_observer_class();
-    let observer: ObjcId = msg_send![cls, new];
+    let observer: *mut AnyObject = msg_send![cls, new];
     if observer.is_null() {
         return Err(WorkspaceTrackerError::ObserverUnavailable);
     }
+
+    // Set the ivar
     unsafe {
-        (*observer).set_ivar("cleoWorkspaceState", state as *mut c_void);
+        let ivar = (*cls).instance_variable(c"cleoWorkspaceState").unwrap();
+        let ptr = ivar.load_ptr::<*mut c_void>(&*observer);
+        *ptr = state as *mut c_void;
     }
 
-    let workspace: ObjcId = msg_send![class!(NSWorkspace), sharedWorkspace];
-    if workspace.is_null() {
-        let _: () = msg_send![observer, release];
-        return Err(WorkspaceTrackerError::ObserverUnavailable);
-    }
-    let center: ObjcId = msg_send![workspace, notificationCenter];
-    let name = workspace_did_activate_notification() as ObjcId;
-    let _: () = msg_send![center,
-        addObserver: observer
-        selector: sel!(handleWorkspaceActivation:)
-        name: name
-        object: ptr::null_mut::<Object>()
+    let workspace = NSWorkspace::sharedWorkspace();
+    let center = workspace.notificationCenter();
+    let name = NSString::from_str("NSWorkspaceDidActivateApplicationNotification");
+    let _: () = msg_send![
+        &center,
+        addObserver: observer,
+        selector: sel!(handleWorkspaceActivation:),
+        name: &*name,
+        object: ptr::null::<AnyObject>()
     ];
-    Ok(unsafe { ShareId::from_ptr(observer) })
+    Ok(unsafe { Retained::retain(observer).unwrap() })
 }
 
 fn frontmost_app_name() -> Option<String> {
     unsafe {
-        let workspace: ObjcId = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let app: ObjcId = msg_send![workspace, frontmostApplication];
-        if app.is_null() {
-            return None;
-        }
-        nsstring_to_string(app)
+        let workspace = NSWorkspace::sharedWorkspace();
+        let app = workspace.frontmostApplication()?;
+        let name = app.localizedName()?;
+        Some(name.to_string())
     }
 }
 
@@ -170,56 +170,38 @@ fn copy_attribute_string(element: AXUIElementRef, attribute: CFStringRef) -> Opt
     Some(string.to_string())
 }
 
-unsafe fn nsstring_to_string(obj: ObjcId) -> Option<String> {
-    if obj.is_null() {
-        return None;
-    }
-    let localized: ObjcId = msg_send![obj, localizedName];
-    if localized.is_null() {
-        return None;
-    }
-    let c_str: *const c_char = msg_send![localized, UTF8String];
-    if c_str.is_null() {
-        return None;
-    }
-    Some(
-        unsafe { CStr::from_ptr(c_str) }
-            .to_string_lossy()
-            .into_owned(),
-    )
-}
-
-fn workspace_observer_class() -> &'static Class {
-    static CLASS: OnceLock<&'static Class> = OnceLock::new();
+fn workspace_observer_class() -> &'static AnyClass {
+    static CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
     CLASS.get_or_init(|| {
-        let superclass = class!(NSObject);
-        let mut decl =
-            ClassDecl::new("CleoWorkspaceActivationObserver", superclass).expect("class");
-        decl.add_ivar::<*mut c_void>("cleoWorkspaceState");
-        extern "C" fn handle_workspace_activation(this: &mut Object, _: Sel, _: ObjcId) {
+        let superclass = NSObject::class();
+        let mut builder =
+            ClassBuilder::new(c"CleoWorkspaceActivationObserver", superclass).expect("class");
+        builder.add_ivar::<*mut c_void>(c"cleoWorkspaceState");
+
+        unsafe extern "C" fn handle_workspace_activation(
+            this: *mut AnyObject,
+            _: Sel,
+            _: *mut AnyObject,
+        ) {
             unsafe {
-                let state_ptr =
-                    *this.get_ivar::<*mut c_void>("cleoWorkspaceState") as *mut WorkspaceState;
+                let cls = (*this).class();
+                let ivar = cls.instance_variable(c"cleoWorkspaceState").unwrap();
+                let state_ptr = *ivar.load_ptr::<*mut c_void>(&*this) as *mut WorkspaceState;
                 if !state_ptr.is_null() {
                     (*state_ptr).handle_activation();
                 }
             }
         }
+
         unsafe {
-            decl.add_method(
+            builder.add_method(
                 sel!(handleWorkspaceActivation:),
-                handle_workspace_activation as extern "C" fn(&mut Object, Sel, ObjcId),
+                handle_workspace_activation
+                    as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
             );
         }
-        decl.register()
+        builder.register()
     })
-}
-
-fn workspace_did_activate_notification() -> CFStringRef {
-    static VALUE: OnceLock<StaticCFString> = OnceLock::new();
-    VALUE
-        .get_or_init(|| StaticCFString::from_str("NSWorkspaceDidActivateApplicationNotification"))
-        .0
 }
 
 fn ax_focused_window_attribute() -> CFStringRef {
@@ -252,7 +234,6 @@ const KAX_ERROR_SUCCESS: AXError = 0;
 
 type AXError = i32;
 type AXUIElementRef = *mut c_void;
-type ObjcId = *mut Object;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {

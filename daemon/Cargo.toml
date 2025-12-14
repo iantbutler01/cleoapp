@@ -4,9 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cacao = "0.4.0-beta2"
-objc = "0.2"
-objc_id = "0.1"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSRunningApplication", "NSWorkspace", "NSEvent", "NSPanel", "NSWindow", "NSView", "NSTextField", "NSImageView", "NSImage", "NSBox", "NSColor", "NSFont", "NSVisualEffectView", "NSMenu", "NSMenuItem", "NSAlert", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSResponder", "NSControl", "NSText", "block2", "objc2-quartz-core"] }
+objc2-quartz-core = { version = "0.3", features = ["CALayer", "objc2-core-graphics"] }
+objc2-core-graphics = { version = "0.3", features = ["CGColor", "CGColorSpace"] }
+objc2-core-foundation = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 reqwest = { version = "0.12", features = ["blocking", "json", "multipart"] }
 serde = { version = "1", features = ["derive"] }
@@ -17,7 +22,6 @@ core-foundation = "0.9"
 libc = "0.2"
 log = "0.4"
 oslog = "0.2"
-block = "0.1"
 url = "2"
 dirs = "5"
 

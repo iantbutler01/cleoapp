@@ -1,19 +1,10 @@
 use std::fmt;
 
-use block::{ConcreteBlock, RcBlock};
-use objc::runtime::Object;
-use objc::{class, msg_send, sel, sel_impl};
-use objc_id::ShareId;
-
-const NSEVENT_TYPE_LEFT_MOUSE_DOWN: u64 = 1;
-const NSEVENT_TYPE_RIGHT_MOUSE_DOWN: u64 = 3;
-const NSEVENT_TYPE_OTHER_MOUSE_DOWN: u64 = 25;
-
-fn mouse_down_mask() -> u64 {
-    (1 << NSEVENT_TYPE_LEFT_MOUSE_DOWN)
-        | (1 << NSEVENT_TYPE_RIGHT_MOUSE_DOWN)
-        | (1 << NSEVENT_TYPE_OTHER_MOUSE_DOWN)
-}
+use block2::RcBlock;
+use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
+use objc2::{msg_send, ClassType};
+use objc2_app_kit::{NSEvent, NSEventMask};
 
 #[derive(Debug)]
 pub enum MouseTrackerError {
@@ -33,8 +24,8 @@ impl fmt::Display for MouseTrackerError {
 impl std::error::Error for MouseTrackerError {}
 
 pub struct MouseTracker {
-    monitor: ShareId<Object>,
-    _handler: RcBlock<(*mut Object,), ()>,
+    monitor: Retained<AnyObject>,
+    _handler: RcBlock<dyn Fn(*mut AnyObject)>,
 }
 
 impl MouseTracker {
@@ -42,16 +33,15 @@ impl MouseTracker {
     where
         F: Fn() + Send + 'static,
     {
-        let block = ConcreteBlock::new(move |_event: *mut Object| {
+        let block = RcBlock::new(move |_event: *mut AnyObject| {
             handler();
-        })
-        .copy();
+        });
 
-        let mask = mouse_down_mask();
-        let monitor: *mut Object = unsafe {
+        let mask = NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::OtherMouseDown;
+        let monitor: *mut AnyObject = unsafe {
             msg_send![
-                class!(NSEvent),
-                addGlobalMonitorForEventsMatchingMask: mask
+                NSEvent::class(),
+                addGlobalMonitorForEventsMatchingMask: mask,
                 handler: &*block
             ]
         };
@@ -61,7 +51,7 @@ impl MouseTracker {
         }
 
         Ok(Self {
-            monitor: unsafe { ShareId::from_ptr(monitor) },
+            monitor: unsafe { Retained::retain(monitor).unwrap() },
             _handler: block,
         })
     }
@@ -70,7 +60,7 @@ impl MouseTracker {
 impl Drop for MouseTracker {
     fn drop(&mut self) {
         unsafe {
-            let _: () = msg_send![class!(NSEvent), removeMonitor:&*self.monitor];
+            let _: () = msg_send![NSEvent::class(), removeMonitor: &*self.monitor];
         }
     }
 }

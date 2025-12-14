@@ -1,7 +1,6 @@
-#![allow(unexpected_cfgs)] // objc macros reference cfg(cargo-clippy) internally
-
 mod accessibility;
 mod api;
+mod app;
 mod command_palette;
 mod content_filter;
 mod idle;
@@ -36,16 +35,15 @@ struct BurstAction {
     kind: BurstActionKind,
 }
 
-use cacao::appkit::menu::{Menu, MenuItem};
-use cacao::appkit::{App, AppDelegate};
-use cacao::foundation::{NO, NSString, YES, id};
-use cacao::image::{Image, SFSymbol};
-use cacao::notification_center::Dispatcher;
 use chrono::{Local, Utc};
 use log::{debug, error, info, warn};
-use objc::runtime::Object;
-use objc::{class, msg_send, sel, sel_impl};
-use objc_id::ShareId;
+use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
+use objc2::{sel, MainThreadOnly};
+use objc2_app_kit::{
+    NSAlert, NSAlertStyle, NSApplication, NSMenu, NSMenuItem, NSTextField,
+};
+use objc2_foundation::{MainThreadMarker, NSString};
 use png::{BitDepth, ColorType, Encoder, EncodingError};
 use screencapturekit::error::SCError;
 use screencapturekit::prelude::*;
@@ -61,14 +59,14 @@ use image_hasher::{HashAlg, HasherConfig, ImageHash};
 
 use crate::accessibility::{ActiveWindowInfo, check_accessibility_trusted};
 use crate::api::{ActivityEntry, ActivityEvent, ApiClient, ApiError, ImageFormat, VideoFormat};
+use crate::app::{App, MenuBuilder, MenuItemHandle, StatusItem, terminate};
 use crate::command_palette::{CommandPalette, HotkeyTracker, PaletteCommand};
-use crate::content_filter::{ContentFilter, NsfwFilter, NoOpFilter};
+use crate::content_filter::{ContentFilter, NoOpFilter, NsfwFilter};
 use crate::interval::current_interval_id;
 use crate::keyboard_tracker::KeyboardTracker;
 use crate::mouse_tracker::MouseTracker;
 use crate::workspace_tracker::WorkspaceTracker;
 
-const NS_VARIABLE_STATUS_ITEM_LENGTH: f64 = -1.0;
 const API_BASE_ENV: &str = "CLEO_CAPTURE_API_URL";
 const DEFAULT_API_BASE: &str = "http://localhost:3000";
 const SCREENSHOT_INTERVAL_SECS: u64 = 5;
@@ -154,13 +152,121 @@ impl PrivacySettings {
         }
 
         // If pattern ends with *, we're done; otherwise text must end here
-        parts.last().map_or(true, |p| p.is_empty() || pos == text.len())
+        parts
+            .last()
+            .map_or(true, |p| p.is_empty() || pos == text.len())
     }
+}
+
+/// Message type for dispatching events to main thread
+#[derive(Copy, Clone)]
+enum AppMessage {
+    ToggleRecording,
+    TakeScreenshot,
+    MouseClick,
+    Keypress,
+    AutoStopRecording,
+    MaxDurationReached,
+    RefreshLimits,
+    FlushActivity,
+    SetApiToken,
+    ShowCommandPalette,
+    HideCommandPalette,
+    ToggleCaptureMode,
+    PollHotkey,
+    PaletteKey { key_code: u16 },
+}
+
+/// Dispatch a message to the main thread using GCD
+fn dispatch_main(message: AppMessage) {
+    if MainThreadMarker::new().is_some() {
+        // Already on main thread, process directly
+        DAEMON.with(|d| {
+            if let Some(ref daemon) = *d.borrow() {
+                daemon.on_message(message);
+            }
+        });
+    } else {
+        // Dispatch to main queue
+        dispatch2::Queue::main().exec_async(move || {
+            DAEMON.with(|d| {
+                if let Some(ref daemon) = *d.borrow() {
+                    daemon.on_message(message);
+                }
+            });
+        });
+    }
+}
+
+thread_local! {
+    static DAEMON: RefCell<Option<CleoDaemon>> = const { RefCell::new(None) };
+}
+
+fn main() {
+    logging::init();
+
+    // Get main thread marker
+    let mtm = MainThreadMarker::new().expect("Must run on main thread");
+
+    // Create the app
+    let app = App::new(mtm);
+
+    // Set up callbacks
+    app.on_did_finish_launching({
+        move || {
+            info!("Launching Cleo Daemon");
+
+            // Request accessibility permissions (will prompt user if not already granted)
+            if !check_accessibility_trusted(true) {
+                warn!("Accessibility permissions not granted - activity tracking will be limited");
+            } else {
+                info!("Accessibility permissions granted");
+            }
+
+            DAEMON.with(|d| {
+                let mut daemon = CleoDaemon::new();
+                daemon.initialize(mtm);
+                d.replace(Some(daemon));
+            });
+            info!("Cleo Daemon started");
+        }
+    });
+
+    app.on_will_terminate({
+        move || {
+            DAEMON.with(|d| {
+                if let Some(ref mut daemon) = *d.borrow_mut() {
+                    daemon.shutdown();
+                }
+            });
+        }
+    });
+
+    app.on_open_urls({
+        move |urls| {
+            DAEMON.with(|d| {
+                if let Some(ref daemon) = *d.borrow() {
+                    for url in urls {
+                        let url_text = url.to_string();
+                        if let Err(err) = daemon.handle_deep_link(url) {
+                            error!("Failed to handle URL {url_text}: {err}");
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    info!("Starting Cleo Daemon");
+
+    // Run the application event loop (like cacao did)
+    app.run();
 }
 
 struct CleoDaemon {
     status_item: RefCell<Option<StatusItem>>,
     menu_handles: RefCell<Option<MenuHandles>>,
+    menu_targets: RefCell<Vec<Retained<AnyObject>>>,
     recorder: RefCell<Option<ScreenRecorder>>,
     logging_daemon: RefCell<Option<LoggingDaemon>>,
     batch_uploader: RefCell<Option<BatchUploader>>,
@@ -184,13 +290,14 @@ struct CleoDaemon {
     privacy_settings: RefCell<PrivacySettings>,
 }
 
-impl Default for CleoDaemon {
-    fn default() -> Self {
-        eprintln!("[DEBUG] CleoDaemon::default() starting");
+impl CleoDaemon {
+    fn new() -> Self {
+        eprintln!("[DEBUG] CleoDaemon::new() starting");
 
         Self {
             status_item: RefCell::new(None),
             menu_handles: RefCell::new(None),
+            menu_targets: RefCell::new(Vec::new()),
             recorder: RefCell::new(None),
             logging_daemon: RefCell::new(None),
             batch_uploader: RefCell::new(None),
@@ -214,30 +321,44 @@ impl Default for CleoDaemon {
             privacy_settings: RefCell::new(PrivacySettings::default()),
         }
     }
-}
 
-#[derive(Copy, Clone)]
-enum AppMessage {
-    ToggleRecording,
-    TakeScreenshot,
-    MouseClick,
-    Keypress,
-    AutoStopRecording,
-    MaxDurationReached,
-    RefreshLimits,
-    FlushActivity,
-    SetApiToken,
-    ShowCommandPalette,
-    HideCommandPalette,
-    ToggleCaptureMode,
-    PollHotkey,
-    PaletteKey { key_code: u16 },
-}
+    fn initialize(&mut self, mtm: MainThreadMarker) {
+        let (menu, handles, targets) = build_status_menu(mtm);
+        handles.set_recording(false);
+        self.menu_handles.replace(Some(handles));
+        self.menu_targets.replace(targets);
 
-impl Dispatcher for CleoDaemon {
-    type Message = AppMessage;
+        let status_item = StatusItem::new(mtm, "message.fill", "Cleo Screen Recorder", menu);
+        self.status_item.replace(Some(status_item));
 
-    fn on_ui_message(&self, message: Self::Message) {
+        self.logging_daemon.replace(Some(LoggingDaemon::start()));
+        self.batch_uploader.replace(Some(BatchUploader::start()));
+        self.load_privacy_settings();
+        self.ensure_api_client();
+        self.start_activity_tracking();
+        self.start_mouse_tracking();
+        self.start_keyboard_tracking();
+        self.start_screenshot_timer();
+        self.start_activity_flush_timer();
+        self.start_limits_refresh_timer();
+        self.start_command_palette();
+    }
+
+    fn shutdown(&mut self) {
+        self.stop_recording();
+        self.stop_logging_daemon();
+        self.stop_batch_uploader();
+        self.stop_tracker();
+        self.stop_mouse_tracking();
+        self.stop_keyboard_tracking();
+        self.stop_command_palette();
+        self.stop_screenshot_timer();
+        self.stop_activity_flush_timer();
+        self.stop_limits_refresh_timer();
+        self.flush_activity_events();
+    }
+
+    fn on_message(&self, message: AppMessage) {
         match message {
             AppMessage::ToggleRecording => {
                 if self.recorder.borrow().is_some() {
@@ -266,68 +387,7 @@ impl Dispatcher for CleoDaemon {
             AppMessage::PaletteKey { key_code } => self.handle_palette_key(key_code),
         }
     }
-}
 
-impl AppDelegate for CleoDaemon {
-    fn did_finish_launching(&self) {
-        eprintln!("[DEBUG] did_finish_launching() called");
-        info!("Launching Cleo Daemon");
-        set_accessory_activation_policy();
-
-        // Request accessibility permissions (will prompt user if not already granted)
-        if !check_accessibility_trusted(true) {
-            warn!("Accessibility permissions not granted - activity tracking will be limited");
-        } else {
-            info!("Accessibility permissions granted");
-        }
-
-        let (menu, handles) = build_status_menu();
-        handles.set_recording(false);
-        self.menu_handles.replace(Some(handles));
-
-        let icon = Image::symbol(SFSymbol::MessageFill, "Screen capture menu bar icon");
-        let status_item = StatusItem::new(icon, menu);
-        self.status_item.replace(Some(status_item));
-
-        self.logging_daemon.replace(Some(LoggingDaemon::start()));
-        self.batch_uploader.replace(Some(BatchUploader::start()));
-        self.load_privacy_settings();
-        self.ensure_api_client();
-        self.start_activity_tracking();
-        self.start_mouse_tracking();
-        self.start_keyboard_tracking();
-        self.start_screenshot_timer();
-        self.start_activity_flush_timer();
-        self.start_limits_refresh_timer();
-        self.start_command_palette();
-        info!("Cleo Daemon started");
-    }
-
-    fn open_urls(&self, urls: Vec<Url>) {
-        for url in urls {
-            let url_text = url.to_string();
-            if let Err(err) = self.handle_deep_link(url) {
-                error!("Failed to handle URL {url_text}: {err}");
-            }
-        }
-    }
-
-    fn will_terminate(&self) {
-        self.stop_recording();
-        self.stop_logging_daemon();
-        self.stop_batch_uploader();
-        self.stop_tracker();
-        self.stop_mouse_tracking();
-        self.stop_keyboard_tracking();
-        self.stop_command_palette();
-        self.stop_screenshot_timer();
-        self.stop_activity_flush_timer();
-        self.stop_limits_refresh_timer();
-        self.flush_activity_events();
-    }
-}
-
-impl CleoDaemon {
     fn start_recording(&self) {
         if self.recorder.borrow().is_some() {
             warn!("Recording already in progress");
@@ -373,7 +433,10 @@ impl CleoDaemon {
         }
         // Skip screenshot if user is idle
         if idle::is_idle(IDLE_THRESHOLD_SECS) {
-            debug!("Skipping screenshot - user idle for {:.0}s", idle::seconds_since_last_input());
+            debug!(
+                "Skipping screenshot - user idle for {:.0}s",
+                idle::seconds_since_last_input()
+            );
             return;
         }
         let privacy = self.privacy_settings.borrow().clone();
@@ -399,11 +462,14 @@ impl CleoDaemon {
     }
 
     fn start_activity_tracking(&self) {
-        let this = self as *const CleoDaemon;
-        let handler = move |info: ActiveWindowInfo| unsafe {
-            if let Some(app) = this.as_ref() {
-                app.record_focus_event(info);
-            }
+        // Use thread_local DAEMON to call record_focus_event directly
+        // The handler runs on the main thread via accessibility notifications
+        let handler = move |info: ActiveWindowInfo| {
+            DAEMON.with(|d| {
+                if let Some(ref daemon) = *d.borrow() {
+                    daemon.record_focus_event(info);
+                }
+            });
         };
 
         match WorkspaceTracker::start(handler) {
@@ -431,7 +497,7 @@ impl CleoDaemon {
         if self.mouse_tracker.borrow().is_some() {
             return;
         }
-        let handler = || App::<CleoDaemon, AppMessage>::dispatch_main(AppMessage::MouseClick);
+        let handler = || dispatch_main(AppMessage::MouseClick);
         match MouseTracker::start(handler) {
             Ok(tracker) => {
                 info!("Mouse tracker started");
@@ -458,7 +524,7 @@ impl CleoDaemon {
         if self.keyboard_tracker.borrow().is_some() {
             return;
         }
-        let handler = || App::<CleoDaemon, AppMessage>::dispatch_main(AppMessage::Keypress);
+        let handler = || dispatch_main(AppMessage::Keypress);
         match KeyboardTracker::start(handler) {
             Ok(tracker) => {
                 info!("Keyboard tracker started");
@@ -500,7 +566,7 @@ impl CleoDaemon {
 
         // Start polling timer for hotkey events (poll every 50ms for responsiveness)
         let task = RepeatingTask::start(Duration::from_millis(50), || {
-            App::<CleoDaemon, AppMessage>::dispatch_main(AppMessage::PollHotkey);
+            dispatch_main(AppMessage::PollHotkey);
         });
         self.hotkey_poll_task.replace(Some(task));
     }
@@ -515,9 +581,7 @@ impl CleoDaemon {
         // Hide palette if it lost key window status (user clicked elsewhere)
         if let Some(palette) = self.command_palette.borrow().as_ref() {
             if palette.is_visible() {
-                let is_key: bool = unsafe {
-                    msg_send![palette.panel_ptr(), isKeyWindow]
-                };
+                let is_key = palette.panel_ptr().isKeyWindow();
                 if !is_key {
                     palette.hide();
                 }
@@ -552,7 +616,7 @@ impl CleoDaemon {
 
             // Install local keyboard monitor AFTER show() since show() uninstalls stale monitors
             palette.install_local_monitor(|key_code| {
-                App::<CleoDaemon, AppMessage>::dispatch_main(AppMessage::PaletteKey { key_code });
+                dispatch_main(AppMessage::PaletteKey { key_code });
             });
 
             info!("Command palette shown");
@@ -689,7 +753,7 @@ impl CleoDaemon {
             return;
         }
         let task = RepeatingTask::start(Duration::from_secs(SCREENSHOT_INTERVAL_SECS), || {
-            App::<CleoDaemon, AppMessage>::dispatch_main(AppMessage::TakeScreenshot);
+            dispatch_main(AppMessage::TakeScreenshot);
         });
         self.screenshot_task.replace(Some(task));
     }
@@ -703,7 +767,7 @@ impl CleoDaemon {
             return;
         }
         let task = RepeatingTask::start(Duration::from_secs(ACTIVITY_FLUSH_INTERVAL_SECS), || {
-            App::<CleoDaemon, AppMessage>::dispatch_main(AppMessage::FlushActivity);
+            dispatch_main(AppMessage::FlushActivity);
         });
         self.activity_flush_task.replace(Some(task));
     }
@@ -717,7 +781,7 @@ impl CleoDaemon {
             return;
         }
         let task = RepeatingTask::start(Duration::from_secs(LIMITS_REFRESH_INTERVAL_SECS), || {
-            App::<CleoDaemon, AppMessage>::dispatch_main(AppMessage::RefreshLimits);
+            dispatch_main(AppMessage::RefreshLimits);
         });
         self.limits_refresh_task.replace(Some(task));
     }
@@ -762,8 +826,15 @@ impl CleoDaemon {
             0 // Already in a burst, any action extends
         };
 
-        if window.len() >= burst_threshold && self.recorder.borrow().is_none() && self.auto_capture_enabled.get() {
-            eprintln!("[recording] Automatic recording triggered by activity burst ({} events in {}s window)", window.len(), BURST_WINDOW_SECS);
+        if window.len() >= burst_threshold
+            && self.recorder.borrow().is_none()
+            && self.auto_capture_enabled.get()
+        {
+            eprintln!(
+                "[recording] Automatic recording triggered by activity burst ({} events in {}s window)",
+                window.len(),
+                BURST_WINDOW_SECS
+            );
             self.start_recording();
         }
     }
@@ -785,7 +856,7 @@ impl CleoDaemon {
             );
         }
         let task = DelayedTask::schedule(Duration::from_secs(AUTO_RECORDING_TAIL_SECS), || {
-            App::<CleoDaemon, AppMessage>::dispatch_main(AppMessage::AutoStopRecording);
+            dispatch_main(AppMessage::AutoStopRecording);
         });
         slot.replace(task);
     }
@@ -821,7 +892,9 @@ impl CleoDaemon {
         }
 
         // Get max duration from limits (fall back to constant if not fetched)
-        let max_secs = self.recording_limits.borrow()
+        let max_secs = self
+            .recording_limits
+            .borrow()
             .as_ref()
             .map(|l| l.max_recording_duration_secs)
             .unwrap_or(MAX_RECORDING_DURATION_SECS);
@@ -829,7 +902,7 @@ impl CleoDaemon {
         info!("Max recording duration set to {}s", max_secs);
 
         let task = DelayedTask::schedule(Duration::from_secs(max_secs), || {
-            App::<CleoDaemon, AppMessage>::dispatch_main(AppMessage::MaxDurationReached);
+            dispatch_main(AppMessage::MaxDurationReached);
         });
         self.max_duration_task.borrow_mut().replace(task);
     }
@@ -878,10 +951,6 @@ impl CleoDaemon {
         }
     }
 
-    fn is_capture_blocked(&self, app_name: &str, bundle_id: &str, window_title: &str) -> bool {
-        self.privacy_settings.borrow().should_block(app_name, bundle_id, window_title)
-    }
-
     fn handle_deep_link(&self, url: Url) -> Result<(), CaptureError> {
         if !url.scheme().eq_ignore_ascii_case("cleo") {
             warn!("Ignoring unsupported URL {}", url);
@@ -905,153 +974,161 @@ impl CleoDaemon {
     }
 
     fn show_api_token_dialog(&self) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            error!("show_api_token_dialog must be called on main thread");
+            return;
+        };
+
         unsafe {
             // Add Edit menu temporarily so Cmd+V paste works
-            let app: id = msg_send![class!(NSApplication), sharedApplication];
-            let main_menu: id = msg_send![app, mainMenu];
-            let had_menu = !main_menu.is_null();
+            let app = NSApplication::sharedApplication(mtm);
+            let main_menu = app.mainMenu();
+            let had_menu = main_menu.is_some();
 
             // Create main menu if needed
-            let menu_bar: id = if had_menu {
-                main_menu
+            let menu_bar = if let Some(menu) = main_menu {
+                menu
             } else {
-                let m: id = msg_send![class!(NSMenu), new];
-                let _: () = msg_send![app, setMainMenu: m];
+                let m = NSMenu::new(mtm);
+                app.setMainMenu(Some(&m));
                 m
             };
 
             // Create Edit menu with standard items
-            let edit_title = NSString::new("Edit");
-            let edit_menu: id = msg_send![class!(NSMenu), alloc];
-            let edit_menu: id = msg_send![edit_menu, initWithTitle:&*edit_title];
+            let edit_title = NSString::from_str("Edit");
+            let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &edit_title);
 
             // Add Paste item (Cmd+V)
-            let paste_title = NSString::new("Paste");
-            let paste_key = NSString::new("v");
-            let paste_item: id = msg_send![class!(NSMenuItem), alloc];
-            let paste_sel = objc::runtime::Sel::register("paste:");
-            let paste_item: id = msg_send![paste_item, initWithTitle:&*paste_title action:paste_sel keyEquivalent:&*paste_key];
-            let _: () = msg_send![edit_menu, addItem: paste_item];
+            let paste_title = NSString::from_str("Paste");
+            let paste_key = NSString::from_str("v");
+            let paste_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &paste_title,
+                Some(sel!(paste:)),
+                &paste_key,
+            );
+            edit_menu.addItem(&paste_item);
 
             // Add Cut item (Cmd+X)
-            let cut_title = NSString::new("Cut");
-            let cut_key = NSString::new("x");
-            let cut_item: id = msg_send![class!(NSMenuItem), alloc];
-            let cut_sel = objc::runtime::Sel::register("cut:");
-            let cut_item: id = msg_send![cut_item, initWithTitle:&*cut_title action:cut_sel keyEquivalent:&*cut_key];
-            let _: () = msg_send![edit_menu, addItem: cut_item];
+            let cut_title = NSString::from_str("Cut");
+            let cut_key = NSString::from_str("x");
+            let cut_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &cut_title,
+                Some(sel!(cut:)),
+                &cut_key,
+            );
+            edit_menu.addItem(&cut_item);
 
             // Add Copy item (Cmd+C)
-            let copy_title = NSString::new("Copy");
-            let copy_key = NSString::new("c");
-            let copy_item: id = msg_send![class!(NSMenuItem), alloc];
-            let copy_sel = objc::runtime::Sel::register("copy:");
-            let copy_item: id = msg_send![copy_item, initWithTitle:&*copy_title action:copy_sel keyEquivalent:&*copy_key];
-            let _: () = msg_send![edit_menu, addItem: copy_item];
+            let copy_title = NSString::from_str("Copy");
+            let copy_key = NSString::from_str("c");
+            let copy_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &copy_title,
+                Some(sel!(copy:)),
+                &copy_key,
+            );
+            edit_menu.addItem(&copy_item);
 
             // Add Select All item (Cmd+A)
-            let select_title = NSString::new("Select All");
-            let select_key = NSString::new("a");
-            let select_item: id = msg_send![class!(NSMenuItem), alloc];
-            let select_sel = objc::runtime::Sel::register("selectAll:");
-            let select_item: id = msg_send![select_item, initWithTitle:&*select_title action:select_sel keyEquivalent:&*select_key];
-            let _: () = msg_send![edit_menu, addItem: select_item];
+            let select_title = NSString::from_str("Select All");
+            let select_key = NSString::from_str("a");
+            let select_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &select_title,
+                Some(sel!(selectAll:)),
+                &select_key,
+            );
+            edit_menu.addItem(&select_item);
 
             // Create menu bar item for Edit menu
-            let edit_menu_item: id = msg_send![class!(NSMenuItem), new];
-            let _: () = msg_send![edit_menu_item, setSubmenu: edit_menu];
-            let _: () = msg_send![menu_bar, addItem: edit_menu_item];
+            let edit_menu_item = NSMenuItem::new(mtm);
+            edit_menu_item.setSubmenu(Some(&edit_menu));
+            menu_bar.addItem(&edit_menu_item);
 
             // Create the alert
-            let alert: id = msg_send![class!(NSAlert), new];
-            let title = NSString::new("Set API Token");
-            let message = NSString::new(
+            let alert = NSAlert::new(mtm);
+            let title = NSString::from_str("Set API Token");
+            let message = NSString::from_str(
                 "Enter your Cleo API token.\n\nYou can get this from the web dashboard after logging in with Twitter.",
             );
-            let _: () = msg_send![alert, setMessageText:&*title];
-            let _: () = msg_send![alert, setInformativeText:&*message];
+            alert.setMessageText(&title);
+            alert.setInformativeText(&message);
 
-            // Set alert style to informational (removes the app icon, uses info icon)
-            // NSAlertStyleInformational = 1
-            let _: () = msg_send![alert, setAlertStyle: 1isize];
+            // Set alert style to informational
+            alert.setAlertStyle(NSAlertStyle::Informational);
 
             // Set a custom icon (key symbol for API token)
-            let icon_name = NSString::new("key.fill");
-            let icon: id = msg_send![class!(NSImage), imageWithSystemSymbolName:&*icon_name accessibilityDescription:std::ptr::null::<objc::runtime::Object>()];
-            if !icon.is_null() {
-                let _: () = msg_send![alert, setIcon: icon];
+            let icon_name = NSString::from_str("key.fill");
+            if let Some(icon) =
+                objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &icon_name,
+                    None,
+                )
+            {
+                alert.setIcon(Some(&icon));
             }
 
             // Add OK and Cancel buttons
-            let ok_title = NSString::new("Save");
-            let cancel_title = NSString::new("Cancel");
-            let _: () = msg_send![alert, addButtonWithTitle:&*ok_title];
-            let _: () = msg_send![alert, addButtonWithTitle:&*cancel_title];
+            let ok_title = NSString::from_str("Save");
+            let cancel_title = NSString::from_str("Cancel");
+            alert.addButtonWithTitle(&ok_title);
+            alert.addButtonWithTitle(&cancel_title);
 
             // Create text input field with frame
-            #[repr(C)]
-            struct NSRect {
-                origin: (f64, f64),
-                size: (f64, f64),
-            }
-            let frame = NSRect {
-                origin: (0.0, 0.0),
-                size: (400.0, 24.0),
-            };
-            let text_field: id = msg_send![class!(NSTextField), alloc];
-            let text_field: id = msg_send![text_field, initWithFrame: frame];
+            let frame = objc2_foundation::NSRect::new(
+                objc2_foundation::NSPoint::new(0.0, 0.0),
+                objc2_foundation::NSSize::new(400.0, 24.0),
+            );
+            let text_field = NSTextField::new(mtm);
+            text_field.setFrame(frame);
 
             // Make it editable and selectable
-            let _: () = msg_send![text_field, setEditable: YES];
-            let _: () = msg_send![text_field, setSelectable: YES];
+            text_field.setEditable(true);
+            text_field.setSelectable(true);
 
             // Load existing token as placeholder/default
             if let Ok(existing_token) = load_api_token() {
-                let placeholder = NSString::new(&existing_token);
-                let _: () = msg_send![text_field, setStringValue:&*placeholder];
+                let placeholder = NSString::from_str(&existing_token);
+                text_field.setStringValue(&placeholder);
             } else {
-                let placeholder = NSString::new("cleo_your_token_here");
-                let _: () = msg_send![text_field, setPlaceholderString:&*placeholder];
+                let placeholder = NSString::from_str("cleo_your_token_here");
+                text_field.setPlaceholderString(Some(&placeholder));
             }
 
-            let _: () = msg_send![alert, setAccessoryView: text_field];
+            alert.setAccessoryView(Some(&text_field));
 
             // Bring app to front so the dialog is visible
-            let app: id = msg_send![class!(NSApplication), sharedApplication];
-            let _: () = msg_send![app, activateIgnoringOtherApps: YES];
+            app.activateIgnoringOtherApps(true);
 
             // Get the alert's window and make text field first responder for paste support
-            let window: id = msg_send![alert, window];
-            let _: () = msg_send![window, makeFirstResponder: text_field];
+            let window = alert.window();
+            window.makeFirstResponder(Some(&text_field));
 
             // Run the alert and get response
-            let response: isize = msg_send![alert, runModal];
+            let response = alert.runModal();
 
             // Clean up: remove the Edit menu we added
-            let _: () = msg_send![menu_bar, removeItem: edit_menu_item];
+            menu_bar.removeItem(&edit_menu_item);
             if !had_menu {
-                let _: () = msg_send![app, setMainMenu: std::ptr::null::<objc::runtime::Object>()];
+                app.setMainMenu(None);
             }
 
             // NSAlertFirstButtonReturn = 1000
             if response == 1000 {
-                let value: id = msg_send![text_field, stringValue];
-                let cstr: *const i8 = msg_send![value, UTF8String];
-                if !cstr.is_null() {
-                    let token = std::ffi::CStr::from_ptr(cstr)
-                        .to_string_lossy()
-                        .into_owned();
+                let value = text_field.stringValue();
+                let token = value.to_string();
 
-                    if !token.trim().is_empty() {
-                        match self.apply_api_token(token) {
-                            Ok(()) => {
-                                info!("API token saved from dialog");
-                                show_notification("Cleo", "API token saved successfully!");
-                            }
-                            Err(err) => {
-                                error!("Failed to save API token: {err}");
-                                show_notification("Cleo", &format!("Failed to save token: {err}"));
-                            }
+                if !token.trim().is_empty() {
+                    match self.apply_api_token(token) {
+                        Ok(()) => {
+                            info!("API token saved from dialog");
+                            show_notification("Cleo", "API token saved successfully!");
+                        }
+                        Err(err) => {
+                            error!("Failed to save API token: {err}");
+                            show_notification("Cleo", &format!("Failed to save token: {err}"));
                         }
                     }
                 }
@@ -1060,31 +1137,32 @@ impl CleoDaemon {
     }
 }
 
-fn main() {
-    logging::init();
-    App::new("com.cleo.cleo", CleoDaemon::default()).run();
-}
+fn build_status_menu(
+    mtm: MainThreadMarker,
+) -> (Retained<NSMenu>, MenuHandles, Vec<Retained<AnyObject>>) {
+    let builder = MenuBuilder::new(mtm, "");
 
-fn build_status_menu() -> (Menu, MenuHandles) {
-    let hello = disabled_label("Hello, world!");
-    let (record_handle, record_item) = action_item("Start Recording", AppMessage::ToggleRecording);
-    let screenshot_item = action_item("Take Screenshot", AppMessage::TakeScreenshot).1;
-    let token_item = action_item("Set API Token...", AppMessage::SetApiToken).1;
+    let (builder, record_handle) = builder
+        .add_disabled_label("Hello, world!")
+        .add_action_item_with_handle("Start Recording", "", || {
+            dispatch_main(AppMessage::ToggleRecording);
+        });
 
-    let menu = Menu::new(
-        "",
-        vec![
-            hello,
-            record_item,
-            screenshot_item,
-            MenuItem::Separator,
-            token_item,
-            MenuItem::Separator,
-            quit_item(),
-        ],
-    );
+    let (menu, targets) = builder
+        .add_action_item("Take Screenshot", "", || {
+            dispatch_main(AppMessage::TakeScreenshot);
+        })
+        .add_separator()
+        .add_action_item("Set API Token...", "", || {
+            dispatch_main(AppMessage::SetApiToken);
+        })
+        .add_separator()
+        .add_action_item("Quit Cleo Recorder", "", || {
+            terminate();
+        })
+        .build();
 
-    (menu, MenuHandles::new(record_handle))
+    (menu, MenuHandles::new(record_handle), targets)
 }
 
 fn build_api_client() -> Result<ApiClient, CaptureError> {
@@ -1225,47 +1303,6 @@ impl CleoRoute {
     }
 }
 
-fn action_item(title: &str, message: AppMessage) -> (MenuItemHandle, MenuItem) {
-    let item = MenuItem::new(title).action(move || {
-        App::<CleoDaemon, AppMessage>::dispatch_main(message);
-    });
-
-    match item {
-        MenuItem::Custom(objc) => {
-            let shared = unsafe {
-                let ptr = (&*objc) as *const Object as *mut Object;
-                ShareId::from_ptr(ptr)
-            };
-            (MenuItemHandle { item: shared }, MenuItem::Custom(objc))
-        }
-        _ => unreachable!("Custom menu item expected"),
-    }
-}
-
-fn disabled_label<S: AsRef<str>>(text: S) -> MenuItem {
-    match MenuItem::new(text.as_ref()) {
-        MenuItem::Custom(objc) => {
-            unsafe {
-                let _: () = msg_send![&*objc, setEnabled: NO];
-            }
-            MenuItem::Custom(objc)
-        }
-        other => other,
-    }
-}
-
-fn quit_item() -> MenuItem {
-    MenuItem::new("Quit Cleo Recorder").action(|| App::terminate())
-}
-
-fn set_accessory_activation_policy() {
-    unsafe {
-        let app: id = msg_send![class!(NSApplication), sharedApplication];
-        // 1 == NSApplicationActivationPolicyAccessory
-        let _: () = msg_send![app, setActivationPolicy: 1isize];
-    }
-}
-
 fn show_notification(title: &str, message: &str) {
     // NSUserNotificationCenter is deprecated and returns null for accessory apps
     // Just log the notification for now
@@ -1289,64 +1326,6 @@ impl MenuHandles {
         };
         self.recording.set_title(title);
         self.recording.set_enabled(true);
-    }
-}
-
-struct MenuItemHandle {
-    item: ShareId<Object>,
-}
-
-impl MenuItemHandle {
-    fn set_enabled(&self, enabled: bool) {
-        unsafe {
-            let flag = if enabled { YES } else { NO };
-            let _: () = msg_send![&*self.item, setEnabled: flag];
-        }
-    }
-
-    fn set_title(&self, title: &str) {
-        unsafe {
-            let text = NSString::new(title);
-            let _: () = msg_send![&*self.item, setTitle:&*text];
-        }
-    }
-}
-
-struct StatusItem {
-    item: ShareId<Object>,
-    _menu: Menu,
-    _icon: Image,
-}
-
-impl StatusItem {
-    fn new(icon: Image, menu: Menu) -> Self {
-        unsafe {
-            let status_bar: id = msg_send![class!(NSStatusBar), systemStatusBar];
-            let item: id =
-                msg_send![status_bar, statusItemWithLength: NS_VARIABLE_STATUS_ITEM_LENGTH];
-            let button: id = msg_send![item, button];
-
-            let tooltip = NSString::new("Cleo Screen Recorder");
-            let _: () = msg_send![&*icon.0, setTemplate: YES];
-            let _: () = msg_send![button, setToolTip:&*tooltip];
-            let _: () = msg_send![button, setImage:&*icon.0];
-            let _: () = msg_send![item, setMenu:&*menu.0];
-
-            Self {
-                item: ShareId::from_ptr(item),
-                _menu: menu,
-                _icon: icon,
-            }
-        }
-    }
-}
-
-impl Drop for StatusItem {
-    fn drop(&mut self) {
-        unsafe {
-            let status_bar: id = msg_send![class!(NSStatusBar), systemStatusBar];
-            let _: () = msg_send![status_bar, removeStatusItem:&*self.item];
-        }
     }
 }
 
@@ -1529,7 +1508,10 @@ impl ScreenRecorder {
             .collect();
 
         if !excluded_windows.is_empty() {
-            info!("Excluding {} windows from privacy settings", excluded_windows.len());
+            info!(
+                "Excluding {} windows from privacy settings",
+                excluded_windows.len()
+            );
         }
 
         let filter = SCContentFilter::builder()
@@ -1577,11 +1559,12 @@ impl ScreenRecorder {
         let pending_dir = pending_recordings_dir();
         fs::create_dir_all(&pending_dir)?;
 
-        let filename = self.file_path.file_name()
-            .ok_or_else(|| CaptureError::Io(std::io::Error::new(
+        let filename = self.file_path.file_name().ok_or_else(|| {
+            CaptureError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "Invalid recording path"
-            )))?;
+                "Invalid recording path",
+            ))
+        })?;
         let pending_path = pending_dir.join(filename);
 
         fs::rename(&self.file_path, &pending_path)?;
@@ -1800,16 +1783,25 @@ impl BatchUploader {
                     Box::new(filter)
                 }
                 Err(e) => {
-                    warn!("BatchUploader: NSFW filter unavailable ({}), using no-op", e);
+                    warn!(
+                        "BatchUploader: NSFW filter unavailable ({}), using no-op",
+                        e
+                    );
                     Box::new(NoOpFilter::new())
                 }
             };
 
             eprintln!("[DEBUG] BatchUploader: entering main loop");
-            info!("BatchUploader: Started, processing every {}s", UPLOAD_BATCH_INTERVAL_SECS);
+            info!(
+                "BatchUploader: Started, processing every {}s",
+                UPLOAD_BATCH_INTERVAL_SECS
+            );
 
             while !flag.load(Ordering::Relaxed) {
-                eprintln!("[DEBUG] BatchUploader: sleeping for {}s", UPLOAD_BATCH_INTERVAL_SECS);
+                eprintln!(
+                    "[DEBUG] BatchUploader: sleeping for {}s",
+                    UPLOAD_BATCH_INTERVAL_SECS
+                );
                 if sleep_with_cancellation(&flag, Duration::from_secs(UPLOAD_BATCH_INTERVAL_SECS)) {
                     eprintln!("[DEBUG] BatchUploader: sleep cancelled, exiting");
                     break;
@@ -1874,8 +1866,15 @@ impl BatchUploader {
         }
     }
 
-    fn batch_process_screenshots(api: &ApiClient, content_filter: &dyn ContentFilter, files: &[PathBuf]) {
-        eprintln!("[DEBUG] batch_process_screenshots() called with {} files", files.len());
+    fn batch_process_screenshots(
+        api: &ApiClient,
+        content_filter: &dyn ContentFilter,
+        files: &[PathBuf],
+    ) {
+        eprintln!(
+            "[DEBUG] batch_process_screenshots() called with {} files",
+            files.len()
+        );
 
         // Create perceptual hasher - using mean algorithm for speed, 8x8 hash
         let hasher = HasherConfig::new()
@@ -1936,9 +1935,17 @@ impl BatchUploader {
                 // Skip similar frames (perceptual hash with hamming distance threshold)
                 if let Some(ref prev_hash) = last_hash {
                     let distance = prev_hash.dist(&current_hash);
-                    eprintln!("[DEBUG] phash distance={} (threshold={}) for {}", distance, PHASH_DISTANCE_THRESHOLD, path.display());
+                    eprintln!(
+                        "[DEBUG] phash distance={} (threshold={}) for {}",
+                        distance,
+                        PHASH_DISTANCE_THRESHOLD,
+                        path.display()
+                    );
                     if distance <= PHASH_DISTANCE_THRESHOLD {
-                        eprintln!("[DEBUG] Skipping similar frame, deleting: {}", path.display());
+                        eprintln!(
+                            "[DEBUG] Skipping similar frame, deleting: {}",
+                            path.display()
+                        );
                         duplicates_skipped += 1;
                         if let Err(e) = fs::remove_file(path) {
                             eprintln!("[DEBUG] Failed to delete {}: {}", path.display(), e);
@@ -1958,7 +1965,10 @@ impl BatchUploader {
             }
 
             // Classify this batch
-            eprintln!("[DEBUG] Starting batch classification of {} images", prepared.len());
+            eprintln!(
+                "[DEBUG] Starting batch classification of {} images",
+                prepared.len()
+            );
             info!("Classifying batch of {} screenshots", prepared.len());
             let scaled_batch: Vec<Vec<u8>> = prepared.iter().map(|(_, _, s)| s.clone()).collect();
             let results = match content_filter.classify(&scaled_batch) {
@@ -1987,13 +1997,25 @@ impl BatchUploader {
 
             // Upload this batch
             if !safe_uploads.is_empty() {
-                eprintln!("[DEBUG] Starting batch upload of {} safe screenshots", safe_uploads.len());
-                info!("{} screenshots passed filter, uploading as batch", safe_uploads.len());
-                let batch: Vec<_> = safe_uploads.iter().map(|(_, bytes)| (bytes.clone(), ImageFormat::Png)).collect();
+                eprintln!(
+                    "[DEBUG] Starting batch upload of {} safe screenshots",
+                    safe_uploads.len()
+                );
+                info!(
+                    "{} screenshots passed filter, uploading as batch",
+                    safe_uploads.len()
+                );
+                let batch: Vec<_> = safe_uploads
+                    .iter()
+                    .map(|(_, bytes)| (bytes.clone(), ImageFormat::Png))
+                    .collect();
                 match api.upload_images(batch) {
                     Ok(result) => {
                         eprintln!("[DEBUG] Batch upload finished");
-                        info!("Batch upload complete: {} uploaded, {} failed", result.uploaded, result.failed);
+                        info!(
+                            "Batch upload complete: {} uploaded, {} failed",
+                            result.uploaded, result.failed
+                        );
                         total_processed += result.uploaded;
                     }
                     Err(e) => error!("Batch upload failed: {}", e),
@@ -2006,15 +2028,25 @@ impl BatchUploader {
         }
 
         if duplicates_skipped > 0 {
-            info!("Skipped {} duplicate static frames total", duplicates_skipped);
+            info!(
+                "Skipped {} duplicate static frames total",
+                duplicates_skipped
+            );
         }
         if total_processed > 0 {
-            info!("Total screenshots processed this cycle: {}", total_processed);
+            info!(
+                "Total screenshots processed this cycle: {}",
+                total_processed
+            );
         }
         eprintln!("[DEBUG] batch_process_screenshots() done");
     }
 
-    fn batch_process_recordings(api: &ApiClient, content_filter: &dyn ContentFilter, files: &[PathBuf]) {
+    fn batch_process_recordings(
+        api: &ApiClient,
+        content_filter: &dyn ContentFilter,
+        files: &[PathBuf],
+    ) {
         // Step 1: Sample frames from all recordings
         let mut prepared: Vec<(PathBuf, Vec<Vec<u8>>)> = Vec::new(); // (path, scaled_frames)
 
@@ -2061,7 +2093,11 @@ impl BatchUploader {
             all_frames.extend(scaled_frames.iter().cloned());
         }
 
-        info!("Classifying {} frames from {} recordings", all_frames.len(), prepared.len());
+        info!(
+            "Classifying {} frames from {} recordings",
+            all_frames.len(),
+            prepared.len()
+        );
 
         let results = match content_filter.classify(&all_frames) {
             Ok(r) => r,
@@ -2114,10 +2150,19 @@ impl BatchUploader {
 
         // Step 4: Batch upload all safe recordings
         if !safe_uploads.is_empty() {
-            info!("{} recordings passed filter, uploading as batch", safe_uploads.len());
-            let batch: Vec<_> = safe_uploads.iter().map(|(_, bytes, format)| (bytes.clone(), *format)).collect();
+            info!(
+                "{} recordings passed filter, uploading as batch",
+                safe_uploads.len()
+            );
+            let batch: Vec<_> = safe_uploads
+                .iter()
+                .map(|(_, bytes, format)| (bytes.clone(), *format))
+                .collect();
             match api.upload_videos(batch) {
-                Ok(result) => info!("Batch upload complete: {} uploaded, {} failed", result.uploaded, result.failed),
+                Ok(result) => info!(
+                    "Batch upload complete: {} uploaded, {} failed",
+                    result.uploaded, result.failed
+                ),
                 Err(e) => error!("Batch upload failed: {}", e),
             }
             // Delete all files after upload attempt

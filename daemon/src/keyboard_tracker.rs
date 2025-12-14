@@ -1,15 +1,10 @@
 use std::fmt;
 
-use block::{ConcreteBlock, RcBlock};
-use objc::runtime::Object;
-use objc::{class, msg_send, sel, sel_impl};
-use objc_id::ShareId;
-
-const NSEVENT_TYPE_KEY_DOWN: u64 = 10;
-
-fn key_down_mask() -> u64 {
-    1 << NSEVENT_TYPE_KEY_DOWN
-}
+use block2::RcBlock;
+use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
+use objc2::{msg_send, ClassType};
+use objc2_app_kit::{NSEvent, NSEventMask};
 
 #[derive(Debug)]
 pub enum KeyboardTrackerError {
@@ -29,8 +24,8 @@ impl fmt::Display for KeyboardTrackerError {
 impl std::error::Error for KeyboardTrackerError {}
 
 pub struct KeyboardTracker {
-    monitor: ShareId<Object>,
-    _handler: RcBlock<(*mut Object,), ()>,
+    monitor: Retained<AnyObject>,
+    _handler: RcBlock<dyn Fn(*mut AnyObject)>,
 }
 
 impl KeyboardTracker {
@@ -39,16 +34,14 @@ impl KeyboardTracker {
         F: Fn() + Send + 'static,
     {
         // Just fire the handler - don't capture the actual keystroke
-        let block = ConcreteBlock::new(move |_event: *mut Object| {
+        let block = RcBlock::new(move |_event: *mut AnyObject| {
             handler();
-        })
-        .copy();
+        });
 
-        let mask = key_down_mask();
-        let monitor: *mut Object = unsafe {
+        let monitor: *mut AnyObject = unsafe {
             msg_send![
-                class!(NSEvent),
-                addGlobalMonitorForEventsMatchingMask: mask
+                NSEvent::class(),
+                addGlobalMonitorForEventsMatchingMask: NSEventMask::KeyDown,
                 handler: &*block
             ]
         };
@@ -58,7 +51,7 @@ impl KeyboardTracker {
         }
 
         Ok(Self {
-            monitor: unsafe { ShareId::from_ptr(monitor) },
+            monitor: unsafe { Retained::retain(monitor).unwrap() },
             _handler: block,
         })
     }
@@ -67,7 +60,7 @@ impl KeyboardTracker {
 impl Drop for KeyboardTracker {
     fn drop(&mut self) {
         unsafe {
-            let _: () = msg_send![class!(NSEvent), removeMonitor:&*self.monitor];
+            let _: () = msg_send![NSEvent::class(), removeMonitor: &*self.monitor];
         }
     }
 }
