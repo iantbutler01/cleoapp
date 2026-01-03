@@ -11,6 +11,13 @@ export default defineConfig({
         target: 'http://localhost:3000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
+        // WebSocket support for publish progress
+        ws: true,
+      },
+      // Proxy local media serving (only used in dev with LOCAL_STORAGE_PATH)
+      '/media': {
+        target: 'http://localhost:3000',
+        changeOrigin: true,
       },
     },
   },

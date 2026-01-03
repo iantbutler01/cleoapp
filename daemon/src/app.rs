@@ -12,7 +12,7 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
     NSStatusItem,
 };
-use objc2_foundation::{MainThreadMarker, NSArray, NSObject, NSString, NSURL};
+use objc2_foundation::{MainThreadMarker, NSArray, NSBundle, NSObject, NSString, NSURL};
 use url::Url;
 
 /// Callback type for application lifecycle events
@@ -38,7 +38,8 @@ pub struct StatusItem {
 impl StatusItem {
     pub fn new(
         mtm: MainThreadMarker,
-        icon_name: &str,
+        icon_resource_name: &str,
+        fallback_sf_symbol: &str,
         tooltip: &str,
         menu: Retained<NSMenu>,
     ) -> Self {
@@ -51,13 +52,38 @@ impl StatusItem {
                 let tooltip_str = NSString::from_str(tooltip);
                 button.setToolTip(Some(&tooltip_str));
 
-                // Set icon using SF Symbols
-                let icon_str = NSString::from_str(icon_name);
-                if let Some(image) =
-                    NSImage::imageWithSystemSymbolName_accessibilityDescription(&icon_str, None)
-                {
-                    image.setTemplate(true);
-                    button.setImage(Some(&image));
+                // Try to load custom icon from bundle Resources, fallback to SF Symbol
+                let mut image_set = false;
+
+                // Try to find icon in app bundle Resources/assets/ using NSBundle
+                // cargo-bundle places resources in a subdirectory matching the source path
+                let bundle = NSBundle::mainBundle();
+                let resource_name = NSString::from_str(icon_resource_name);
+                let resource_type = NSString::from_str("png");
+                let subdir = NSString::from_str("assets");
+
+                if let Some(path) = bundle.pathForResource_ofType_inDirectory(Some(&resource_name), Some(&resource_type), Some(&subdir)) {
+                    // Load image from file path
+                    let image_ptr: *mut NSImage = msg_send![class!(NSImage), alloc];
+                    if !image_ptr.is_null() {
+                        let image_ptr: *mut NSImage = msg_send![image_ptr, initWithContentsOfFile: &*path];
+                        if let Some(image) = Retained::retain(image_ptr) {
+                            image.setTemplate(true);
+                            button.setImage(Some(&image));
+                            image_set = true;
+                        }
+                    }
+                }
+
+                // Fallback to SF Symbol if bundle resource not found
+                if !image_set {
+                    let icon_str = NSString::from_str(fallback_sf_symbol);
+                    if let Some(image) =
+                        NSImage::imageWithSystemSymbolName_accessibilityDescription(&icon_str, None)
+                    {
+                        image.setTemplate(true);
+                        button.setImage(Some(&image));
+                    }
                 }
             }
 
@@ -438,7 +464,7 @@ impl App {
     /// Create a new application
     pub fn new(mtm: MainThreadMarker) -> Self {
         let app = NSApplication::sharedApplication(mtm);
-        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+        app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
 
         // Create delegate instance
         let delegate_class = app_delegate_class();

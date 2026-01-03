@@ -1,164 +1,143 @@
 import { LitElement, html } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { PendingTweet, api } from '../api';
-
-interface MediaUrl {
-  url: string;
-  content_type: string;
-}
+import { ThreadTweet, api, PublishProgress } from '../api';
+import { tailwindStyles } from '../styles/shared';
+import './card-shell';
+import './card-header';
+import './content-badge';
+import './tweet-content';
 
 @customElement('tweet-card')
 export class TweetCard extends LitElement {
-  @property({ type: Object }) tweet!: PendingTweet;
+  static styles = [tailwindStyles];
+
+  @property({ type: Object }) tweet: ThreadTweet | null = null;
+  @property({ type: Boolean }) hideActions = false;
+  @property({ type: Boolean }) compact = false;
+  @property({ type: Boolean }) showRailConnector = false;
+
   @state() posting = false;
   @state() dismissing = false;
-  @state() imageUrls: MediaUrl[] = [];
-  @state() videoUrl: MediaUrl | null = null;
-  @state() loadingMedia = true;
-
-  createRenderRoot() {
-    return this;
-  }
-
-  async connectedCallback() {
-    super.connectedCallback();
-    await this.loadMedia();
-  }
-
-  async loadMedia() {
-    this.loadingMedia = true;
-    try {
-      // Load image URLs
-      const imagePromises = this.tweet.image_capture_ids.map((id) =>
-        api.getCaptureUrl(id)
-      );
-      this.imageUrls = await Promise.all(imagePromises);
-
-      // Load video URL if present
-      if (this.tweet.video_clip) {
-        this.videoUrl = await api.getCaptureUrl(
-          this.tweet.video_clip.source_capture_id
-        );
-      }
-    } catch (e) {
-      console.error('Failed to load media:', e);
-    } finally {
-      this.loadingMedia = false;
-    }
-  }
-
-  async handlePost() {
-    this.posting = true;
-    try {
-      await api.postTweet(this.tweet.id);
-      this.dispatchEvent(new CustomEvent('tweet-posted', { detail: this.tweet.id }));
-    } catch (e) {
-      console.error('Failed to post tweet:', e);
-    } finally {
-      this.posting = false;
-    }
-  }
-
-  async handleDismiss() {
-    this.dismissing = true;
-    try {
-      await api.dismissTweet(this.tweet.id);
-      this.dispatchEvent(new CustomEvent('tweet-dismissed', { detail: this.tweet.id }));
-    } catch (e) {
-      console.error('Failed to dismiss tweet:', e);
-    } finally {
-      this.dismissing = false;
-    }
-  }
+  @state() uploadProgress: number | null = null;
+  @state() uploadStatus: 'uploading' | 'processing' | 'posting' | null = null;
+  @state() error: string | null = null;
 
   formatDate(dateStr: string) {
     return new Date(dateStr).toLocaleString();
   }
 
-  renderMedia() {
-    if (this.loadingMedia) {
-      return html`
-        <div class="flex justify-center py-4">
-          <span class="loading loading-spinner loading-md"></span>
-        </div>
-      `;
+  async handlePost() {
+    if (!this.tweet) return;
+
+    this.posting = true;
+    this.uploadProgress = null;
+    this.uploadStatus = null;
+    this.error = null;
+
+    try {
+      // Use WebSocket progress for media tweets (video or multiple images)
+      const hasMedia = this.tweet.video_clip || this.tweet.image_capture_ids.length > 0;
+      if (hasMedia) {
+        await api.postTweetWithProgress(this.tweet.id, (progress: PublishProgress) => {
+          if (progress.type === 'uploading') {
+            this.uploadStatus = 'uploading';
+            this.uploadProgress = progress.percent;
+          } else if (progress.type === 'processing') {
+            this.uploadStatus = 'processing';
+            this.uploadProgress = null;
+          } else if (progress.type === 'posting') {
+            this.uploadStatus = 'posting';
+          }
+        });
+      } else {
+        await api.postTweet(this.tweet.id);
+      }
+      this.dispatchEvent(new CustomEvent('tweet-posted', { detail: this.tweet.id }));
+    } catch (e) {
+      console.error('Failed to post tweet:', e);
+      this.error = e instanceof Error ? e.message : 'Failed to post tweet';
+    } finally {
+      this.posting = false;
+      this.uploadProgress = null;
+      this.uploadStatus = null;
     }
+  }
 
-    const hasMedia = this.imageUrls.length > 0 || this.videoUrl;
-    if (!hasMedia) return '';
+  async handleDismiss() {
+    if (!this.tweet) return;
 
-    return html`
-      <div class="mt-4 space-y-3">
-        ${this.videoUrl
-          ? html`
-              <video
-                controls
-                class="w-full rounded-lg max-h-80 object-contain bg-black"
-                src=${this.videoUrl.url}
-              >
-                Your browser does not support the video tag.
-              </video>
-              ${this.tweet.video_clip
-                ? html`
-                    <div class="text-xs opacity-60">
-                      Clip: ${this.tweet.video_clip.start_timestamp} (${this.tweet.video_clip.duration_secs}s)
-                    </div>
-                  `
-                : ''}
-            `
-          : ''}
-        ${this.imageUrls.length > 0
-          ? html`
-              <div class="grid gap-2 ${this.imageUrls.length > 1 ? 'grid-cols-2' : 'grid-cols-1'}">
-                ${this.imageUrls.map(
-                  (img) => html`
-                    <img
-                      src=${img.url}
-                      class="rounded-lg w-full object-cover max-h-60 cursor-pointer hover:opacity-90 transition-opacity"
-                      @click=${() => window.open(img.url, '_blank')}
-                    />
-                  `
-                )}
-              </div>
-            `
-          : ''}
-      </div>
-    `;
+    this.dismissing = true;
+    this.error = null;
+
+    try {
+      await api.dismissTweet(this.tweet.id);
+      this.dispatchEvent(new CustomEvent('tweet-dismissed', { detail: this.tweet.id }));
+    } catch (e) {
+      console.error('Failed to dismiss tweet:', e);
+      this.error = e instanceof Error ? e.message : 'Failed to dismiss tweet';
+    } finally {
+      this.dismissing = false;
+    }
+  }
+
+  clearError() {
+    this.error = null;
+  }
+
+  handleCollateralUpdated(e: CustomEvent) {
+    // Re-dispatch the event from tweet-content
+    this.dispatchEvent(new CustomEvent('collateral-updated', {
+      detail: e.detail,
+      bubbles: true,
+      composed: true
+    }));
   }
 
   render() {
+    if (!this.tweet) {
+      return html`<card-shell><p class="text-base-content/50">No tweet data</p></card-shell>`;
+    }
+
+    const imageCount = this.tweet.image_capture_ids.length;
+
     return html`
-      <div class="card bg-base-100 shadow-xl">
-        <div class="card-body">
-          <div class="flex justify-between items-start">
-            <span class="badge badge-ghost">${this.formatDate(this.tweet.created_at)}</span>
-            <div class="flex gap-1">
-              ${this.tweet.video_clip
-                ? html`<span class="badge badge-secondary">Video</span>`
-                : ''}
-              ${this.tweet.image_capture_ids.length > 0
-                ? html`<span class="badge badge-accent">${this.tweet.image_capture_ids.length} Image${this.tweet.image_capture_ids.length > 1 ? 's' : ''}</span>`
-                : ''}
-            </div>
+      <card-shell
+        ?showRailConnector=${this.showRailConnector}
+        variant=${this.compact ? 'compact' : 'default'}
+      >
+        <card-header slot="header">
+          <span slot="left" class="text-xs">${this.formatDate(this.tweet.created_at)}</span>
+          <div slot="right" class="flex gap-1.5">
+            <slot name="extra-badges"></slot>
+            ${this.tweet.video_clip
+              ? html`<content-badge variant="accent">Video</content-badge>`
+              : ''}
+            ${imageCount > 0
+              ? html`<content-badge variant="muted">${imageCount} image${imageCount > 1 ? 's' : ''}</content-badge>`
+              : ''}
           </div>
+        </card-header>
 
-          <div class="mt-4 p-4 bg-base-200 rounded-lg">
-            <p class="text-lg whitespace-pre-wrap">${this.tweet.text}</p>
+        <tweet-content
+          .tweet=${this.tweet}
+          ?compact=${this.compact}
+          @collateral-updated=${this.handleCollateralUpdated}
+        ></tweet-content>
+
+        ${this.error ? html`
+          <div class="alert alert-error mt-3 py-2 px-3 text-sm">
+            <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-5 w-5" fill="none" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span>${this.error}</span>
+            <button class="btn btn-ghost btn-xs" @click=${this.clearError}>Dismiss</button>
           </div>
+        ` : ''}
 
-          ${this.renderMedia()}
-
-          <div class="collapse collapse-arrow bg-base-200 mt-4">
-            <input type="checkbox" />
-            <div class="collapse-title font-medium">Why this moment?</div>
-            <div class="collapse-content">
-              <p class="text-sm opacity-70">${this.tweet.rationale}</p>
-            </div>
-          </div>
-
-          <div class="card-actions justify-end mt-4">
+        ${!this.hideActions ? html`
+          <div slot="actions" class="flex justify-end gap-2 mt-4 pt-3 border-t border-base-200">
             <button
-              class="btn btn-ghost"
+              class="btn btn-ghost btn-sm"
               @click=${this.handleDismiss}
               ?disabled=${this.dismissing || this.posting}
             >
@@ -167,22 +146,34 @@ export class TweetCard extends LitElement {
                 : 'Dismiss'}
             </button>
             <button
-              class="btn btn-primary"
+              class="btn btn-primary btn-sm gap-1 min-w-24"
               @click=${this.handlePost}
               ?disabled=${this.posting || this.dismissing}
             >
               ${this.posting
-                ? html`<span class="loading loading-spinner loading-sm"></span>`
+                ? this.uploadStatus === 'uploading' && this.uploadProgress !== null
+                  ? html`
+                      <div class="flex items-center gap-2">
+                        <div class="radial-progress text-primary-content" style="--value:${this.uploadProgress}; --size:1.25rem; --thickness:2px;">
+                        </div>
+                        <span class="text-xs">${this.uploadProgress}%</span>
+                      </div>
+                    `
+                  : this.uploadStatus === 'processing'
+                    ? html`<span class="loading loading-spinner loading-sm"></span><span class="text-xs">Processing...</span>`
+                    : this.uploadStatus === 'posting'
+                      ? html`<span class="loading loading-spinner loading-sm"></span><span class="text-xs">Posting...</span>`
+                      : html`<span class="loading loading-spinner loading-sm"></span>`
                 : html`
-                    <svg class="w-4 h-4 mr-1" viewBox="0 0 24 24" fill="currentColor">
+                    <svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
                       <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
                     </svg>
                     Post
                   `}
             </button>
           </div>
-        </div>
-      </div>
+        ` : ''}
+      </card-shell>
     `;
   }
 }

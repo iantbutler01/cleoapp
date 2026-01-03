@@ -1,6 +1,7 @@
 mod accessibility;
 mod api;
 mod app;
+mod banned_apps_window;
 mod command_palette;
 mod content_filter;
 mod idle;
@@ -60,6 +61,7 @@ use image_hasher::{HashAlg, HasherConfig, ImageHash};
 use crate::accessibility::{ActiveWindowInfo, check_accessibility_trusted};
 use crate::api::{ActivityEntry, ActivityEvent, ApiClient, ApiError, ImageFormat, VideoFormat};
 use crate::app::{App, MenuBuilder, MenuItemHandle, StatusItem, terminate};
+use crate::banned_apps_window::BannedAppsWindow;
 use crate::command_palette::{CommandPalette, HotkeyTracker, PaletteCommand};
 use crate::content_filter::{ContentFilter, NoOpFilter, NsfwFilter};
 use crate::interval::current_interval_id;
@@ -103,6 +105,10 @@ struct PrivacySettings {
     /// Whether to detect and blur secrets in captures
     #[serde(default)]
     secret_detection_enabled: bool,
+    /// Apps the user has explicitly added to the ban list (user-curated, not auto-tracked).
+    /// This persists even after unbanning so users can easily re-ban apps.
+    #[serde(default)]
+    known_apps: Vec<String>,
 }
 
 impl PrivacySettings {
@@ -175,6 +181,7 @@ enum AppMessage {
     ToggleCaptureMode,
     PollHotkey,
     PaletteKey { key_code: u16 },
+    ManageBannedApps,
 }
 
 /// Dispatch a message to the main thread using GCD
@@ -195,6 +202,23 @@ fn dispatch_main(message: AppMessage) {
                 }
             });
         });
+    }
+}
+
+/// Dispatch a ban toggle action to the main thread
+fn dispatch_main_toggle_ban(app_name: String, should_ban: bool) {
+    let action = move || {
+        DAEMON.with(|d| {
+            if let Some(ref daemon) = *d.borrow() {
+                daemon.set_app_banned(&app_name, should_ban);
+            }
+        });
+    };
+
+    if MainThreadMarker::new().is_some() {
+        action();
+    } else {
+        dispatch2::Queue::main().exec_async(action);
     }
 }
 
@@ -288,6 +312,10 @@ struct CleoDaemon {
     activity_events: RefCell<Vec<ActivityEntry>>,
     recording_limits: RefCell<Option<api::RecordingLimits>>,
     privacy_settings: RefCell<PrivacySettings>,
+    /// The currently focused app name (for ban toggle in command palette)
+    current_app_name: RefCell<Option<String>>,
+    /// Window for managing banned apps
+    banned_apps_window: RefCell<Option<BannedAppsWindow>>,
 }
 
 impl CleoDaemon {
@@ -319,6 +347,8 @@ impl CleoDaemon {
             activity_events: RefCell::new(Vec::new()),
             recording_limits: RefCell::new(None),
             privacy_settings: RefCell::new(PrivacySettings::default()),
+            current_app_name: RefCell::new(None),
+            banned_apps_window: RefCell::new(None),
         }
     }
 
@@ -328,7 +358,7 @@ impl CleoDaemon {
         self.menu_handles.replace(Some(handles));
         self.menu_targets.replace(targets);
 
-        let status_item = StatusItem::new(mtm, "message.fill", "Cleo Screen Recorder", menu);
+        let status_item = StatusItem::new(mtm, "menubar-icon", "message.fill", "Cleo Screen Recorder", menu);
         self.status_item.replace(Some(status_item));
 
         self.logging_daemon.replace(Some(LoggingDaemon::start()));
@@ -345,7 +375,9 @@ impl CleoDaemon {
     }
 
     fn shutdown(&mut self) {
+        // Try to save any in-progress recording before shutting down
         self.stop_recording();
+
         self.stop_logging_daemon();
         self.stop_batch_uploader();
         self.stop_tracker();
@@ -385,6 +417,7 @@ impl CleoDaemon {
             AppMessage::ToggleCaptureMode => self.toggle_capture_mode(),
             AppMessage::PollHotkey => self.poll_hotkey(),
             AppMessage::PaletteKey { key_code } => self.handle_palette_key(key_code),
+            AppMessage::ManageBannedApps => self.show_banned_apps_window(),
         }
     }
 
@@ -413,8 +446,14 @@ impl CleoDaemon {
         self.manual_recording.set(false);
         if let Some(recorder) = self.recorder.borrow_mut().take() {
             match recorder.stop() {
-                Ok(()) => info!("Recording saved to pending folder"),
-                Err(err) => error!("Failed to stop recording: {err}"),
+                Ok(()) => {
+                    eprintln!("[recording] Recording saved to pending folder");
+                    info!("Recording saved to pending folder");
+                }
+                Err(err) => {
+                    eprintln!("[recording] Failed to stop recording: {err}");
+                    error!("Failed to stop recording: {err}");
+                }
             }
         }
         self.update_menu_state(false);
@@ -427,10 +466,6 @@ impl CleoDaemon {
             debug!("Skipping screenshot - auto capture disabled");
             return;
         }
-        if self.recorder.borrow().is_some() {
-            info!("Skipping screenshot while recording");
-            return;
-        }
         // Skip screenshot if user is idle
         if idle::is_idle(IDLE_THRESHOLD_SECS) {
             debug!(
@@ -438,6 +473,13 @@ impl CleoDaemon {
                 idle::seconds_since_last_input()
             );
             return;
+        }
+        // Skip screenshot if current app is banned
+        if let Some(ref app_name) = *self.current_app_name.borrow() {
+            if self.is_app_banned(app_name) {
+                debug!("Skipping screenshot - current app '{}' is banned", app_name);
+                return;
+            }
         }
         let privacy = self.privacy_settings.borrow().clone();
         if let Err(err) = capture_screenshot_with_exclusions(&privacy) {
@@ -453,12 +495,16 @@ impl CleoDaemon {
 
     fn stop_logging_daemon(&self) {
         if let Some(daemon) = self.logging_daemon.borrow_mut().take() {
-            daemon.shutdown();
+            daemon.stop.store(true, Ordering::Relaxed);
+            // Don't wait for thread - let it terminate in background
         }
     }
 
     fn stop_batch_uploader(&self) {
-        self.batch_uploader.borrow_mut().take();
+        if let Some(uploader) = self.batch_uploader.borrow_mut().take() {
+            uploader.stop.store(true, Ordering::Relaxed);
+            // Don't wait for thread - let it terminate in background
+        }
     }
 
     fn start_activity_tracking(&self) {
@@ -486,11 +532,112 @@ impl CleoDaemon {
     }
 
     fn record_focus_event(&self, info: ActiveWindowInfo) {
+        // Store the current app name for the ban toggle feature
+        *self.current_app_name.borrow_mut() = Some(info.app_name.clone());
+
+        // Update the command palette if visible
+        if let Some(ref palette) = *self.command_palette.borrow() {
+            let is_banned = self.is_app_banned(&info.app_name);
+            palette.set_current_app(Some(info.app_name.clone()), is_banned);
+        }
+
         let event = ActivityEvent::foreground_switch(info.app_name, info.window_title);
         let interval_id = current_interval_id();
         let entry = ActivityEntry::new(Utc::now(), interval_id, event);
         self.activity_events.borrow_mut().push(entry);
         self.handle_activity_event(BurstActionKind::AppSwitch);
+    }
+
+    /// Check if an app is in the blocked list
+    fn is_app_banned(&self, app_name: &str) -> bool {
+        let settings = self.privacy_settings.borrow();
+        let app_lower = app_name.to_lowercase();
+        settings.blocked_apps.iter().any(|blocked| blocked.to_lowercase() == app_lower)
+    }
+
+    /// Toggle the ban status of the currently focused app
+    fn toggle_ban_current_app(&self) {
+        let app_name = match self.current_app_name.borrow().clone() {
+            Some(name) => name,
+            None => {
+                warn!("No current app to ban/unban");
+                return;
+            }
+        };
+
+        let is_banned = self.is_app_banned(&app_name);
+        {
+            let mut settings = self.privacy_settings.borrow_mut();
+            if is_banned {
+                // Remove from blocked list (case-insensitive match)
+                let app_lower = app_name.to_lowercase();
+                settings.blocked_apps.retain(|blocked| blocked.to_lowercase() != app_lower);
+                info!("Unbanned app: {}", app_name);
+            } else {
+                // Add to blocked list
+                settings.blocked_apps.push(app_name.clone());
+                info!("Banned app: {}", app_name);
+            }
+
+            // Always add to known_apps when banning (user-curated list)
+            if !is_banned {
+                let app_lower = app_name.to_lowercase();
+                let already_known = settings.known_apps.iter().any(|k| k.to_lowercase() == app_lower);
+                if !already_known {
+                    settings.known_apps.push(app_name.clone());
+                }
+            }
+        }
+
+        // Save the updated settings
+        let settings = self.privacy_settings.borrow().clone();
+        if let Err(err) = save_privacy_settings(&settings) {
+            error!("Failed to save privacy settings: {}", err);
+        }
+
+        // Update the command palette
+        if let Some(ref palette) = *self.command_palette.borrow() {
+            palette.set_current_app(Some(app_name), !is_banned);
+        }
+    }
+
+    /// Set the ban status of an app by name (used by banned apps window)
+    fn set_app_banned(&self, app_name: &str, should_ban: bool) {
+        let is_currently_banned = self.is_app_banned(app_name);
+
+        // No change needed
+        if is_currently_banned == should_ban {
+            return;
+        }
+
+        {
+            let mut settings = self.privacy_settings.borrow_mut();
+            if should_ban {
+                // Add to blocked list
+                settings.blocked_apps.push(app_name.to_string());
+                info!("Banned app: {}", app_name);
+            } else {
+                // Remove from blocked list (case-insensitive match)
+                let app_lower = app_name.to_lowercase();
+                settings.blocked_apps.retain(|blocked| blocked.to_lowercase() != app_lower);
+                info!("Unbanned app: {}", app_name);
+            }
+        }
+
+        // Save the updated settings
+        let settings = self.privacy_settings.borrow().clone();
+        if let Err(err) = save_privacy_settings(&settings) {
+            error!("Failed to save privacy settings: {}", err);
+        }
+
+        // Update command palette if this is the current app
+        if let Some(current) = self.current_app_name.borrow().as_ref() {
+            if current.to_lowercase() == app_name.to_lowercase() {
+                if let Some(ref palette) = *self.command_palette.borrow() {
+                    palette.set_current_app(Some(current.clone()), should_ban);
+                }
+            }
+        }
     }
 
     fn start_mouse_tracking(&self) {
@@ -630,6 +777,57 @@ impl CleoDaemon {
         }
     }
 
+    fn show_banned_apps_window(&self) {
+        let mtm = match MainThreadMarker::new() {
+            Some(m) => m,
+            None => {
+                error!("show_banned_apps_window must be called on main thread");
+                return;
+            }
+        };
+
+        // Create window if it doesn't exist
+        if self.banned_apps_window.borrow().is_none() {
+            match BannedAppsWindow::new(mtm) {
+                Ok(window) => {
+                    self.banned_apps_window.replace(Some(window));
+                }
+                Err(e) => {
+                    error!("Failed to create banned apps window: {:?}", e);
+                    return;
+                }
+            }
+        }
+
+        // Update the window with current apps and show it
+        if let Some(ref window) = *self.banned_apps_window.borrow() {
+            let settings = self.privacy_settings.borrow();
+
+            // Build list of (app_name, is_banned) from known_apps
+            let apps: Vec<(String, bool)> = settings.known_apps.iter().map(|app| {
+                let is_banned = settings.blocked_apps.iter()
+                    .any(|b| b.to_lowercase() == app.to_lowercase());
+                (app.clone(), is_banned)
+            }).collect();
+
+            // Clone what we need for the callback
+            let on_toggle = move |app_name: String, is_banned: bool| {
+                dispatch_main_toggle_ban(app_name, is_banned);
+            };
+
+            window.update_apps(&apps, on_toggle);
+            window.show();
+
+            // Bring app to front
+            unsafe {
+                let app = NSApplication::sharedApplication(mtm);
+                app.activateIgnoringOtherApps(true);
+            }
+
+            info!("Banned apps window shown");
+        }
+    }
+
     fn toggle_capture_mode(&self) {
         let new_state = !self.auto_capture_enabled.get();
         self.auto_capture_enabled.set(new_state);
@@ -686,6 +884,9 @@ impl CleoDaemon {
                     if let Err(err) = capture_screenshot_with_exclusions(&privacy) {
                         error!("Failed to capture screenshot: {err}");
                     }
+                }
+                PaletteCommand::ToggleBanApp => {
+                    self.toggle_ban_current_app();
                 }
             }
         }
@@ -791,6 +992,13 @@ impl CleoDaemon {
     }
 
     fn handle_activity_event(&self, kind: BurstActionKind) {
+        // Skip activity tracking if current app is banned
+        if let Some(ref app_name) = *self.current_app_name.borrow() {
+            if self.is_app_banned(app_name) {
+                return;
+            }
+        }
+
         self.track_activity_burst(kind);
         self.schedule_auto_stop();
     }
@@ -872,6 +1080,7 @@ impl CleoDaemon {
             return;
         }
         if self.recorder.borrow().is_some() {
+            eprintln!("[recording] Stopping automatic recording after inactivity");
             info!("Stopping automatic recording after inactivity");
             self.stop_recording();
         }
@@ -879,6 +1088,7 @@ impl CleoDaemon {
 
     fn stop_recording_max_duration(&self) {
         if self.recorder.borrow().is_some() {
+            eprintln!("[recording] Stopping recording: max duration reached");
             info!("Stopping recording: max duration reached");
             self.manual_recording.set(false);
             self.stop_recording();
@@ -1153,6 +1363,9 @@ fn build_status_menu(
             dispatch_main(AppMessage::TakeScreenshot);
         })
         .add_separator()
+        .add_action_item("Manage Banned Apps...", "", || {
+            dispatch_main(AppMessage::ManageBannedApps);
+        })
         .add_action_item("Set API Token...", "", || {
             dispatch_main(AppMessage::SetApiToken);
         })
@@ -1236,6 +1449,30 @@ fn load_privacy_settings() -> Result<PrivacySettings, CaptureError> {
         ))
     })?;
     Ok(config.privacy)
+}
+
+fn save_privacy_settings(privacy: &PrivacySettings) -> Result<(), CaptureError> {
+    let path = cleo_config_path()?;
+
+    // Load existing config to preserve API token
+    let api_token = load_api_token().unwrap_or_default();
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(CaptureError::from)?;
+    }
+
+    let config = CleoConfig {
+        api_token,
+        privacy: privacy.clone(),
+    };
+    let payload = serde_json::to_string_pretty(&config).map_err(|err| {
+        CaptureError::Config(format!(
+            "Failed to serialize Cleo config at {}: {err}",
+            path.display()
+        ))
+    })?;
+
+    fs::write(&path, payload).map_err(CaptureError::from)
 }
 
 fn validate_api_token(token: &str, context: &str) -> Result<String, CaptureError> {
@@ -1345,7 +1582,9 @@ impl LoggingDaemon {
                     "heartbeat {}",
                     Local::now().format("%H:%M:%S")
                 );
-                thread::sleep(Duration::from_secs(1));
+                if sleep_with_cancellation(&thread_flag, Duration::from_secs(1)) {
+                    break;
+                }
             }
             info!(target: "daemon", "stopping");
         });
@@ -1356,20 +1595,18 @@ impl LoggingDaemon {
         }
     }
 
-    fn shutdown(mut self) {
+    fn shutdown(self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        // Thread will exit on next sleep_with_cancellation check (max 100ms)
+        // Drop impl will not block
     }
 }
 
 impl Drop for LoggingDaemon {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        // Thread will exit on next sleep_with_cancellation check (max 100ms)
+        // Don't block on join during app termination
     }
 }
 
@@ -1410,9 +1647,8 @@ impl RepeatingTask {
 impl Drop for RepeatingTask {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        // Thread will exit on next sleep_with_cancellation check (max 100ms)
+        // Don't block on join during app termination
     }
 }
 
@@ -1449,9 +1685,8 @@ impl DelayedTask {
 impl Drop for DelayedTask {
     fn drop(&mut self) {
         self.cancel();
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        // Thread will exit on next sleep_with_cancellation check (max 100ms)
+        // Don't block on join during app termination
     }
 }
 
@@ -1531,7 +1766,7 @@ impl ScreenRecorder {
         let recording_config = SCRecordingOutputConfiguration::new()
             .with_output_url(&file_path)
             .with_video_codec(SCRecordingOutputCodec::H264)
-            .with_output_file_type(SCRecordingOutputFileType::MOV);
+            .with_output_file_type(SCRecordingOutputFileType::MP4);
 
         let recording_output =
             SCRecordingOutput::new(&recording_config).ok_or(CaptureError::RecordingUnavailable)?;
@@ -1662,7 +1897,7 @@ impl From<EncodingError> for CaptureError {
 fn recording_file_path() -> PathBuf {
     let mut path = env::temp_dir();
     let stamp = Local::now().format("%Y%m%d-%H%M%S");
-    path.push(format!("cleo-recording-{stamp}.mov"));
+    path.push(format!("cleo-recording-{stamp}.mp4"));
     path
 }
 
@@ -2017,12 +2252,15 @@ impl BatchUploader {
                             result.uploaded, result.failed
                         );
                         total_processed += result.uploaded;
+                        // Only delete files on successful upload
+                        for (path, _) in safe_uploads {
+                            let _ = fs::remove_file(&path);
+                        }
                     }
-                    Err(e) => error!("Batch upload failed: {}", e),
-                }
-                // Delete all files after upload attempt
-                for (path, _) in safe_uploads {
-                    let _ = fs::remove_file(&path);
+                    Err(e) => {
+                        eprintln!("[DEBUG] Batch upload failed, keeping files for retry: {}", e);
+                        error!("Batch upload failed: {}", e);
+                    }
                 }
             }
         }
@@ -2141,8 +2379,7 @@ impl BatchUploader {
 
             let format = match path.extension().and_then(|e| e.to_str()) {
                 Some("mov") => VideoFormat::QuickTime,
-                Some("mp4") => VideoFormat::Mp4,
-                _ => VideoFormat::QuickTime,
+                Some("mp4") | _ => VideoFormat::Mp4,
             };
 
             safe_uploads.push((path, bytes, format));
@@ -2159,15 +2396,24 @@ impl BatchUploader {
                 .map(|(_, bytes, format)| (bytes.clone(), *format))
                 .collect();
             match api.upload_videos(batch) {
-                Ok(result) => info!(
-                    "Batch upload complete: {} uploaded, {} failed",
-                    result.uploaded, result.failed
-                ),
-                Err(e) => error!("Batch upload failed: {}", e),
-            }
-            // Delete all files after upload attempt
-            for (path, _, _) in safe_uploads {
-                let _ = fs::remove_file(&path);
+                Ok(result) => {
+                    eprintln!(
+                        "[recording] Batch upload complete: {} uploaded, {} failed",
+                        result.uploaded, result.failed
+                    );
+                    info!(
+                        "Batch upload complete: {} uploaded, {} failed",
+                        result.uploaded, result.failed
+                    );
+                    // Only delete files on successful upload
+                    for (path, _, _) in safe_uploads {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[recording] Batch upload failed, keeping files for retry: {}", e);
+                    error!("Batch upload failed: {}", e);
+                }
             }
         }
     }
@@ -2176,8 +2422,7 @@ impl BatchUploader {
 impl Drop for BatchUploader {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        // Thread will exit on next sleep_with_cancellation check (max 100ms)
+        // Don't block on join during app termination
     }
 }

@@ -15,7 +15,8 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const BUCKET_NAME: &str = "cleo_multimedia_data";
+use crate::constants::BUCKET_NAME;
+
 const MAX_TURNS: usize = 40;
 
 // Tool definitions
@@ -55,6 +56,31 @@ pub struct GetMoreContext {
     pub query: String,
 }
 
+/// A single tweet within a thread
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThreadTweetInput {
+    /// Tweet text (max 280 chars)
+    pub text: String,
+    /// Capture IDs to attach as images
+    pub image_capture_ids: Option<Vec<i64>>,
+    /// Video timestamp to clip from (e.g., "0:30")
+    pub video_timestamp: Option<String>,
+    /// Duration of video clip in seconds
+    pub video_duration: Option<u32>,
+}
+
+/// Create a tweet thread (multiple tweets posted as a reply chain).
+/// Use this when content deserves deeper exploration than a single tweet.
+#[derive(Tool, Serialize, Deserialize, Debug)]
+pub struct WriteThread {
+    /// Optional title for the thread (for user organization, not posted)
+    pub title: Option<String>,
+    /// The tweets in order. First tweet posts normally, rest reply to previous.
+    pub tweets: Vec<ThreadTweetInput>,
+    /// Why this is thread-worthy (vs individual tweets)
+    pub rationale: String,
+}
+
 // Collateral output types
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +90,10 @@ pub struct TweetCollateral {
     pub image_capture_ids: Vec<i64>,
     pub rationale: String,
     pub created_at: DateTime<Utc>,
+    /// Thread ID if this tweet belongs to a thread
+    pub thread_id: Option<i64>,
+    /// Position in thread (0-indexed)
+    pub thread_position: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,6 +101,14 @@ pub struct VideoClip {
     pub source_capture_id: i64,
     pub start_timestamp: String,
     pub duration_secs: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadMetadata {
+    pub id: i64,
+    pub title: Option<String>,
+    #[allow(dead_code)]
+    pub tweet_count: usize,
 }
 
 #[derive(Debug)]
@@ -82,7 +120,10 @@ pub struct AgentContext {
     pub window_start: DateTime<Utc>,
     pub window_end: DateTime<Utc>,
     pub tweets: Vec<TweetCollateral>,
+    pub threads: Vec<ThreadMetadata>,
     pub completed: bool,
+    /// Counter for generating thread IDs within a run
+    pub next_thread_id: i64,
 }
 
 // Data fetching
@@ -106,6 +147,11 @@ pub struct ActivityRecord {
     pub window: Option<String>,
 }
 
+/// Maximum captures to fetch for agent context (prevents OOM on large time windows)
+const MAX_AGENT_CAPTURES: i64 = 100;
+/// Maximum activities to fetch for agent context
+const MAX_AGENT_ACTIVITIES: i64 = 500;
+
 pub async fn fetch_captures_in_window(
     db: &PgPool,
     user_id: i64,
@@ -118,33 +164,36 @@ pub async fn fetch_captures_in_window(
         FROM captures
         WHERE user_id = $1 AND captured_at >= $2 AND captured_at < $3
         ORDER BY captured_at ASC
+        LIMIT $4
         "#,
     )
     .bind(user_id)
     .bind(start)
     .bind(end)
+    .bind(MAX_AGENT_CAPTURES)
     .fetch_all(db)
     .await
 }
 
 pub async fn fetch_activities_in_window(
     db: &PgPool,
-    _user_id: i64,
+    user_id: i64,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Vec<ActivityRecord>, sqlx::Error> {
-    // Activities don't have user_id directly, but we can join through interval
-    // For now, fetch all in window - adjust based on your schema
     sqlx::query_as::<_, ActivityRecord>(
         r#"
         SELECT id, timestamp, event_type, application, "window"
         FROM activities
-        WHERE timestamp >= $1 AND timestamp < $2
+        WHERE user_id = $1 AND timestamp >= $2 AND timestamp < $3
         ORDER BY timestamp ASC
+        LIMIT $4
         "#,
     )
+    .bind(user_id)
     .bind(start)
     .bind(end)
+    .bind(MAX_AGENT_ACTIVITIES)
     .fetch_all(db)
     .await
 }
@@ -220,10 +269,12 @@ pub async fn record_run(
     Ok(())
 }
 
+#[allow(dead_code)] // Kept for reference; save_threads_and_tweets is now preferred
 pub async fn save_tweet(
     db: &PgPool,
     user_id: i64,
     tweet: &TweetCollateral,
+    thread_id_map: &std::collections::HashMap<i64, i64>, // Maps temp ID -> real DB ID
 ) -> Result<i64, sqlx::Error> {
     let video_clip_json = tweet
         .video_clip
@@ -231,10 +282,13 @@ pub async fn save_tweet(
         .map(|c| serde_json::to_value(c).unwrap());
     let image_ids: Vec<i64> = tweet.image_capture_ids.clone();
 
+    // Map temp thread_id to real DB thread_id
+    let real_thread_id = tweet.thread_id.and_then(|tid| thread_id_map.get(&tid).copied());
+
     let row: (i64,) = sqlx::query_as(
         r#"
-        INSERT INTO tweet_collateral (user_id, text, video_clip, image_capture_ids, rationale, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO tweet_collateral (user_id, text, video_clip, image_capture_ids, rationale, created_at, thread_id, thread_position)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING id
         "#,
     )
@@ -244,10 +298,90 @@ pub async fn save_tweet(
     .bind(&image_ids)
     .bind(&tweet.rationale)
     .bind(tweet.created_at)
+    .bind(real_thread_id)
+    .bind(tweet.thread_position)
     .fetch_one(db)
     .await?;
 
     Ok(row.0)
+}
+
+#[allow(dead_code)] // Kept for reference; save_threads_and_tweets is now preferred
+pub async fn save_thread(
+    db: &PgPool,
+    user_id: i64,
+    thread: &ThreadMetadata,
+) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        r#"
+        INSERT INTO tweet_threads (user_id, title, status, created_at)
+        VALUES ($1, $2, 'draft', NOW())
+        RETURNING id
+        "#,
+    )
+    .bind(user_id)
+    .bind(&thread.title)
+    .fetch_one(db)
+    .await?;
+    Ok(row.0)
+}
+
+/// Save threads and tweets atomically in a transaction
+/// If any tweet fails to save, all threads and tweets are rolled back
+pub async fn save_threads_and_tweets(
+    db: &PgPool,
+    user_id: i64,
+    threads: &[ThreadMetadata],
+    tweets: &[TweetCollateral],
+) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin().await?;
+
+    // Save threads first and build mapping from temp ID -> real DB ID
+    let mut thread_id_map = std::collections::HashMap::new();
+    for thread in threads {
+        let row: (i64,) = sqlx::query_as(
+            r#"
+            INSERT INTO tweet_threads (user_id, title, status, created_at)
+            VALUES ($1, $2, 'draft', NOW())
+            RETURNING id
+            "#,
+        )
+        .bind(user_id)
+        .bind(&thread.title)
+        .fetch_one(&mut *tx)
+        .await?;
+        thread_id_map.insert(thread.id, row.0);
+    }
+
+    // Save tweets
+    for tweet in tweets {
+        let video_clip_json = tweet
+            .video_clip
+            .as_ref()
+            .map(|c| serde_json::to_value(c).unwrap());
+        let image_ids: Vec<i64> = tweet.image_capture_ids.clone();
+        let real_thread_id = tweet.thread_id.and_then(|tid| thread_id_map.get(&tid).copied());
+
+        sqlx::query(
+            r#"
+            INSERT INTO tweet_collateral (user_id, text, video_clip, image_capture_ids, rationale, created_at, thread_id, thread_position)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "#,
+        )
+        .bind(user_id)
+        .bind(&tweet.text)
+        .bind(video_clip_json)
+        .bind(&image_ids)
+        .bind(&tweet.rationale)
+        .bind(tweet.created_at)
+        .bind(real_thread_id)
+        .bind(tweet.thread_position)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
 }
 
 // Agent implementation
@@ -261,7 +395,7 @@ pub struct UploadedMedia {
     pub is_video: bool,
 }
 
-#[agentic(model = "gemini:gemini-2.0-flash")]
+#[agentic(model = "gemini:gemini-3.0-flash")]
 pub async fn run_collateral_agent(
     context: Arc<Mutex<AgentContext>>,
     captures: Vec<CaptureRecord>,
@@ -280,7 +414,7 @@ pub async fn run_collateral_agent(
             WriteTweet::schema(),
             ToolFunction::Async(Box::new({
                 let ctx = ctx.clone();
-                let media = media_for_tool;
+                let media = media_for_tool.clone();
                 move |args| {
                     let ctx = ctx.clone();
                     let media = media.clone();
@@ -307,6 +441,8 @@ pub async fn run_collateral_agent(
                             image_capture_ids: tweet.image_capture_ids.unwrap_or_default(),
                             rationale: tweet.rationale.clone(),
                             created_at: Utc::now(),
+                            thread_id: None,
+                            thread_position: None,
                         };
 
                         guard.tweets.push(collateral);
@@ -431,6 +567,73 @@ pub async fn run_collateral_agent(
         )
         .await?;
 
+    // Register WriteThread tool
+    runtime
+        .register_tool_with_schema(
+            WriteThread::tool_name(),
+            WriteThread::description(),
+            WriteThread::schema(),
+            ToolFunction::Async(Box::new({
+                let ctx = ctx.clone();
+                let media = media_for_tool.clone();
+                move |args| {
+                    let ctx = ctx.clone();
+                    let media = media.clone();
+                    Box::pin(async move {
+                        println!("[agent] WriteThread tool called with args: {:?}", args);
+                        let thread: WriteThread = serde_json::from_value(args)?;
+                        let mut guard = ctx.lock().await;
+
+                        if thread.tweets.is_empty() {
+                            return Ok("Error: Thread must have at least one tweet".to_string());
+                        }
+
+                        // Generate thread ID (will be replaced with real DB ID when saved)
+                        let thread_id = guard.next_thread_id;
+                        guard.next_thread_id += 1;
+
+                        // Convert each tweet input to TweetCollateral with thread info
+                        for (position, tweet_input) in thread.tweets.iter().enumerate() {
+                            let video_clip = if let Some(ts) = &tweet_input.video_timestamp {
+                                media.iter().find(|m| m.is_video).map(|m| VideoClip {
+                                    source_capture_id: m.capture_id,
+                                    start_timestamp: ts.clone(),
+                                    duration_secs: tweet_input.video_duration.unwrap_or(10),
+                                })
+                            } else {
+                                None
+                            };
+
+                            let collateral = TweetCollateral {
+                                text: tweet_input.text.clone(),
+                                video_clip,
+                                image_capture_ids: tweet_input.image_capture_ids.clone().unwrap_or_default(),
+                                rationale: thread.rationale.clone(),
+                                created_at: Utc::now(),
+                                thread_id: Some(thread_id),
+                                thread_position: Some(position as i32),
+                            };
+                            guard.tweets.push(collateral);
+                        }
+
+                        // Store thread metadata
+                        guard.threads.push(ThreadMetadata {
+                            id: thread_id,
+                            title: thread.title.clone(),
+                            tweet_count: thread.tweets.len(),
+                        });
+
+                        Ok(format!(
+                            "Thread created with {} tweets{}",
+                            thread.tweets.len(),
+                            thread.title.as_ref().map(|t| format!(": {}", t)).unwrap_or_default()
+                        ))
+                    })
+                }
+            })),
+        )
+        .await?;
+
     // Build activity summary
     let activity_summary: String = activities
         .iter()
@@ -486,6 +689,15 @@ pub async fn run_collateral_agent(
         }
     }
 
+    // Extract window timestamps once to avoid multiple lock acquisitions
+    let (window_start_str, window_end_str) = {
+        let guard = ctx.lock().await;
+        (
+            guard.window_start.format("%Y-%m-%d %H:%M").to_string(),
+            guard.window_end.format("%Y-%m-%d %H:%M").to_string(),
+        )
+    };
+
     // Add text prompt
     let prompt = format!(
         r#"You are reviewing captured screen recordings and activity data to find tweet-worthy moments.
@@ -500,21 +712,29 @@ CAPTURES AVAILABLE:
 
 Your job is to:
 1. Review the videos and activity data
-2. Find interesting, funny, or notable moments that would make good tweets
-3. Use WriteTweet to create tweet content with specific timestamps
+2. Find interesting, funny, or notable moments
+3. Decide whether content deserves a single tweet or a thread:
+   - Use WriteTweet for standalone moments (quick wins, single observations)
+   - Use WriteThread for narrative arcs (debugging journeys, feature builds, learning progressions)
 4. When done reviewing, use MarkComplete
 
-Focus on:
-- Interesting work being done
-- Funny moments or reactions
-- Impressive accomplishments
-- Relatable developer moments
+THREAD GUIDELINES:
+- Threads should tell a story with a beginning, middle, and end
+- Each tweet in a thread should stand alone but connect to the narrative
+- Good thread length: 3-7 tweets (not too short, not overwhelming)
+- First tweet should hook the reader
+- Last tweet should have a takeaway or conclusion
 
-Be selective - only create tweets for genuinely interesting content. Quality over quantity.
+CONTENT GUIDELINES:
+- Target cadence: ~1 thread per work session + 2-3 standalone tweets
+- Be selective - quality over quantity
+- Focus on: interesting work, funny moments, accomplishments, relatable developer experiences
+- Avoid: mundane tasks, repetitive content, incomplete thoughts
+
+When you find thread-worthy content, group related moments together chronologically.
 "#,
-        // TODO: BAD. Change this to not require locking the context here.
-        { ctx.lock().await.window_start.format("%Y-%m-%d %H:%M") },
-        { ctx.lock().await.window_end.format("%Y-%m-%d %H:%M") },
+        window_start_str,
+        window_end_str,
         activity_summary,
         capture_summary
     );
@@ -660,8 +880,10 @@ pub async fn run_collateral_job(
 
     if captures.is_empty() {
         println!("[agent] User {} - no captures found in window", user_id);
-        // Nothing to process
-        record_run(&db, user_id, window_start, window_end, 0).await?;
+        // Nothing to process - record run for tracking (don't fail if this errors)
+        if let Err(e) = record_run(&db, user_id, window_start, window_end, 0).await {
+            eprintln!("[agent] Failed to record empty run: {}", e);
+        }
         return Ok(vec![]);
     }
 
@@ -745,28 +967,48 @@ pub async fn run_collateral_job(
         window_start,
         window_end,
         tweets: Vec::new(),
+        threads: Vec::new(),
         completed: false,
+        next_thread_id: 1,
     }));
 
-    // Run agent
-    run_collateral_agent(context.clone(), captures, activities, uploaded_media).await?;
+    // Run agent - ensure cleanup happens even on error
+    let agent_result = run_collateral_agent(context.clone(), captures, activities, uploaded_media).await;
+
+    // Helper to cleanup uploaded files
+    async fn cleanup_gemini_files(client: &GoogleGenAIClient, file_names: &[String]) {
+        for file_name in file_names {
+            if let Err(e) = client.delete_file(file_name).await {
+                eprintln!("[agent] Failed to cleanup Gemini file {}: {}", file_name, e);
+            }
+        }
+    }
+
+    // If agent failed, cleanup and return error
+    if let Err(e) = agent_result {
+        cleanup_gemini_files(&gemini_client, &uploaded_file_names).await;
+        return Err(e.into());
+    }
 
     // Get results
     let guard = context.lock().await;
     let tweets = guard.tweets.clone();
+    let threads = guard.threads.clone();
+    drop(guard); // Release lock before DB operations
 
-    // Save tweets to DB
-    for tweet in &tweets {
-        save_tweet(&db, user_id, tweet).await?;
+    // Save threads and tweets atomically - if any fails, all are rolled back
+    if let Err(e) = save_threads_and_tweets(&db, user_id, &threads, &tweets).await {
+        cleanup_gemini_files(&gemini_client, &uploaded_file_names).await;
+        return Err(e.into());
     }
 
-    // Record run
-    record_run(&db, user_id, window_start, window_end, tweets.len() as i32).await?;
+    // Record run - if this fails, cleanup but don't error (tweets are already saved)
+    if let Err(e) = record_run(&db, user_id, window_start, window_end, tweets.len() as i32).await {
+        eprintln!("[agent] Failed to record run (tweets already saved): {}", e);
+    }
 
     // Cleanup uploaded video files from Gemini File API
-    for file_name in uploaded_file_names {
-        let _ = gemini_client.delete_file(&file_name).await;
-    }
+    cleanup_gemini_files(&gemini_client, &uploaded_file_names).await;
 
     Ok(tweets)
 }

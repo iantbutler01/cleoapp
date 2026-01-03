@@ -1,0 +1,8 @@
+	<key>LSUIElement</key>
+	<false/>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Cleo needs screen recording permission to capture screenshots and recordings of your workflow.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Cleo may use the camera if you enable video recording features.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Cleo may use the microphone if you enable audio recording features.</string>

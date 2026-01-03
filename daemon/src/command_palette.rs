@@ -53,6 +53,7 @@ const KEY_DOWN: u16 = 125;
 const KEY_T: u16 = 17;
 const KEY_R: u16 = 15;
 const KEY_S: u16 = 1;
+const KEY_B: u16 = 11;
 
 /// Commands available in the palette
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +61,15 @@ pub enum PaletteCommand {
     ToggleCapture,
     ToggleRecording,
     TakeScreenshot,
+    ToggleBanApp,
+}
+
+/// State needed to render command labels
+pub struct PaletteState {
+    pub auto_capture_enabled: bool,
+    pub recording: bool,
+    pub current_app_name: Option<String>,
+    pub current_app_banned: bool,
 }
 
 impl PaletteCommand {
@@ -68,6 +78,7 @@ impl PaletteCommand {
             PaletteCommand::ToggleCapture,
             PaletteCommand::ToggleRecording,
             PaletteCommand::TakeScreenshot,
+            PaletteCommand::ToggleBanApp,
         ]
     }
 
@@ -76,6 +87,7 @@ impl PaletteCommand {
             PaletteCommand::ToggleCapture => "T",
             PaletteCommand::ToggleRecording => "R",
             PaletteCommand::TakeScreenshot => "S",
+            PaletteCommand::ToggleBanApp => "B",
         }
     }
 
@@ -84,26 +96,34 @@ impl PaletteCommand {
             PaletteCommand::ToggleCapture => "power",
             PaletteCommand::ToggleRecording => "record.circle",
             PaletteCommand::TakeScreenshot => "camera",
+            PaletteCommand::ToggleBanApp => "eye.slash",
         }
     }
 
-    pub fn label(&self, auto_capture_enabled: bool, recording: bool) -> &'static str {
+    pub fn label(&self, state: &PaletteState) -> String {
         match self {
             PaletteCommand::ToggleCapture => {
-                if auto_capture_enabled {
-                    "Auto Capture: ON"
+                if state.auto_capture_enabled {
+                    "Auto Capture: ON".to_string()
                 } else {
-                    "Auto Capture: OFF"
+                    "Auto Capture: OFF".to_string()
                 }
             }
             PaletteCommand::ToggleRecording => {
-                if recording {
-                    "Stop Recording"
+                if state.recording {
+                    "Stop Recording".to_string()
                 } else {
-                    "Start Recording"
+                    "Start Recording".to_string()
                 }
             }
-            PaletteCommand::TakeScreenshot => "Take Screenshot",
+            PaletteCommand::TakeScreenshot => "Take Screenshot".to_string(),
+            PaletteCommand::ToggleBanApp => {
+                match &state.current_app_name {
+                    Some(name) if state.current_app_banned => format!("Unban {}", name),
+                    Some(name) => format!("Ban {}", name),
+                    None => "Ban Current App".to_string(),
+                }
+            }
         }
     }
 }
@@ -141,6 +161,8 @@ pub struct CommandPalette {
     selected_index: Cell<usize>,
     auto_capture_enabled: Cell<bool>,
     recording: Cell<bool>,
+    current_app_name: RefCell<Option<String>>,
+    current_app_banned: Cell<bool>,
 }
 
 impl CommandPalette {
@@ -348,7 +370,13 @@ impl CommandPalette {
                 let label = NSTextField::new(mtm);
                 label.setFrame(label_frame);
 
-                let text = NSString::from_str(cmd.label(true, false));
+                let initial_state = PaletteState {
+                    auto_capture_enabled: true,
+                    recording: false,
+                    current_app_name: None,
+                    current_app_banned: false,
+                };
+                let text = NSString::from_str(&cmd.label(&initial_state));
                 label.setStringValue(&text);
                 label.setBezeled(false);
                 label.setDrawsBackground(false);
@@ -427,6 +455,8 @@ impl CommandPalette {
             selected_index: Cell::new(0),
             auto_capture_enabled: Cell::new(true),
             recording: Cell::new(false),
+            current_app_name: RefCell::new(None),
+            current_app_banned: Cell::new(false),
         };
 
         palette.update_selection();
@@ -537,6 +567,7 @@ impl CommandPalette {
                 self.hide();
                 Some(PaletteCommand::TakeScreenshot)
             }
+            KEY_B => Some(PaletteCommand::ToggleBanApp),
             _ => None,
         }
     }
@@ -625,17 +656,28 @@ impl CommandPalette {
     }
 
     fn update_labels(&self) {
-        let auto_capture_enabled = self.auto_capture_enabled.get();
-        let recording = self.recording.get();
+        let state = PaletteState {
+            auto_capture_enabled: self.auto_capture_enabled.get(),
+            recording: self.recording.get(),
+            current_app_name: self.current_app_name.borrow().clone(),
+            current_app_banned: self.current_app_banned.get(),
+        };
         let labels = self.command_labels.borrow();
 
         for (i, cmd) in PaletteCommand::all().iter().enumerate() {
             if let Some(label) = labels.get(i) {
-                let text = cmd.label(auto_capture_enabled, recording);
-                let ns_text = NSString::from_str(text);
+                let text = cmd.label(&state);
+                let ns_text = NSString::from_str(&text);
                 label.setStringValue(&ns_text);
             }
         }
+    }
+
+    /// Update the current app state for the ban toggle
+    pub fn set_current_app(&self, app_name: Option<String>, is_banned: bool) {
+        *self.current_app_name.borrow_mut() = app_name;
+        self.current_app_banned.set(is_banned);
+        self.update_labels();
     }
 }
 

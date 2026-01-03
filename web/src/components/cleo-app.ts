@@ -1,20 +1,26 @@
 import { LitElement, html } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { api } from '../api';
+import { tailwindStyles } from '../styles/shared';
 import './login-page';
 import './dashboard-page';
 
 @customElement('cleo-app')
 export class CleoApp extends LitElement {
+  static styles = [tailwindStyles];
+
   @state() isLoggedIn = false;
   @state() loading = true;
-
-  createRenderRoot() {
-    return this;
-  }
+  @state() authError: string | null = null;
 
   async connectedCallback() {
     super.connectedCallback();
+
+    // Set up callback for when session expires
+    api.setUnauthorizedCallback(() => {
+      this.isLoggedIn = false;
+    });
+
     await this.checkAuth();
   }
 
@@ -22,43 +28,37 @@ export class CleoApp extends LitElement {
     // Check if we're handling OAuth callback
     const params = new URLSearchParams(window.location.search);
     const code = params.get('code');
-    const state = params.get('state');
+    const stateParam = params.get('state');
 
-    if (code && state) {
-      // OAuth callback - exchange code for session
+    if (code && stateParam) {
+      // OAuth callback - exchange code for session (sets httpOnly cookies)
       try {
-        const res = await fetch('/api/auth/twitter/token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ code, state }),
-        });
-        if (res.ok) {
-          const data = await res.json();
-          api.setUserId(data.user_id);
-          this.isLoggedIn = true;
-        }
-        // Clean up URL
-        window.history.replaceState({}, '', '/');
+        await api.exchangeToken(code, stateParam);
+        this.isLoggedIn = true;
+        this.authError = null;
       } catch (e) {
         console.error('OAuth callback failed:', e);
+        this.authError = 'Login failed. Please try again.';
       }
+      // Clean up URL
+      window.history.replaceState({}, '', '/');
+      this.loading = false;
+      return;
     }
 
-    // Check if we have a stored user_id
-    if (api.getUserId()) {
-      try {
-        await api.getMe();
-        this.isLoggedIn = true;
-      } catch {
-        api.clearUserId();
-        this.isLoggedIn = false;
-      }
+    // Check if we have a valid session by calling /auth/me
+    try {
+      await api.checkSession();
+      this.isLoggedIn = true;
+    } catch {
+      this.isLoggedIn = false;
     }
 
     this.loading = false;
   }
 
-  handleLogout() {
+  async handleLogout() {
+    await api.logout();
     this.isLoggedIn = false;
   }
 
@@ -73,6 +73,6 @@ export class CleoApp extends LitElement {
 
     return this.isLoggedIn
       ? html`<dashboard-page @logout=${this.handleLogout}></dashboard-page>`
-      : html`<login-page></login-page>`;
+      : html`<login-page .error=${this.authError}></login-page>`;
   }
 }

@@ -1,2 +1,36 @@
 @import "tailwindcss";
 @plugin "daisyui";
+
+/* Custom dark theme with mint green accent */
+@plugin "daisyui/theme" {
+  name: "dark";
+  default: true;
+
+  /* Mint green primary */
+  --color-primary: oklch(75% 0.15 160);
+  --color-primary-content: oklch(15% 0.01 240);
+
+  /* Monochrome secondary */
+  --color-secondary: oklch(40% 0.01 240);
+  --color-secondary-content: oklch(92% 0.01 240);
+
+  /* Mint accent */
+  --color-accent: oklch(75% 0.15 160);
+  --color-accent-content: oklch(15% 0.01 240);
+
+  /* Neutral grays */
+  --color-neutral: oklch(22% 0.01 240);
+  --color-neutral-content: oklch(85% 0.01 240);
+
+  /* Base surfaces */
+  --color-base-100: oklch(18% 0.01 240);
+  --color-base-200: oklch(15% 0.01 240);
+  --color-base-300: oklch(25% 0.01 240);
+  --color-base-content: oklch(85% 0.01 240);
+
+  /* Status colors - keep defaults but ensure they work */
+  --color-info: oklch(70% 0.15 220);
+  --color-success: oklch(70% 0.15 145);
+  --color-warning: oklch(75% 0.15 85);
+  --color-error: oklch(65% 0.2 25);
+}
