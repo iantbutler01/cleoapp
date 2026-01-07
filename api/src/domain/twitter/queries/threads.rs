@@ -429,11 +429,11 @@ pub async fn mark_thread_tweet_posted<'e, E>(
     user_id: i64,
     twitter_id: &str,
     reply_to: Option<&str>,
-) -> Result<(), sqlx::Error>
+) -> Result<bool, sqlx::Error>
 where
     E: Executor<'e, Database = Postgres>,
 {
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         UPDATE tweet_collateral
         SET posted_at = NOW(), tweet_id = $1, reply_to_tweet_id = $2
@@ -446,7 +446,8 @@ where
     .bind(user_id)
     .execute(executor)
     .await?;
-    Ok(())
+
+    Ok(result.rows_affected() > 0)
 }
 
 /// Verify all tweets belong to a specific thread and user
@@ -546,14 +547,16 @@ where
 pub async fn get_max_thread_position<'e, E>(
     executor: E,
     thread_id: i64,
+    user_id: i64,
 ) -> Result<Option<i32>, sqlx::Error>
 where
     E: Executor<'e, Database = Postgres>,
 {
     let (max_pos,): (Option<i32>,) = sqlx::query_as(
-        "SELECT MAX(thread_position) FROM tweet_collateral WHERE thread_id = $1",
+        "SELECT MAX(thread_position) FROM tweet_collateral WHERE thread_id = $1 AND user_id = $2",
     )
     .bind(thread_id)
+    .bind(user_id)
     .fetch_one(executor)
     .await?;
 

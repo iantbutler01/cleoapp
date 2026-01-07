@@ -269,63 +269,6 @@ pub async fn record_run(
     Ok(())
 }
 
-#[allow(dead_code)] // Kept for reference; save_threads_and_tweets is now preferred
-pub async fn save_tweet(
-    db: &PgPool,
-    user_id: i64,
-    tweet: &TweetCollateral,
-    thread_id_map: &std::collections::HashMap<i64, i64>, // Maps temp ID -> real DB ID
-) -> Result<i64, sqlx::Error> {
-    let video_clip_json = tweet
-        .video_clip
-        .as_ref()
-        .map(|c| serde_json::to_value(c).unwrap());
-    let image_ids: Vec<i64> = tweet.image_capture_ids.clone();
-
-    // Map temp thread_id to real DB thread_id
-    let real_thread_id = tweet.thread_id.and_then(|tid| thread_id_map.get(&tid).copied());
-
-    let row: (i64,) = sqlx::query_as(
-        r#"
-        INSERT INTO tweet_collateral (user_id, text, video_clip, image_capture_ids, rationale, created_at, thread_id, thread_position)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id
-        "#,
-    )
-    .bind(user_id)
-    .bind(&tweet.text)
-    .bind(video_clip_json)
-    .bind(&image_ids)
-    .bind(&tweet.rationale)
-    .bind(tweet.created_at)
-    .bind(real_thread_id)
-    .bind(tweet.thread_position)
-    .fetch_one(db)
-    .await?;
-
-    Ok(row.0)
-}
-
-#[allow(dead_code)] // Kept for reference; save_threads_and_tweets is now preferred
-pub async fn save_thread(
-    db: &PgPool,
-    user_id: i64,
-    thread: &ThreadMetadata,
-) -> Result<i64, sqlx::Error> {
-    let row: (i64,) = sqlx::query_as(
-        r#"
-        INSERT INTO tweet_threads (user_id, title, status, created_at)
-        VALUES ($1, $2, 'draft', NOW())
-        RETURNING id
-        "#,
-    )
-    .bind(user_id)
-    .bind(&thread.title)
-    .fetch_one(db)
-    .await?;
-    Ok(row.0)
-}
-
 /// Save threads and tweets atomically in a transaction
 /// If any tweet fails to save, all threads and tweets are rolled back
 pub async fn save_threads_and_tweets(

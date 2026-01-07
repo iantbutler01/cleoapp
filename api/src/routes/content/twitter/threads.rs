@@ -274,7 +274,7 @@ async fn add_tweet_to_thread(
         pos
     } else {
         // Get max position and append
-        let max_pos = threads::get_max_thread_position(&mut *tx, thread_id)
+        let max_pos = threads::get_max_thread_position(&mut *tx, thread_id, user_id)
             .await
             .log_500("Get max thread position error")?;
         max_pos.map(|p| p + 1).unwrap_or(0)

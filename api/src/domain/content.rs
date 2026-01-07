@@ -1,7 +1,7 @@
 //! Content domain - unified content queries with DB-level pagination
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool, Postgres};
 use std::collections::HashMap;
 
 use super::twitter::{Thread, ThreadWithTweets, Tweet};
@@ -66,11 +66,14 @@ impl ContentStatusFilter {
 }
 
 /// Count total content items (tweets + threads) with status filter
-pub async fn count_content(
-    db: &PgPool,
+pub async fn count_content<'e, E>(
+    executor: E,
     user_id: i64,
     status_filter: Option<&str>,
-) -> Result<i64, sqlx::Error> {
+) -> Result<i64, sqlx::Error>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let filter = ContentStatusFilter::from_str(status_filter);
 
     let query = format!(
@@ -87,7 +90,7 @@ pub async fn count_content(
         filter.thread_where()
     );
 
-    let (count,): (i64,) = sqlx::query_as(&query).bind(user_id).fetch_one(db).await?;
+    let (count,): (i64,) = sqlx::query_as(&query).bind(user_id).fetch_one(executor).await?;
     Ok(count)
 }
 

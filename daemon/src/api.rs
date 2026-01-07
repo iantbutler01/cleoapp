@@ -80,7 +80,7 @@ pub struct ApiClient {
 impl ApiClient {
     /// Create a new client targeting the provided base URL.
     pub fn new(base_url: impl Into<String>, auth_token: Option<String>) -> Result<Self, ApiError> {
-        let http = Client::builder().timeout(Duration::from_secs(10)).build()?;
+        let http = Client::builder().timeout(Duration::from_secs(60)).build()?;
 
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
