@@ -20,6 +20,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -40,10 +41,8 @@ use chrono::{Local, Utc};
 use log::{debug, error, info, warn};
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{sel, MainThreadOnly};
-use objc2_app_kit::{
-    NSAlert, NSAlertStyle, NSApplication, NSMenu, NSMenuItem, NSTextField,
-};
+use objc2::{MainThreadOnly, sel};
+use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSMenu, NSMenuItem, NSTextField};
 use objc2_foundation::{MainThreadMarker, NSString};
 use png::{BitDepth, ColorType, Encoder, EncodingError};
 use screencapturekit::error::SCError;
@@ -60,7 +59,10 @@ use image_hasher::{HashAlg, HasherConfig, ImageHash};
 
 use crate::accessibility::{ActiveWindowInfo, check_accessibility_trusted};
 use crate::api::{ActivityEntry, ActivityEvent, ApiClient, ApiError, ImageFormat, VideoFormat};
-use crate::app::{App, MenuBuilder, MenuItemHandle, StatusItem, terminate};
+use crate::app::{
+    App, MenuBuilder, MenuItemHandle, StatusItem, TerminateReply,
+    reply_to_application_should_terminate, terminate,
+};
 use crate::banned_apps_window::BannedAppsWindow;
 use crate::command_palette::{CommandPalette, HotkeyTracker, PaletteCommand};
 use crate::content_filter::{ContentFilter, NoOpFilter, NsfwFilter};
@@ -256,6 +258,42 @@ fn main() {
         }
     });
 
+    app.on_should_terminate({
+        move || {
+            let (api, pending) = DAEMON.with(|d| {
+                if let Some(ref daemon) = *d.borrow() {
+                    let pending = daemon.take_activity_events();
+                    let api = daemon.api_client().ok();
+                    (api, pending)
+                } else {
+                    (None, Vec::new())
+                }
+            });
+
+            let Some(api) = api else {
+                return TerminateReply::Now;
+            };
+            if pending.is_empty() {
+                return TerminateReply::Now;
+            }
+
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let result = api.upload_activity(&pending);
+                let _ = tx.send(result.is_ok());
+            });
+
+            thread::spawn(move || {
+                let _ = rx.recv_timeout(Duration::from_secs(2));
+                dispatch2::DispatchQueue::main().exec_async(|| {
+                    reply_to_application_should_terminate(true);
+                });
+            });
+
+            TerminateReply::Later
+        }
+    });
+
     app.on_will_terminate({
         move || {
             DAEMON.with(|d| {
@@ -358,7 +396,13 @@ impl CleoDaemon {
         self.menu_handles.replace(Some(handles));
         self.menu_targets.replace(targets);
 
-        let status_item = StatusItem::new(mtm, "menubar-icon", "message.fill", "Cleo Screen Recorder", menu);
+        let status_item = StatusItem::new(
+            mtm,
+            "menubar-icon",
+            "message.fill",
+            "Cleo Screen Recorder",
+            menu,
+        );
         self.status_item.replace(Some(status_item));
 
         self.logging_daemon.replace(Some(LoggingDaemon::start()));
@@ -387,7 +431,7 @@ impl CleoDaemon {
         self.stop_screenshot_timer();
         self.stop_activity_flush_timer();
         self.stop_limits_refresh_timer();
-        self.flush_activity_events();
+        self.flush_activity_events_async();
     }
 
     fn on_message(&self, message: AppMessage) {
@@ -502,8 +546,7 @@ impl CleoDaemon {
 
     fn stop_batch_uploader(&self) {
         if let Some(uploader) = self.batch_uploader.borrow_mut().take() {
-            uploader.stop.store(true, Ordering::Relaxed);
-            // Don't wait for thread - let it terminate in background
+            uploader.shutdown();
         }
     }
 
@@ -552,7 +595,10 @@ impl CleoDaemon {
     fn is_app_banned(&self, app_name: &str) -> bool {
         let settings = self.privacy_settings.borrow();
         let app_lower = app_name.to_lowercase();
-        settings.blocked_apps.iter().any(|blocked| blocked.to_lowercase() == app_lower)
+        settings
+            .blocked_apps
+            .iter()
+            .any(|blocked| blocked.to_lowercase() == app_lower)
     }
 
     /// Toggle the ban status of the currently focused app
@@ -571,7 +617,9 @@ impl CleoDaemon {
             if is_banned {
                 // Remove from blocked list (case-insensitive match)
                 let app_lower = app_name.to_lowercase();
-                settings.blocked_apps.retain(|blocked| blocked.to_lowercase() != app_lower);
+                settings
+                    .blocked_apps
+                    .retain(|blocked| blocked.to_lowercase() != app_lower);
                 info!("Unbanned app: {}", app_name);
             } else {
                 // Add to blocked list
@@ -582,7 +630,10 @@ impl CleoDaemon {
             // Always add to known_apps when banning (user-curated list)
             if !is_banned {
                 let app_lower = app_name.to_lowercase();
-                let already_known = settings.known_apps.iter().any(|k| k.to_lowercase() == app_lower);
+                let already_known = settings
+                    .known_apps
+                    .iter()
+                    .any(|k| k.to_lowercase() == app_lower);
                 if !already_known {
                     settings.known_apps.push(app_name.clone());
                 }
@@ -619,7 +670,9 @@ impl CleoDaemon {
             } else {
                 // Remove from blocked list (case-insensitive match)
                 let app_lower = app_name.to_lowercase();
-                settings.blocked_apps.retain(|blocked| blocked.to_lowercase() != app_lower);
+                settings
+                    .blocked_apps
+                    .retain(|blocked| blocked.to_lowercase() != app_lower);
                 info!("Unbanned app: {}", app_name);
             }
         }
@@ -804,11 +857,17 @@ impl CleoDaemon {
             let settings = self.privacy_settings.borrow();
 
             // Build list of (app_name, is_banned) from known_apps
-            let apps: Vec<(String, bool)> = settings.known_apps.iter().map(|app| {
-                let is_banned = settings.blocked_apps.iter()
-                    .any(|b| b.to_lowercase() == app.to_lowercase());
-                (app.clone(), is_banned)
-            }).collect();
+            let apps: Vec<(String, bool)> = settings
+                .known_apps
+                .iter()
+                .map(|app| {
+                    let is_banned = settings
+                        .blocked_apps
+                        .iter()
+                        .any(|b| b.to_lowercase() == app.to_lowercase());
+                    (app.clone(), is_banned)
+                })
+                .collect();
 
             // Clone what we need for the callback
             let on_toggle = move |app_name: String, is_banned: bool| {
@@ -923,6 +982,38 @@ impl CleoDaemon {
         let sent = pending.len().min(buffer.len());
         buffer.drain(0..sent);
         info!(target: "activity", "Flushed {sent} activity event(s) to API");
+    }
+
+    fn take_activity_events(&self) -> Vec<ActivityEntry> {
+        let mut buffer = self.activity_events.borrow_mut();
+        if buffer.is_empty() {
+            return Vec::new();
+        }
+        buffer.drain(..).collect()
+    }
+
+    fn flush_activity_events_async(&self) {
+        let pending = {
+            let buffer = self.activity_events.borrow();
+            if buffer.is_empty() {
+                return;
+            }
+            buffer.clone()
+        };
+
+        let api = match self.api_client() {
+            Ok(client) => client,
+            Err(err) => {
+                error!("Cannot upload activity events during shutdown: {err}");
+                return;
+            }
+        };
+
+        thread::spawn(move || {
+            if let Err(err) = api.upload_activity(&pending) {
+                error!("Failed to upload activity events during shutdown: {err}");
+            }
+        });
     }
 
     fn ensure_api_client(&self) {
@@ -1273,8 +1364,7 @@ impl CleoDaemon {
             let icon_name = NSString::from_str("key.fill");
             if let Some(icon) =
                 objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                    &icon_name,
-                    None,
+                    &icon_name, None,
                 )
             {
                 alert.setIcon(Some(&icon));
@@ -1352,9 +1442,8 @@ fn build_status_menu(
 ) -> (Retained<NSMenu>, MenuHandles, Vec<Retained<AnyObject>>) {
     let builder = MenuBuilder::new(mtm, "");
 
-    let (builder, record_handle) = builder
-        .add_disabled_label("Hello, world!")
-        .add_action_item_with_handle("Start Recording", "", || {
+    let (builder, record_handle) =
+        builder.add_action_item_with_handle("Start Recording", "", || {
             dispatch_main(AppMessage::ToggleRecording);
         });
 
@@ -2057,6 +2146,13 @@ impl BatchUploader {
         }
     }
 
+    fn shutdown(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            std::mem::forget(handle);
+        }
+    }
+
     fn process_pending(api: &ApiClient, content_filter: &dyn ContentFilter) {
         eprintln!("[DEBUG] process_pending() called");
         // Process screenshots - batch classify then upload, processing ALL files continuously
@@ -2258,7 +2354,10 @@ impl BatchUploader {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[DEBUG] Batch upload failed, keeping files for retry: {}", e);
+                        eprintln!(
+                            "[DEBUG] Batch upload failed, keeping files for retry: {}",
+                            e
+                        );
                         error!("Batch upload failed: {}", e);
                     }
                 }
@@ -2411,7 +2510,10 @@ impl BatchUploader {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[recording] Batch upload failed, keeping files for retry: {}", e);
+                    eprintln!(
+                        "[recording] Batch upload failed, keeping files for retry: {}",
+                        e
+                    );
                     error!("Batch upload failed: {}", e);
                 }
             }

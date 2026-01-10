@@ -17,9 +17,16 @@ use url::Url;
 
 /// Callback type for application lifecycle events
 type DidFinishLaunchingCallback = Box<dyn FnMut() + 'static>;
-type ShouldTerminateCallback = Box<dyn Fn() -> bool + 'static>;
+type ShouldTerminateCallback = Box<dyn Fn() -> TerminateReply + 'static>;
 type WillTerminateCallback = Box<dyn FnMut() + 'static>;
 type OpenUrlsCallback = Box<dyn FnMut(Vec<Url>) + 'static>;
+
+#[derive(Clone, Copy)]
+pub enum TerminateReply {
+    Now,
+    Cancel,
+    Later,
+}
 
 /// Thread-local storage for callbacks
 thread_local! {
@@ -384,14 +391,18 @@ fn app_delegate_class() -> &'static AnyClass {
             _sel: Sel,
             _sender: *mut AnyObject,
         ) -> usize {
-            let should = SHOULD_TERMINATE.with(|cb| {
+            let reply = SHOULD_TERMINATE.with(|cb| {
                 if let Some(callback) = cb.borrow().as_ref() {
                     callback()
                 } else {
-                    true
+                    TerminateReply::Now
                 }
             });
-            if should { 1 } else { 2 } // NSTerminateNow = 1, NSTerminateCancel = 2
+            match reply {
+                TerminateReply::Cancel => 0, // NSTerminateCancel
+                TerminateReply::Now => 1,    // NSTerminateNow
+                TerminateReply::Later => 2,  // NSTerminateLater
+            }
         }
 
         unsafe {
@@ -487,7 +498,7 @@ impl App {
     }
 
     /// Set the callback for applicationShouldTerminate
-    pub fn on_should_terminate<F: Fn() -> bool + 'static>(&self, callback: F) {
+    pub fn on_should_terminate<F: Fn() -> TerminateReply + 'static>(&self, callback: F) {
         SHOULD_TERMINATE.with(|cb| {
             *cb.borrow_mut() = Some(Box::new(callback));
         });
@@ -540,6 +551,15 @@ pub fn terminate() {
         let app = NSApplication::sharedApplication(mtm);
         unsafe {
             app.terminate(None);
+        }
+    }
+}
+
+pub fn reply_to_application_should_terminate(should_terminate: bool) {
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        unsafe {
+            let _: () = msg_send![&app, replyToApplicationShouldTerminate: should_terminate];
         }
     }
 }
