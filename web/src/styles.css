@@ -23,9 +23,9 @@
   --color-neutral-content: oklch(85% 0.01 240);
 
   /* Base surfaces */
-  --color-base-100: oklch(18% 0.01 240);
+  --color-base-100: oklch(25% 0.01 240);
   --color-base-200: oklch(15% 0.01 240);
-  --color-base-300: oklch(25% 0.01 240);
+  --color-base-300: oklch(32% 0.01 240);
   --color-base-content: oklch(85% 0.01 240);
 
   /* Status colors - keep defaults but ensure they work */

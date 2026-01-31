@@ -38,7 +38,6 @@ const ThreadStatusSchema = z.enum(['draft', 'posting', 'posted', 'partial_failed
 
 const TweetThreadSchema = z.object({
   id: z.number(),
-  user_id: z.number(),
   title: z.string().nullable(),
   status: ThreadStatusSchema,
   created_at: z.string(),
@@ -118,7 +117,7 @@ const ApiTokenResponseSchema = z.object({
 
 const ContentItemSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('tweet') }).extend(ThreadTweetSchema.shape),
-  z.object({ type: z.literal('thread') }).extend(ThreadWithTweetsSchema.shape),
+  z.object({ type: z.literal('thread'), thread: TweetThreadSchema, tweets: z.array(ThreadTweetSchema) }),
 ]);
 
 const ContentResponseSchema = z.object({

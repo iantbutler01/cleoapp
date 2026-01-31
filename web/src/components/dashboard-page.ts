@@ -5,6 +5,7 @@ import { tailwindStyles } from "../styles/shared";
 import { groupContentByTime, TimelineSection } from "../utils/time-grouping";
 import "./tweet-card";
 import "./thread-card";
+import "./timeline-rail";
 
 @customElement("dashboard-page")
 export class DashboardPage extends LitElement {
@@ -14,6 +15,7 @@ export class DashboardPage extends LitElement {
   @state() content: ContentItem[] = [];
   @state() sections: TimelineSection[] = [];
   @state() loading = true;
+  @state() refreshing = false;
   @state() loadError: string | null = null;
   @state() apiToken: string | null = null;
   @state() showTokenModal = false;
@@ -101,7 +103,11 @@ export class DashboardPage extends LitElement {
       }
     });
 
-    if (closestId !== null && !Number.isNaN(closestId) && closestId !== this.activeItemId) {
+    if (
+      closestId !== null &&
+      !Number.isNaN(closestId) &&
+      closestId !== this.activeItemId
+    ) {
       this.activeItemId = closestId;
     }
   }
@@ -121,8 +127,19 @@ export class DashboardPage extends LitElement {
   }
 
   async loadData() {
-    this.loading = true;
+    // Use refreshing state if we already have content (keeps UI stable)
+    const isRefresh = this.content.length > 0;
+    if (isRefresh) {
+      this.refreshing = true;
+    } else {
+      this.loading = true;
+    }
     this.loadError = null;
+
+    // Minimum spinner display time to avoid flash
+    const minDisplayTime = 400;
+    const startTime = Date.now();
+
     try {
       const [user, contentResponse] = await Promise.all([
         api.getMe(),
@@ -135,7 +152,13 @@ export class DashboardPage extends LitElement {
       console.error("Failed to load data:", e);
       this.loadError = e instanceof Error ? e.message : "Failed to load data";
     } finally {
+      // Wait for minimum display time before hiding spinner
+      const elapsed = Date.now() - startTime;
+      if (elapsed < minDisplayTime) {
+        await new Promise(resolve => setTimeout(resolve, minDisplayTime - elapsed));
+      }
       this.loading = false;
+      this.refreshing = false;
     }
   }
 
@@ -189,7 +212,8 @@ export class DashboardPage extends LitElement {
       this.apiToken = result.api_token;
     } catch (e) {
       console.error("Failed to generate token:", e);
-      this.tokenError = e instanceof Error ? e.message : "Failed to generate token";
+      this.tokenError =
+        e instanceof Error ? e.message : "Failed to generate token";
     } finally {
       this.generatingToken = false;
     }
@@ -248,26 +272,30 @@ export class DashboardPage extends LitElement {
   }
 
   render() {
-    if (this.loading) {
-      return html`
-        <div class="flex justify-center items-center min-h-screen">
-          <span class="loading loading-spinner loading-lg"></span>
-        </div>
-      `;
-    }
-
     if (this.loadError) {
       return html`
         <div class="flex justify-center items-center min-h-screen">
           <div class="card bg-base-100 shadow-xl max-w-md">
             <div class="card-body items-center text-center">
-              <svg class="w-12 h-12 text-error" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+              <svg
+                class="w-12 h-12 text-error"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+                />
               </svg>
               <h2 class="card-title text-error">Failed to load</h2>
               <p class="text-base-content/70">${this.loadError}</p>
               <div class="card-actions mt-4">
-                <button class="btn btn-primary" @click=${this.loadData}>Try Again</button>
+                <button class="btn btn-primary" @click=${this.loadData}>
+                  Try Again
+                </button>
               </div>
             </div>
           </div>
@@ -324,10 +352,15 @@ export class DashboardPage extends LitElement {
                 <li>
                   <a
                     @click=${this.handleLogout}
-                    class="rounded-md text-error ${this.loggingOut ? 'pointer-events-none opacity-50' : ''}"
+                    class="rounded-md text-error ${this.loggingOut
+                      ? "pointer-events-none opacity-50"
+                      : ""}"
                   >
                     ${this.loggingOut
-                      ? html`<span class="loading loading-spinner loading-xs"></span> Logging out...`
+                      ? html`<span
+                            class="loading loading-spinner loading-xs"
+                          ></span>
+                          Logging out...`
                       : "Logout"}
                   </a>
                 </li>
@@ -336,128 +369,124 @@ export class DashboardPage extends LitElement {
           </div>
         </div>
 
-        ${this.logoutError ? html`
-          <div class="alert alert-error mx-6 mt-2">
-            <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-5 w-5" fill="none" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-            <span>${this.logoutError}</span>
-            <button class="btn btn-ghost btn-xs" @click=${this.clearLogoutError}>Dismiss</button>
-          </div>
-        ` : ''}
+        ${this.logoutError
+          ? html`
+              <div class="alert alert-error mx-6 mt-2">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  class="stroke-current shrink-0 h-5 w-5"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="2"
+                    d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"
+                  />
+                </svg>
+                <span>${this.logoutError}</span>
+                <button
+                  class="btn btn-ghost btn-xs"
+                  @click=${this.clearLogoutError}
+                >
+                  Dismiss
+                </button>
+              </div>
+            `
+          : ""}
 
         <!-- 3-Panel Layout -->
         <div class="flex h-[calc(100vh-65px)]">
-          <!-- Left Sidebar - Floating Timeline -->
-          <div class="w-1/5 shrink-0 flex flex-col items-center pt-20 pl-4">
-            <!-- Timeline dots - floating alongside content -->
-            <div
-              class="sticky top-24 flex flex-col items-center bg-base-100/80 backdrop-blur-sm rounded-2xl py-4 px-3 border border-base-300/30 shadow-sm"
-            >
-              <div
-                class="absolute left-1/2 top-4 bottom-4 w-px bg-base-300/50 -translate-x-1/2"
-              ></div>
-              ${this.sections.map(
-                (section) => html`
-                  <div class="relative z-10 flex flex-col items-center">
-                    <div
-                      class="text-[9px] font-bold uppercase tracking-wider text-base-content/40 mb-2 px-1 py-0.5 bg-base-100 whitespace-nowrap"
-                    >
-                      ${section.label}
-                    </div>
-                    ${section.items.map((item) => {
-                      const itemId =
-                        item.type === "tweet" ? item.id : item.thread.id;
-                      const isActive = this.activeItemId === itemId;
-                      return html`
-                        <button
-                          class="w-2 h-2 my-2 rounded-full transition-all
-                          ${isActive
-                            ? "bg-primary scale-150 ring-4 ring-primary/20"
-                            : "bg-base-300 hover:bg-primary/70 hover:scale-125"}"
-                          title="${item.type === "tweet"
-                            ? item.created_at
-                            : item.thread.created_at}"
-                          @click=${() => this.handleDotClick(itemId)}
-                        ></button>
-                      `;
-                    })}
-                    <div class="h-3"></div>
-                  </div>
-                `
-              )}
-            </div>
+          <!-- Left Sidebar - Timeline Rail -->
+          <div class="shrink-0 flex flex-col items-end pt-20 pl-4">
+            <timeline-rail
+              .sections=${this.sections}
+              .content=${this.content}
+              .scrollTarget=${this.scrollContainer}
+              .activeItemId=${this.activeItemId}
+              @dot-click=${(e: CustomEvent) =>
+                this.handleDotClick(e.detail.itemId)}
+            ></timeline-rail>
           </div>
 
           <!-- Center - Content Feed -->
-          <div class="content-scroll flex-1 overflow-y-auto py-6 px-8">
-            ${this.content.length === 0
-              ? html`
-                  <div class="max-w-xl mx-auto">
-                    <div class="card bg-base-100 rounded-2xl">
-                      <div class="card-body items-center text-center">
-                        <svg
-                          class="w-12 h-12 opacity-30"
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            stroke-width="1"
-                            d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"
-                          />
-                        </svg>
-                        <h2 class="card-title mt-3 text-base">
-                          No pending content
-                        </h2>
-                        <p class="opacity-50 text-sm">
-                          New suggestions will appear here when the AI finds
-                          interesting moments.
-                        </p>
+          <div class="flex-1 flex flex-col overflow-hidden">
+            <!-- Header (fixed, doesn't scroll) -->
+            <div class="px-8 py-4 border-base-300/30">
+              <div class="max-w-3xl mx-auto flex justify-between items-center">
+                <div>
+                  <h1 class="text-lg font-semibold text-base-content">Queue</h1>
+                  <p class="text-xs text-base-content/50">
+                    ${this.content.length} items pending
+                  </p>
+                </div>
+                <button
+                  class="btn btn-ghost btn-sm gap-1.5"
+                  @click=${this.loadData}
+                >
+                  <svg
+                    class="w-3.5 h-3.5"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      stroke-width="2"
+                      d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                    />
+                  </svg>
+                  Refresh
+                </button>
+              </div>
+            </div>
+            <!-- Scrollable content -->
+            <div class="content-scroll flex-1 overflow-y-auto py-6 px-8 relative">
+              <!-- Loading overlay (just for content area) -->
+              ${(this.loading || this.refreshing) ? html`
+                <div class="absolute inset-0 z-10 flex justify-center items-center bg-base-200/60 backdrop-blur-sm animate-in fade-in duration-150">
+                  <span class="loading loading-spinner loading-lg"></span>
+                </div>
+              ` : ''}
+              ${this.content.length === 0
+                ? html`
+                    <div class="max-w-3xl mx-auto">
+                      <div class="card bg-base-100 rounded-2xl">
+                        <div class="card-body items-center text-center">
+                          <svg
+                            class="w-12 h-12 opacity-30"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              stroke-width="1"
+                              d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"
+                            />
+                          </svg>
+                          <h2 class="card-title mt-3 text-base">
+                            No pending content
+                          </h2>
+                          <p class="opacity-50 text-sm">
+                            New suggestions will appear here when the AI finds
+                            interesting moments.
+                          </p>
+                        </div>
                       </div>
                     </div>
-                  </div>
-                `
-              : html`
-                  <!-- Header -->
-                  <div class="max-w-xl mx-auto mb-6">
-                    <div class="flex justify-between items-center">
-                      <div>
-                        <h1 class="text-lg font-semibold text-base-content">
-                          Queue
-                        </h1>
-                        <p class="text-xs text-base-content/50">
-                          ${this.content.length} items pending
-                        </p>
-                      </div>
-                      <button
-                        class="btn btn-ghost btn-sm gap-1.5"
-                        @click=${this.loadData}
-                      >
-                        <svg
-                          class="w-3.5 h-3.5"
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            stroke-width="2"
-                            d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
-                          />
-                        </svg>
-                        Refresh
-                      </button>
+                  `
+                : html`
+                    <div class="space-y-4 w-full max-w-3xl mx-auto">
+                      ${this.content.map((item) =>
+                        this.renderContentItem(item)
+                      )}
                     </div>
-                  </div>
-                  <!-- Cards -->
-                  <div class="space-y-4 flex flex-col items-center">
-                    ${this.content.map((item) => this.renderContentItem(item))}
-                  </div>
-                `}
+                  `}
+            </div>
           </div>
 
           <!-- Right Sidebar - Context Panel -->
@@ -562,18 +591,29 @@ export class DashboardPage extends LitElement {
                   ${this.tokenError
                     ? html`
                         <div class="alert alert-error mt-4">
-                          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+                          <svg
+                            class="w-5 h-5"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              stroke-width="2"
+                              d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+                            />
                           </svg>
                           <span>${this.tokenError}</span>
                         </div>
                       `
                     : ""}
-
                   ${this.loadingToken
                     ? html`
                         <div class="mt-4 text-center py-4">
-                          <span class="loading loading-spinner loading-md"></span>
+                          <span
+                            class="loading loading-spinner loading-md"
+                          ></span>
                         </div>
                       `
                     : this.apiToken

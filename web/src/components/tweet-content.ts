@@ -3,6 +3,7 @@ import { customElement, property, state } from 'lit/decorators.js';
 import { ThreadTweet, api } from '../api';
 import { tailwindStyles } from '../styles/shared';
 import './media-browser';
+import './media-editor';
 
 interface MediaUrl {
   url: string;
@@ -26,6 +27,9 @@ export class TweetContent extends LitElement {
   @state() mediaError: string | null = null;
   @state() mediaBrowserOpen = false;
   @state() fullscreenImage: string | null = null;
+  @state() editorOpen = false;
+  @state() editorCaptureId: number | null = null;
+  @state() editorMediaType: 'image' | 'video' = 'image';
 
   async connectedCallback() {
     super.connectedCallback();
@@ -111,6 +115,65 @@ export class TweetContent extends LitElement {
     }));
   }
 
+  openEditor(captureId: number, mediaType: 'image' | 'video') {
+    this.editorCaptureId = captureId;
+    this.editorMediaType = mediaType;
+    this.editorOpen = true;
+  }
+
+  handleEditorClose() {
+    this.editorOpen = false;
+  }
+
+  async handleEditComplete(e: CustomEvent<{ newCaptureId: number }>) {
+    if (!this.tweet) return;
+    const { newCaptureId } = e.detail;
+    this.editorOpen = false;
+
+    // Replace the edited capture with the new one in the tweet
+    if (this.editorMediaType === 'video' && this.tweet.video_clip) {
+      // Update video clip with new capture
+      await api.updateTweetCollateral(this.tweet.id, {
+        image_capture_ids: [],
+        video_clip: {
+          source_capture_id: newCaptureId,
+          start_timestamp: '00:00:00',
+          duration_secs: this.tweet.video_clip.duration_secs,
+        },
+      });
+      this.tweet = {
+        ...this.tweet,
+        video_clip: {
+          ...this.tweet.video_clip,
+          source_capture_id: newCaptureId,
+        },
+      };
+    } else if (this.editorCaptureId) {
+      // Replace the edited image with the new one
+      const newImageIds = this.tweet.image_capture_ids.map((id) =>
+        id === this.editorCaptureId ? newCaptureId : id
+      );
+      await api.updateTweetCollateral(this.tweet.id, {
+        image_capture_ids: newImageIds,
+        video_clip: null,
+      });
+      this.tweet = {
+        ...this.tweet,
+        image_capture_ids: newImageIds,
+      };
+    }
+
+    await this.loadMedia();
+    this.dispatchEvent(new CustomEvent('collateral-updated', {
+      detail: {
+        imageIds: this.tweet.image_capture_ids,
+        videoId: this.tweet.video_clip?.source_capture_id ?? null,
+      },
+      bubbles: true,
+      composed: true,
+    }));
+  }
+
   renderMedia() {
     if (this.loadingMedia) {
       return html`
@@ -140,7 +203,7 @@ export class TweetContent extends LitElement {
     if (!hasMedia) {
       return html`
         <button
-          class="mt-3 w-full aspect-square max-w-md mx-auto rounded-2xl border-2 border-dashed border-base-300 bg-base-200/50
+          class="mt-3 w-full aspect-square max-w-lg mx-auto rounded-2xl border-2 border-dashed border-base-300 bg-base-200/50
             flex items-center justify-center gap-2 text-base-content/50 hover:border-primary/50 hover:text-primary/70 transition-colors"
           @click=${this.openMediaBrowser}
         >
@@ -162,7 +225,7 @@ export class TweetContent extends LitElement {
       : 'aspect-square';
 
     return html`
-      <div class="mt-3 ${aspectClass} max-w-md mx-auto rounded-2xl overflow-hidden bg-base-200 relative">
+      <div class="mt-3 ${aspectClass} max-w-lg mx-auto rounded-2xl overflow-hidden bg-base-200 relative">
         ${this.videoUrl
           ? html`
               <video
@@ -175,16 +238,45 @@ export class TweetContent extends LitElement {
             `
           : this.renderImageGrid()}
 
-        <!-- Edit button badge -->
-        <button
-          class="absolute top-2 right-2 btn btn-circle btn-sm bg-base-100/80 hover:bg-base-100 border-0 shadow-md"
-          @click=${this.openMediaBrowser}
-          title="Edit media"
-        >
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
-          </svg>
-        </button>
+        <!-- Action buttons -->
+        <div class="absolute top-2 right-2 flex gap-1">
+          <!-- Crop/Trim button -->
+          ${this.tweet?.video_clip
+            ? html`
+                <button
+                  class="btn btn-circle btn-sm bg-base-100/80 hover:bg-base-100 border-0 shadow-md"
+                  @click=${() => this.openEditor(this.tweet!.video_clip!.source_capture_id, 'video')}
+                  title="Trim video"
+                >
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.121 14.121L19 19m-7-7l7-7m-7 7l-2.879 2.879M12 12L9.121 9.121m0 5.758a3 3 0 10-4.243 4.243 3 3 0 004.243-4.243zm0-5.758a3 3 0 10-4.243-4.243 3 3 0 004.243 4.243z" />
+                  </svg>
+                </button>
+              `
+            : this.imageUrls.length === 1
+              ? html`
+                  <button
+                    class="btn btn-circle btn-sm bg-base-100/80 hover:bg-base-100 border-0 shadow-md"
+                    @click=${() => this.openEditor(this.tweet!.image_capture_ids[0], 'image')}
+                    title="Crop image"
+                  >
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h2M4 8V6a2 2 0 012-2h2m8 16h2a2 2 0 002-2v-2m0-8V6a2 2 0 00-2-2h-2" />
+                    </svg>
+                  </button>
+                `
+              : ''}
+          <!-- Change media button -->
+          <button
+            class="btn btn-circle btn-sm bg-base-100/80 hover:bg-base-100 border-0 shadow-md"
+            @click=${this.openMediaBrowser}
+            title="Change media"
+          >
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            </svg>
+          </button>
+        </div>
 
         ${this.tweet?.video_clip
           ? html`
@@ -320,6 +412,15 @@ export class TweetContent extends LitElement {
         @close=${this.handleMediaBrowserClose}
         @collateral-updated=${this.handleCollateralUpdated}
       ></media-browser>
+
+      <!-- Media editor modal -->
+      <media-editor
+        .open=${this.editorOpen}
+        .captureId=${this.editorCaptureId}
+        .mediaType=${this.editorMediaType}
+        @close=${this.handleEditorClose}
+        @edit-complete=${this.handleEditComplete}
+      ></media-editor>
 
       <!-- Fullscreen image overlay -->
       ${this.fullscreenImage

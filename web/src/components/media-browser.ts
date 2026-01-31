@@ -3,6 +3,7 @@ import { customElement, property, state } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
 import { CaptureItem, api } from '../api';
 import { tailwindStyles } from '../styles/shared';
+import './media-editor';
 
 @customElement('media-browser')
 export class MediaBrowser extends LitElement {
@@ -78,6 +79,9 @@ export class MediaBrowser extends LitElement {
   @state() saveError: string | null = null;
   @state() filterType: string = '';
   @state() fullscreen = false;
+  @state() editorOpen = false;
+  @state() editorCaptureId: number | null = null;
+  @state() editorMediaType: 'image' | 'video' = 'image';
 
   async connectedCallback() {
     super.connectedCallback();
@@ -242,6 +246,36 @@ export class MediaBrowser extends LitElement {
     }
   }
 
+  openEditor() {
+    if (!this.selectedCapture) return;
+    this.editorCaptureId = this.selectedCapture.id;
+    this.editorMediaType = this.selectedCapture.media_type === 'video' ? 'video' : 'image';
+    this.editorOpen = true;
+  }
+
+  handleEditorClose() {
+    this.editorOpen = false;
+  }
+
+  handleEditComplete(e: CustomEvent<{ newCaptureId: number }>) {
+    const { newCaptureId } = e.detail;
+    this.editorOpen = false;
+    // Reload captures to include the newly created edited capture
+    this.loadCaptures();
+    // Select the new capture
+    const newCapture = this.captures.find((c) => c.id === newCaptureId);
+    if (newCapture) {
+      this.selectCapture(newCapture);
+      // Add to selection
+      if (newCapture.media_type === 'video') {
+        this.selectedVideoId = newCaptureId;
+        this.selectedIds = [];
+      } else {
+        this.selectedIds = [...this.selectedIds.filter((id) => id !== this.editorCaptureId), newCaptureId];
+      }
+    }
+  }
+
   formatTime(dateStr: string) {
     return new Date(dateStr).toLocaleString(undefined, {
       month: 'short',
@@ -375,15 +409,26 @@ export class MediaBrowser extends LitElement {
                           : html`<span class="text-error">No preview available</span>`}
                     ${this.previewUrl && !this.previewLoading
                       ? html`
-                          <button
-                            class="absolute top-2 right-2 btn btn-circle btn-sm btn-ghost bg-base-100/80"
-                            @click=${() => (this.fullscreen = true)}
-                            title="View fullscreen"
-                          >
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
-                            </svg>
-                          </button>
+                          <div class="absolute top-2 right-2 flex gap-1">
+                            <button
+                              class="btn btn-circle btn-sm btn-ghost bg-base-100/80"
+                              @click=${this.openEditor}
+                              title="Edit media"
+                            >
+                              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                              </svg>
+                            </button>
+                            <button
+                              class="btn btn-circle btn-sm btn-ghost bg-base-100/80"
+                              @click=${() => (this.fullscreen = true)}
+                              title="View fullscreen"
+                            >
+                              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                              </svg>
+                            </button>
+                          </div>
                         `
                       : ''}
                   </div>
@@ -486,6 +531,15 @@ export class MediaBrowser extends LitElement {
           }
         }}></div>
       </div>
+
+      <!-- Media Editor Modal -->
+      <media-editor
+        .open=${this.editorOpen}
+        .captureId=${this.editorCaptureId}
+        .mediaType=${this.editorMediaType}
+        @close=${this.handleEditorClose}
+        @edit-complete=${this.handleEditComplete}
+      ></media-editor>
     `;
   }
 

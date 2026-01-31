@@ -37,7 +37,7 @@ impl From<Tweet> for TweetResponse {
     }
 }
 
-/// Thread API response (user_id intentionally omitted for security)
+/// Thread API response
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadResponse {
     pub id: i64,
@@ -64,7 +64,6 @@ impl From<Thread> for ThreadResponse {
 /// Thread with tweets API response
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadWithTweetsResponse {
-    #[serde(flatten)]
     pub thread: ThreadResponse,
     pub tweets: Vec<TweetResponse>,
 }

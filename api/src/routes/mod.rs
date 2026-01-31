@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod captures;
 pub mod content;
+pub mod media_studio;
 pub mod twitter_oauth;
 pub mod user;
 
@@ -15,6 +16,7 @@ pub fn build_routes() -> Router<Arc<AppState>> {
         .merge(auth::routes())
         .merge(captures::routes())
         .merge(content::routes())
+        .merge(media_studio::routes())
         .merge(twitter_oauth::routes())
         .merge(user::routes())
 }
