@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cleo.fullname" . }}-web
+  labels:
+    {{- include "cleo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  type: ClusterIP
+  ports:
+    - port: 4173
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "cleo.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: web

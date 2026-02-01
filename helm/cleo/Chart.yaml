@@ -1,0 +1,6 @@
+apiVersion: v2
+name: cleo
+description: Cleo - AI-powered social media assistant
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -56,6 +56,18 @@ pub struct GetMoreContext {
     pub query: String,
 }
 
+/// Extract text from an image capture or video frame using OCR. Use this when you see text in a screenshot
+/// or video that would be valuable for creating tweet content (code snippets, error messages, UI text, etc.)
+#[derive(Tool, Serialize, Deserialize, Debug)]
+pub struct ExtractText {
+    /// The capture ID of the image or video to extract text from
+    pub capture_id: i64,
+    /// What kind of text you're looking for (e.g., "code", "error message", "tweet text")
+    pub context: String,
+    /// For videos: timestamp to extract frame from (e.g., "1:23" or "0:05"). Required for video captures.
+    pub timestamp: Option<String>,
+}
+
 /// A single tweet within a thread
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadTweetInput {
@@ -124,6 +136,8 @@ pub struct AgentContext {
     pub completed: bool,
     /// Counter for generating thread IDs within a run
     pub next_thread_id: i64,
+    /// Reducto API key for text extraction (optional)
+    pub reducto_api_key: Option<String>,
 }
 
 // Data fetching
@@ -325,6 +339,131 @@ pub async fn save_threads_and_tweets(
 
     tx.commit().await?;
     Ok(())
+}
+
+// Reducto API integration for text extraction
+
+#[derive(Deserialize, Debug)]
+struct ReductoResponse {
+    result: ReductoResult,
+}
+
+#[derive(Deserialize, Debug)]
+struct ReductoResult {
+    chunks: Vec<ReductoChunk>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ReductoChunk {
+    content: String,
+}
+
+/// Upload response from Reducto
+#[derive(Deserialize, Debug)]
+struct ReductoUploadResponse {
+    file_id: String,
+}
+
+/// Extract text from an image using Reducto's API
+async fn extract_text_with_reducto(
+    api_key: &str,
+    image_data: &[u8],
+    filename: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::new();
+
+    // Step 1: Upload the file
+    let form = reqwest::multipart::Form::new()
+        .part("file", reqwest::multipart::Part::bytes(image_data.to_vec())
+            .file_name(filename.to_string()));
+
+    let upload_response = client
+        .post("https://platform.reducto.ai/upload")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .multipart(form)
+        .send()
+        .await?;
+
+    if !upload_response.status().is_success() {
+        let status = upload_response.status();
+        let body = upload_response.text().await.unwrap_or_default();
+        return Err(format!("Reducto upload error {}: {}", status, body).into());
+    }
+
+    let upload_result: ReductoUploadResponse = upload_response.json().await?;
+
+    // Step 2: Parse the uploaded file
+    let parse_response = client
+        .post("https://platform.reducto.ai/parse")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "input": upload_result.file_id
+        }))
+        .send()
+        .await?;
+
+    if !parse_response.status().is_success() {
+        let status = parse_response.status();
+        let body = parse_response.text().await.unwrap_or_default();
+        return Err(format!("Reducto parse error {}: {}", status, body).into());
+    }
+
+    let result: ReductoResponse = parse_response.json().await?;
+
+    // Combine all chunks into one text block
+    let text = result
+        .result
+        .chunks
+        .iter()
+        .map(|c| c.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    Ok(text)
+}
+
+/// Extract a frame from a video at a specific timestamp using ffmpeg
+async fn extract_video_frame(
+    video_data: &[u8],
+    timestamp: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::process::Command;
+
+    // Write video to temp file
+    let temp_dir = std::env::temp_dir();
+    let video_path = temp_dir.join(format!("extract_frame_{}.mp4", rand::random::<u64>()));
+    let output_path = temp_dir.join(format!("extract_frame_{}.png", rand::random::<u64>()));
+
+    tokio::fs::write(&video_path, video_data).await?;
+
+    // Use ffmpeg to extract frame at timestamp
+    let output = Command::new("ffmpeg")
+        .args([
+            "-ss", timestamp,
+            "-i", video_path.to_str().unwrap(),
+            "-frames:v", "1",
+            "-y",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .await?;
+
+    // Clean up video file
+    let _ = tokio::fs::remove_file(&video_path).await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg failed: {}", stderr).into());
+    }
+
+    // Read the extracted frame
+    let frame_data = tokio::fs::read(&output_path).await?;
+
+    // Clean up frame file
+    let _ = tokio::fs::remove_file(&output_path).await;
+
+    Ok(frame_data)
 }
 
 // Agent implementation
@@ -577,6 +716,126 @@ pub async fn run_collateral_agent(
         )
         .await?;
 
+    // Register ExtractText tool
+    runtime
+        .register_tool_with_schema(
+            ExtractText::tool_name(),
+            ExtractText::description(),
+            ExtractText::schema(),
+            ToolFunction::Async(Box::new({
+                let ctx = ctx.clone();
+                let media = media_for_tool.clone();
+                move |args| {
+                    let ctx = ctx.clone();
+                    let media = media.clone();
+                    Box::pin(async move {
+                        println!("[agent] ExtractText tool called with args: {:?}", args);
+                        let request: ExtractText = serde_json::from_value(args)?;
+                        let guard = ctx.lock().await;
+
+                        // Check if we have Reducto API key
+                        let api_key = match &guard.reducto_api_key {
+                            Some(key) => key.clone(),
+                            None => {
+                                return Ok("ExtractText unavailable: REDUCTO_API_KEY not configured".to_string());
+                            }
+                        };
+
+                        // Find the capture in uploaded media
+                        let capture = media
+                            .iter()
+                            .find(|m| m.capture_id == request.capture_id);
+
+                        match capture {
+                            Some(cap) => {
+                                let (image_data, filename) = if cap.is_video {
+                                    // For videos, extract frame at timestamp
+                                    let timestamp = match &request.timestamp {
+                                        Some(ts) => ts.clone(),
+                                        None => {
+                                            return Ok("Error: timestamp is required for video captures. Specify the time (e.g., '1:23') where you see the text.".to_string());
+                                        }
+                                    };
+
+                                    // Look up the capture to get GCS path
+                                    let capture_record = sqlx::query_as::<_, CaptureRecord>(
+                                        "SELECT id, media_type, content_type, gcs_path, captured_at FROM captures WHERE id = $1"
+                                    )
+                                    .bind(request.capture_id)
+                                    .fetch_optional(&guard.db)
+                                    .await;
+
+                                    let capture_record = match capture_record {
+                                        Ok(Some(r)) => r,
+                                        Ok(None) => return Ok(format!("Capture {} not found in database", request.capture_id)),
+                                        Err(e) => return Ok(format!("Database error: {}", e)),
+                                    };
+
+                                    // Download video from GCS
+                                    let bucket = format!("projects/_/buckets/{}", crate::constants::BUCKET_NAME);
+                                    let mut resp = match guard.gcs.read_object(&bucket, &capture_record.gcs_path).send().await {
+                                        Ok(r) => r,
+                                        Err(e) => return Ok(format!("Failed to download video from GCS: {}", e)),
+                                    };
+
+                                    let mut video_data = Vec::new();
+                                    while let Some(chunk) = resp.next().await {
+                                        match chunk {
+                                            Ok(data) => video_data.extend_from_slice(&data),
+                                            Err(e) => return Ok(format!("Failed to read video data: {}", e)),
+                                        }
+                                    }
+
+                                    // Extract frame at timestamp
+                                    let frame_data = match extract_video_frame(&video_data, &timestamp).await {
+                                        Ok(data) => data,
+                                        Err(e) => return Ok(format!("Failed to extract frame at {}: {}", timestamp, e)),
+                                    };
+
+                                    (frame_data, format!("capture_{}_frame_{}.png", cap.capture_id, timestamp.replace(':', "_")))
+                                } else {
+                                    // Decode base64 image data
+                                    let data = match base64::engine::general_purpose::STANDARD
+                                        .decode(&cap.uri)
+                                    {
+                                        Ok(d) => d,
+                                        Err(e) => {
+                                            return Ok(format!("Failed to decode image: {}", e));
+                                        }
+                                    };
+                                    let ext = if cap.mime_type.contains("png") { "png" } else { "jpg" };
+                                    (data, format!("capture_{}.{}", cap.capture_id, ext))
+                                };
+
+                                // Call Reducto API
+                                match extract_text_with_reducto(&api_key, &image_data, &filename).await {
+                                    Ok(text) => {
+                                        if text.is_empty() {
+                                            Ok(format!(
+                                                "No text found in capture {} (context: {})",
+                                                request.capture_id, request.context
+                                            ))
+                                        } else {
+                                            Ok(format!(
+                                                "Extracted text from capture {} ({}):\n\n{}",
+                                                request.capture_id, request.context, text
+                                            ))
+                                        }
+                                    }
+                                    Err(e) => Ok(format!("Failed to extract text: {}", e)),
+                                }
+                            }
+                            None => Ok(format!(
+                                "Capture {} not found in uploaded media",
+                                request.capture_id
+                            )),
+                        }
+                    })
+                }
+            })),
+        )
+        .await?;
+
     // Build activity summary
     let activity_summary: String = activities
         .iter()
@@ -673,6 +932,13 @@ CONTENT GUIDELINES:
 - Be selective - quality over quantity
 - Focus on: interesting work, funny moments, accomplishments, relatable developer experiences
 - Avoid: mundane tasks, repetitive content, incomplete thoughts
+
+TEXT EXTRACTION:
+- Use ExtractText when you see valuable text in screenshots or videos (code snippets, error messages, UI text, terminal output)
+- For images: just provide the capture_id
+- For videos: provide capture_id AND timestamp (e.g., "1:23") - we'll extract that frame and OCR it
+- Extracted text can be quoted or referenced in tweets for accuracy
+- Especially useful for: code examples, error messages worth sharing, interesting terminal output
 
 When you find thread-worthy content, group related moments together chronologically.
 "#,
@@ -902,6 +1168,9 @@ pub async fn run_collateral_job(
         }
     }
 
+    // Get Reducto API key from env
+    let reducto_api_key = std::env::var("REDUCTO_API_KEY").ok();
+
     // Create agent context
     let context = Arc::new(Mutex::new(AgentContext {
         db: db.clone(),
@@ -913,6 +1182,7 @@ pub async fn run_collateral_job(
         threads: Vec::new(),
         completed: false,
         next_thread_id: 1,
+        reducto_api_key,
     }));
 
     // Run agent - ensure cleanup happens even on error

@@ -1,0 +1,77 @@
+# Default values for cleo
+
+# Container registry
+image:
+  registry: ""  # e.g., ghcr.io/username
+  pullPolicy: IfNotPresent
+
+# API configuration
+api:
+  image:
+    repository: cleo-api
+    tag: latest
+  replicas: 1
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "1000m"
+  env: {}
+    # DATABASE_URL: postgres://...
+    # TWITTER_CLIENT_ID: ...
+    # TWITTER_CLIENT_SECRET: ...
+    # JWT_SECRET: ...
+    # GOOGLE_GEMINI_API_KEY: ...
+    # REDUCTO_API_KEY: ...
+
+# Web configuration
+web:
+  image:
+    repository: cleo-web
+    tag: latest
+  replicas: 1
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "50m"
+    limits:
+      memory: "256Mi"
+      cpu: "200m"
+
+# Ingress configuration
+ingress:
+  enabled: true
+  className: ""  # e.g., nginx, traefik
+  annotations: {}
+  hosts:
+    - host: cleo.example.com
+      paths:
+        - path: /api
+          pathType: Prefix
+          service: api
+        - path: /media
+          pathType: Prefix
+          service: api
+        - path: /auth
+          pathType: Prefix
+          service: api
+        - path: /
+          pathType: Prefix
+          service: web
+  tls: []
+  #  - secretName: cleo-tls
+  #    hosts:
+  #      - cleo.example.com
+
+# External secrets (if using external-secrets operator or sealed-secrets)
+externalSecrets:
+  enabled: false
+  # secretStore: ...
+
+# Service account
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}

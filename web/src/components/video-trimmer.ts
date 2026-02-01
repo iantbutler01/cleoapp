@@ -153,7 +153,7 @@ export class VideoTrimmer extends LitElement {
   @property({ type: String }) startTimestamp = '00:00:00';
   @property({ type: Number }) durationSecs = 30;
 
-  // Internal state - two independent values
+  // Internal state - working values (can be modified freely)
   @state() private _startSecs = 0;
   @state() private _endSecs = 30;
   @state() private videoDuration = 0;
@@ -161,6 +161,12 @@ export class VideoTrimmer extends LitElement {
   @state() private playing = false;
   @state() private dragging: 'start' | 'end' | null = null;
   private wasDragging = false;
+
+  // Undo/redo history
+  private undoStack: Array<{ start: number; end: number }> = [];
+  private redoStack: Array<{ start: number; end: number }> = [];
+  @state() private canUndo = false;
+  @state() private canRedo = false;
 
   @query('video') private videoEl!: HTMLVideoElement;
   @query('.timeline-track') private trackEl!: HTMLDivElement;
@@ -173,13 +179,32 @@ export class VideoTrimmer extends LitElement {
     this._endSecs = this._startSecs + this.durationSecs;
     window.addEventListener('mousemove', this.handleMouseMove);
     window.addEventListener('mouseup', this.handleMouseUp);
+    window.addEventListener('keydown', this.handleKeyDown);
   }
 
   disconnectedCallback() {
     super.disconnectedCallback();
     window.removeEventListener('mousemove', this.handleMouseMove);
     window.removeEventListener('mouseup', this.handleMouseUp);
+    window.removeEventListener('keydown', this.handleKeyDown);
   }
+
+  private handleKeyDown = (e: KeyboardEvent) => {
+    // Cmd/Ctrl+Z for undo, Cmd/Ctrl+Shift+Z for redo
+    if ((e.metaKey || e.ctrlKey) && e.key === 'z') {
+      e.preventDefault();
+      if (e.shiftKey) {
+        this.redo();
+      } else {
+        this.undo();
+      }
+    }
+    // Cmd/Ctrl+Y for redo (Windows style)
+    if ((e.metaKey || e.ctrlKey) && e.key === 'y') {
+      e.preventDefault();
+      this.redo();
+    }
+  };
 
   private handleVideoMetadata() {
     this.videoDuration = this.videoEl.duration;
@@ -272,6 +297,8 @@ export class VideoTrimmer extends LitElement {
   private handleDragStart = (e: MouseEvent, type: 'start' | 'end') => {
     e.preventDefault();
     e.stopPropagation();
+    // Save state before drag begins
+    this.pushUndoState();
     this.dragging = type;
   };
 
@@ -304,6 +331,7 @@ export class VideoTrimmer extends LitElement {
     const input = e.target as HTMLInputElement;
     const newStart = parseTimestamp(input.value);
     if (newStart >= 0 && newStart < this._endSecs - 1) {
+      this.pushUndoState();
       this._startSecs = newStart;
       this.emitTrimChange();
     }
@@ -313,6 +341,7 @@ export class VideoTrimmer extends LitElement {
     const input = e.target as HTMLInputElement;
     const newEnd = parseTimestamp(input.value);
     if (newEnd > this._startSecs + 1 && newEnd <= this.videoDuration) {
+      this.pushUndoState();
       this._endSecs = newEnd;
       this.emitTrimChange();
     }
@@ -335,6 +364,42 @@ export class VideoTrimmer extends LitElement {
     this.videoEl.currentTime = this._startSecs;
     this.videoEl.play();
     this.playing = true;
+  }
+
+  /** Push current state to undo stack before making a change */
+  private pushUndoState() {
+    this.undoStack.push({ start: this._startSecs, end: this._endSecs });
+    this.redoStack = []; // Clear redo stack on new action
+    this.canUndo = true;
+    this.canRedo = false;
+  }
+
+  /** Undo last change */
+  private undo() {
+    if (this.undoStack.length === 0) return;
+    // Save current state to redo stack
+    this.redoStack.push({ start: this._startSecs, end: this._endSecs });
+    // Restore previous state
+    const prev = this.undoStack.pop()!;
+    this._startSecs = prev.start;
+    this._endSecs = prev.end;
+    this.canUndo = this.undoStack.length > 0;
+    this.canRedo = true;
+    this.emitTrimChange();
+  }
+
+  /** Redo last undone change */
+  private redo() {
+    if (this.redoStack.length === 0) return;
+    // Save current state to undo stack
+    this.undoStack.push({ start: this._startSecs, end: this._endSecs });
+    // Restore next state
+    const next = this.redoStack.pop()!;
+    this._startSecs = next.start;
+    this._endSecs = next.end;
+    this.canUndo = true;
+    this.canRedo = this.redoStack.length > 0;
+    this.emitTrimChange();
   }
 
   render() {
@@ -364,7 +429,7 @@ export class VideoTrimmer extends LitElement {
       </div>
 
       <!-- Controls -->
-      <div class="flex items-center gap-3 mt-3">
+      <div class="flex items-center gap-2 mt-3">
         <button class="btn btn-sm btn-circle" @click=${this.togglePlay}>
           ${this.playing
             ? html`<svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/></svg>`
@@ -373,9 +438,31 @@ export class VideoTrimmer extends LitElement {
         <span class="text-sm font-mono">
           ${formatTimestamp(this.currentTime)} / ${formatTimestamp(this.videoDuration)}
         </span>
-        <button class="btn btn-sm btn-ghost ml-auto" @click=${this.previewSelection}>
-          Preview Selection
-        </button>
+        <div class="ml-auto flex items-center gap-1">
+          <button
+            class="btn btn-sm btn-ghost"
+            @click=${this.undo}
+            ?disabled=${!this.canUndo}
+            title="Undo (Cmd+Z)"
+          >
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" />
+            </svg>
+          </button>
+          <button
+            class="btn btn-sm btn-ghost"
+            @click=${this.redo}
+            ?disabled=${!this.canRedo}
+            title="Redo (Cmd+Shift+Z)"
+          >
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 10h-10a8 8 0 00-8 8v2M21 10l-6 6m6-6l-6-6" />
+            </svg>
+          </button>
+          <button class="btn btn-sm btn-ghost" @click=${this.previewSelection}>
+            Preview
+          </button>
+        </div>
       </div>
 
       <!-- Timeline -->
