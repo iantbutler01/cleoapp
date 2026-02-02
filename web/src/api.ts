@@ -103,6 +103,25 @@ const SessionResponseSchema = z.object({
   username: z.string(),
 });
 
+// Nudges & Personas schemas
+const PersonaSchema = z.object({
+  id: z.number(),
+  name: z.string(),
+  slug: z.string(),
+  nudges: z.string(),
+});
+
+const UserPersonaSchema = z.object({
+  id: z.number(),
+  name: z.string(),
+  nudges: z.string(),
+});
+
+const NudgesResponseSchema = z.object({
+  nudges: z.string().nullable(),
+  selected_persona_id: z.number().nullable(),
+});
+
 const AuthUrlResponseSchema = z.object({
   url: z.string(),
 });
@@ -142,6 +161,9 @@ export type CaptureItem = z.infer<typeof CaptureItemSchema>;
 export type BrowseCapturesResponse = z.infer<typeof BrowseCapturesResponseSchema>;
 export type ContentItem = z.infer<typeof ContentItemSchema>;
 export type ContentResponse = z.infer<typeof ContentResponseSchema>;
+export type Persona = z.infer<typeof PersonaSchema>;
+export type UserPersona = z.infer<typeof UserPersonaSchema>;
+export type NudgesResponse = z.infer<typeof NudgesResponseSchema>;
 
 // WebSocket publish progress messages
 const PublishProgressSchema = z.discriminatedUnion('type', [
@@ -594,6 +616,42 @@ class ApiClient {
     if (params.status) query.set('status', params.status);
 
     return this.fetchJson(`${API_BASE}/content?${query.toString()}`, {}, 'Failed to get content', ContentResponseSchema);
+  }
+
+  // Nudges & Personas
+
+  async getPersonas(): Promise<Persona[]> {
+    return this.fetchJson(`${API_BASE}/personas`, {}, 'Failed to get personas', z.array(PersonaSchema));
+  }
+
+  async getUserPersonas(): Promise<UserPersona[]> {
+    return this.fetchJson(`${API_BASE}/me/personas`, {}, 'Failed to get user personas', z.array(UserPersonaSchema));
+  }
+
+  async createUserPersona(name: string): Promise<UserPersona> {
+    return this.fetchJson(
+      `${API_BASE}/me/personas`,
+      { method: 'POST', body: JSON.stringify({ name }) },
+      'Failed to create persona',
+      UserPersonaSchema
+    );
+  }
+
+  async deleteUserPersona(id: number): Promise<void> {
+    return this.fetchVoid(`${API_BASE}/me/personas/${id}`, { method: 'DELETE' }, 'Failed to delete persona');
+  }
+
+  async getNudges(): Promise<NudgesResponse> {
+    return this.fetchJson(`${API_BASE}/me/nudges`, {}, 'Failed to get nudges', NudgesResponseSchema);
+  }
+
+  async updateNudges(nudges: string, selectedPersonaId?: number | null): Promise<NudgesResponse> {
+    return this.fetchJson(
+      `${API_BASE}/me/nudges`,
+      { method: 'PUT', body: JSON.stringify({ nudges, selected_persona_id: selectedPersonaId }) },
+      'Failed to update nudges',
+      NudgesResponseSchema
+    );
   }
 }
 

@@ -4,6 +4,9 @@ import { ContentItem } from "../api";
 import { TimelineSection, formatTimeOfDay } from "../utils/time-grouping";
 import { tailwindStyles } from "../styles/shared";
 
+// Max items to show in the rail
+const MAX_RAIL_ITEMS = 15;
+
 @customElement("timeline-rail")
 export class TimelineRail extends LitElement {
   static styles = [tailwindStyles];
@@ -30,15 +33,30 @@ export class TimelineRail extends LitElement {
   }
 
   render() {
+    // Limit total items shown
+    let itemCount = 0;
+    const limitedSections: TimelineSection[] = [];
+
+    for (const section of this.sections) {
+      if (itemCount >= MAX_RAIL_ITEMS) break;
+
+      const remaining = MAX_RAIL_ITEMS - itemCount;
+      const items = section.items.slice(0, remaining);
+      if (items.length > 0) {
+        limitedSections.push({ ...section, items });
+        itemCount += items.length;
+      }
+    }
+
     return html`
       <div
-        class="sticky top-24 flex flex-col items-center bg-base-100/80 backdrop-blur-sm rounded-2xl py-4 px-3 border border-base-300/30 shadow-sm"
+        class="sticky top-24 flex flex-col items-center bg-base-100/80 backdrop-blur-sm rounded-xl py-4 px-3 border border-base-300/30 shadow-sm"
         @wheel=${this.handleRailWheel}
       >
         <div
           class="absolute left-1/2 top-4 bottom-4 w-px bg-base-300/50 -translate-x-1/2"
         ></div>
-        ${this.sections.map(
+        ${limitedSections.map(
           (section) => html`
             <div class="relative z-10 flex flex-col items-center">
               <div

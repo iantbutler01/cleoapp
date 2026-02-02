@@ -203,7 +203,7 @@ export class TweetContent extends LitElement {
     if (!hasMedia) {
       return html`
         <button
-          class="mt-3 w-full aspect-square max-w-lg mx-auto rounded-2xl border-2 border-dashed border-base-300 bg-base-200/50
+          class="mt-3 w-full aspect-video rounded-xl border-2 border-dashed border-base-300 bg-base-200/50
             flex items-center justify-center gap-2 text-base-content/50 hover:border-primary/50 hover:text-primary/70 transition-colors"
           @click=${this.openMediaBrowser}
         >
@@ -225,7 +225,7 @@ export class TweetContent extends LitElement {
       : 'aspect-square';
 
     return html`
-      <div class="mt-3 ${aspectClass} max-w-lg mx-auto rounded-2xl overflow-hidden bg-base-200 relative">
+      <div class="mt-3 ${aspectClass} rounded-xl overflow-hidden bg-base-200 relative">
         ${this.videoUrl
           ? html`
               <video

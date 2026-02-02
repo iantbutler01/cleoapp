@@ -31,13 +31,15 @@ use services::twitter::TwitterClient;
 
 #[derive(Clone)]
 pub struct AppState {
-    db: PgPool,
-    gcs: Storage,
-    twitter: TwitterClient,
+    pub db: PgPool,
+    pub gcs: Storage,
+    pub twitter: TwitterClient,
     /// Optional local storage path - if set, captures are written to disk instead of GCS
-    local_storage_path: Option<PathBuf>,
+    pub local_storage_path: Option<PathBuf>,
     /// Secret key for signing JWT access tokens
-    jwt_secret: Vec<u8>,
+    pub jwt_secret: Vec<u8>,
+    /// Gemini client for AI agent (optional)
+    pub gemini: Option<GoogleGenAIClient>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gemini = match std::env::var("GOOGLE_GEMINI_API_KEY") {
         Ok(key) => {
             println!("[startup] Gemini API key found, AI agent enabled");
-            Some(GoogleGenAIClient::new(&key, "gemini-3.0-flash"))
+            Some(GoogleGenAIClient::new(&key, "gemini-2.5-flash"))
         }
         Err(_) => {
             println!("[startup] GOOGLE_GEMINI_API_KEY not set, AI agent disabled");
@@ -162,10 +164,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         twitter,
         local_storage_path: local_storage_path.clone(),
         jwt_secret,
+        gemini: gemini.clone(),
     });
 
     // Start background scheduler for idle user processing (only if Gemini is configured)
-    if let Some(gemini_client) = gemini {
+    if let Some(gemini_client) = state.gemini.clone() {
         // Checks every 5 minutes for users idle for 30+ minutes
         tokio::spawn(agent::start_background_scheduler(
             pool.clone(),
@@ -173,6 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             gemini_client,
             1,  // idle_minutes
             30, // check_interval_secs (5 min)
+            local_storage_path.clone(),
         ));
         println!("[scheduler] Background scheduler started (30min idle, 5min check)");
     } else {

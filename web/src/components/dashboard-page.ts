@@ -6,6 +6,8 @@ import { groupContentByTime, TimelineSection } from "../utils/time-grouping";
 import "./tweet-card";
 import "./thread-card";
 import "./timeline-rail";
+import "./sidebar-toolbar";
+import "./nudges-modal";
 
 @customElement("dashboard-page")
 export class DashboardPage extends LitElement {
@@ -25,20 +27,31 @@ export class DashboardPage extends LitElement {
   @state() logoutError: string | null = null;
   @state() loggingOut = false;
   @state() activeItemId: number | null = null;
+  @state() showNudgesModal = false;
 
   private scrollContainer: HTMLElement | null = null;
   private rafId: number | null = null;
 
   async connectedCallback() {
     super.connectedCallback();
+    document.addEventListener("keydown", this.handleGlobalKeydown);
     await this.loadData();
   }
 
   disconnectedCallback() {
     super.disconnectedCallback();
+    document.removeEventListener("keydown", this.handleGlobalKeydown);
     if (this.rafId) cancelAnimationFrame(this.rafId);
     this.scrollContainer?.removeEventListener("scroll", this.handleScroll);
   }
+
+  private handleGlobalKeydown = (e: KeyboardEvent) => {
+    // Cmd+. or Ctrl+. to open nudges modal
+    if ((e.metaKey || e.ctrlKey) && e.key === ".") {
+      e.preventDefault();
+      this.showNudgesModal = true;
+    }
+  };
 
   protected updated(changedProperties: Map<string, unknown>) {
     super.updated(changedProperties);
@@ -398,8 +411,8 @@ export class DashboardPage extends LitElement {
 
         <!-- 3-Panel Layout -->
         <div class="flex h-[calc(100vh-65px)]">
-          <!-- Left Sidebar - Timeline Rail -->
-          <div class="shrink-0 flex flex-col items-end pt-20 pl-4">
+          <!-- Left Sidebar - Timeline Rail + Toolbar -->
+          <div class="shrink-0 flex items-start pt-20 pl-4">
             <timeline-rail
               .sections=${this.sections}
               .content=${this.content}
@@ -408,6 +421,9 @@ export class DashboardPage extends LitElement {
               @dot-click=${(e: CustomEvent) =>
                 this.handleDotClick(e.detail.itemId)}
             ></timeline-rail>
+            <sidebar-toolbar
+              @open-nudges=${() => (this.showNudgesModal = true)}
+            ></sidebar-toolbar>
           </div>
 
           <!-- Center - Content Feed -->
@@ -667,6 +683,13 @@ export class DashboardPage extends LitElement {
               </div>
             `
           : ""}
+
+        <!-- Nudges Modal -->
+        <nudges-modal
+          .open=${this.showNudgesModal}
+          @close=${() => (this.showNudgesModal = false)}
+          @nudges-saved=${() => (this.showNudgesModal = false)}
+        ></nudges-modal>
       </div>
     `;
   }
