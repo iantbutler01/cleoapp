@@ -129,21 +129,43 @@ export class ImageCropper extends LitElement {
   private setAspectRatio(ratio: number | null) {
     this.aspectRatio = ratio;
     if (ratio) {
-      // Adjust crop to match aspect ratio
+      // Calculate target aspect ratio in image-normalized coordinates
+      const targetAspect = ratio * (this.imageHeight / this.imageWidth);
       const currentAspect = this.cropWidth / this.cropHeight;
-      if (currentAspect > ratio) {
-        // Too wide, reduce width
-        const newWidth = this.cropHeight * ratio * (this.imageHeight / this.imageWidth);
-        const diff = this.cropWidth - newWidth;
-        this.cropX = Math.min(1 - newWidth, Math.max(0, this.cropX + diff / 2));
-        this.cropWidth = newWidth;
+
+      let newWidth = this.cropWidth;
+      let newHeight = this.cropHeight;
+      let newX = this.cropX;
+      let newY = this.cropY;
+
+      if (currentAspect > targetAspect) {
+        // Too wide, reduce width to match aspect
+        newWidth = this.cropHeight * targetAspect;
       } else {
-        // Too tall, reduce height
-        const newHeight = this.cropWidth / ratio * (this.imageWidth / this.imageHeight);
-        const diff = this.cropHeight - newHeight;
-        this.cropY = Math.min(1 - newHeight, Math.max(0, this.cropY + diff / 2));
-        this.cropHeight = newHeight;
+        // Too tall, reduce height to match aspect
+        newHeight = this.cropWidth / targetAspect;
       }
+
+      // Ensure dimensions don't exceed bounds (max 1.0)
+      if (newWidth > 1) {
+        newWidth = 1;
+        newHeight = newWidth / targetAspect;
+      }
+      if (newHeight > 1) {
+        newHeight = 1;
+        newWidth = newHeight * targetAspect;
+      }
+
+      // Center the crop box, clamping to valid bounds
+      const diffX = this.cropWidth - newWidth;
+      const diffY = this.cropHeight - newHeight;
+      newX = Math.max(0, Math.min(1 - newWidth, this.cropX + diffX / 2));
+      newY = Math.max(0, Math.min(1 - newHeight, this.cropY + diffY / 2));
+
+      this.cropX = newX;
+      this.cropY = newY;
+      this.cropWidth = newWidth;
+      this.cropHeight = newHeight;
       this.emitCropChange();
     }
   }
@@ -207,25 +229,36 @@ export class ImageCropper extends LitElement {
         if (this.dragging === 'n' || this.dragging === 's') {
           // Adjust width to match aspect ratio
           newWidth = newHeight * targetAspect;
-          if (newX + newWidth > 1) {
-            newWidth = 1 - newX;
-            newHeight = newWidth / targetAspect;
-          }
         } else {
           // Adjust height to match aspect ratio
           newHeight = newWidth / targetAspect;
-          if (newY + newHeight > 1) {
-            newHeight = 1 - newY;
-            newWidth = newHeight * targetAspect;
-          }
+        }
+
+        // Clamp to image bounds
+        if (newX + newWidth > 1) {
+          newWidth = 1 - newX;
+          newHeight = newWidth / targetAspect;
+        }
+        if (newY + newHeight > 1) {
+          newHeight = 1 - newY;
+          newWidth = newHeight * targetAspect;
+        }
+        if (newWidth > 1) {
+          newWidth = 1;
+          newHeight = newWidth / targetAspect;
+        }
+        if (newHeight > 1) {
+          newHeight = 1;
+          newWidth = newHeight * targetAspect;
         }
       }
     }
 
-    this.cropX = newX;
-    this.cropY = newY;
-    this.cropWidth = newWidth;
-    this.cropHeight = newHeight;
+    // Final bounds clamp to ensure 0-1 range
+    this.cropX = Math.max(0, Math.min(1 - newWidth, newX));
+    this.cropY = Math.max(0, Math.min(1 - newHeight, newY));
+    this.cropWidth = Math.max(0.05, Math.min(1, newWidth));
+    this.cropHeight = Math.max(0.05, Math.min(1, newHeight));
     this.emitCropChange();
   };
 

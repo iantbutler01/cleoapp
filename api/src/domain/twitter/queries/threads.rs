@@ -4,7 +4,8 @@
 //! both `&PgPool` (for standalone queries) and `&mut PgConnection` (for transactions).
 
 use chrono::{DateTime, Utc};
-use sqlx::{Executor, Postgres};
+use sqlx::{Executor, Postgres, QueryBuilder};
+use sqlx::types::Json;
 
 use super::super::models::{Thread, ThreadStatus, ThreadWithTweets, Tweet, TweetForPosting};
 
@@ -70,7 +71,9 @@ where
 {
     let filter = ThreadStatusFilter::from_str(status_filter);
     let query = format!(
-        r#"SELECT id, user_id, title, status, created_at, posted_at, first_tweet_id
+        r#"SELECT id, user_id, title,
+                  COALESCE(copy_options, '[]'::jsonb) as copy_options,
+                  status, created_at, posted_at, first_tweet_id
            FROM tweet_threads
            WHERE user_id = $1 {}
            ORDER BY created_at DESC"#,
@@ -96,7 +99,9 @@ where
 {
     let filter = ThreadStatusFilter::from_str(status_filter);
     let query = format!(
-        r#"SELECT id, user_id, title, status, created_at, posted_at, first_tweet_id
+        r#"SELECT id, user_id, title,
+                  COALESCE(copy_options, '[]'::jsonb) as copy_options,
+                  status, created_at, posted_at, first_tweet_id
            FROM tweet_threads
            WHERE user_id = $1 {}
            ORDER BY created_at DESC
@@ -123,7 +128,9 @@ where
 {
     let thread: Option<Thread> = sqlx::query_as(
         r#"
-        SELECT id, user_id, title, status, created_at, posted_at, first_tweet_id
+        SELECT id, user_id, title,
+               COALESCE(copy_options, '[]'::jsonb) as copy_options,
+               status, created_at, posted_at, first_tweet_id
         FROM tweet_threads
         WHERE id = $1 AND user_id = $2
         "#,
@@ -154,7 +161,11 @@ where
 {
     sqlx::query_as(
         r#"
-        SELECT id, text, video_clip, image_capture_ids, rationale, created_at,
+        SELECT id, text,
+               COALESCE(copy_options, '[]'::jsonb) as copy_options,
+               video_clip, image_capture_ids,
+               COALESCE(media_options, '[]'::jsonb) as media_options,
+               rationale, created_at,
                thread_position, reply_to_tweet_id, posted_at, tweet_id
         FROM tweet_collateral
         WHERE thread_id = $1 AND user_id = $2
@@ -174,8 +185,10 @@ struct ThreadTweetWithThreadId {
     thread_id: i64,
     id: i64,
     text: String,
+    copy_options: Json<Vec<String>>,
     video_clip: Option<serde_json::Value>,
     image_capture_ids: Vec<i64>,
+    media_options: Json<Vec<serde_json::Value>>,
     rationale: String,
     created_at: DateTime<Utc>,
     thread_position: Option<i32>,
@@ -411,7 +424,12 @@ where
 {
     sqlx::query_as(
         r#"
-        SELECT id, text, image_capture_ids, video_clip FROM tweet_collateral
+        SELECT id, text,
+               COALESCE(copy_options, '[]'::jsonb) as copy_options,
+               image_capture_ids, video_clip,
+               COALESCE(media_options, '[]'::jsonb) as media_options,
+               rationale
+        FROM tweet_collateral
         WHERE thread_id = $1 AND user_id = $2 AND posted_at IS NULL
         ORDER BY thread_position ASC
         "#,
@@ -671,26 +689,38 @@ pub async fn update_tweet_collateral<'e, E>(
     executor: E,
     tweet_id: i64,
     user_id: i64,
+    text: Option<&str>,
     image_capture_ids: Option<&Vec<i64>>,
-    video_clip: Option<&serde_json::Value>,
+    video_clip: Option<Option<serde_json::Value>>,
 ) -> Result<bool, sqlx::Error>
 where
     E: Executor<'e, Database = Postgres>,
 {
-    let result = sqlx::query(
-        r#"
-        UPDATE tweet_collateral
-        SET image_capture_ids = COALESCE($3, image_capture_ids),
-            video_clip = COALESCE($4, video_clip)
-        WHERE id = $1 AND user_id = $2
-        "#,
-    )
-    .bind(tweet_id)
-    .bind(user_id)
-    .bind(image_capture_ids)
-    .bind(video_clip)
-    .execute(executor)
-    .await?;
+    if text.is_none() && image_capture_ids.is_none() && video_clip.is_none() {
+        return Ok(true);
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new("UPDATE tweet_collateral SET ");
+    let mut separated = builder.separated(", ");
+
+    if let Some(text) = text {
+        separated.push("text = ").push_bind_unseparated(text);
+    }
+
+    if let Some(image_capture_ids) = image_capture_ids {
+        separated.push("image_capture_ids = ").push_bind_unseparated(image_capture_ids);
+    }
+
+    if let Some(video_clip) = video_clip {
+        separated.push("video_clip = ").push_bind_unseparated(video_clip);
+    }
+
+    builder.push(" WHERE id = ");
+    builder.push_bind(tweet_id);
+    builder.push(" AND user_id = ");
+    builder.push_bind(user_id);
+
+    let result = builder.build().execute(executor).await?;
 
     Ok(result.rows_affected() > 0)
 }

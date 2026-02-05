@@ -45,7 +45,11 @@ where
 {
     sqlx::query_as(
         r#"
-        SELECT id, text, video_clip, image_capture_ids, rationale, created_at,
+        SELECT id, text,
+               COALESCE(copy_options, '[]'::jsonb) as copy_options,
+               video_clip, image_capture_ids,
+               COALESCE(media_options, '[]'::jsonb) as media_options,
+               rationale, created_at,
                thread_position, reply_to_tweet_id, posted_at, tweet_id
         FROM tweet_collateral
         WHERE user_id = $1 AND posted_at IS NULL AND thread_id IS NULL
@@ -93,7 +97,11 @@ where
 {
     let filter = StatusFilter::from_str(status_filter);
     let query = format!(
-        r#"SELECT id, text, video_clip, image_capture_ids, rationale, created_at,
+        r#"SELECT id, text,
+                  COALESCE(copy_options, '[]'::jsonb) as copy_options,
+                  video_clip, image_capture_ids,
+                  COALESCE(media_options, '[]'::jsonb) as media_options,
+                  rationale, created_at,
                   thread_position, reply_to_tweet_id, posted_at, tweet_id
            FROM tweet_collateral
            WHERE user_id = $1 AND thread_id IS NULL {}
@@ -124,7 +132,11 @@ where
 {
     let filter = StatusFilter::from_str(status_filter);
     let query = format!(
-        r#"SELECT id, text, video_clip, image_capture_ids, rationale, created_at,
+        r#"SELECT id, text,
+                  COALESCE(copy_options, '[]'::jsonb) as copy_options,
+                  video_clip, image_capture_ids,
+                  COALESCE(media_options, '[]'::jsonb) as media_options,
+                  rationale, created_at,
                   thread_position, reply_to_tweet_id, posted_at, tweet_id
            FROM tweet_collateral
            WHERE user_id = $1 AND thread_id IS NULL {}
@@ -153,7 +165,11 @@ where
 {
     let filter = StatusFilter::from_str(status_filter);
     let query = format!(
-        r#"SELECT id, text, video_clip, image_capture_ids, rationale, created_at,
+        r#"SELECT id, text,
+                  COALESCE(copy_options, '[]'::jsonb) as copy_options,
+                  video_clip, image_capture_ids,
+                  COALESCE(media_options, '[]'::jsonb) as media_options,
+                  rationale, created_at,
                   thread_position, reply_to_tweet_id, posted_at, tweet_id
            FROM tweet_collateral
            WHERE user_id = $1 AND thread_id IS NULL {}
@@ -178,7 +194,12 @@ where
 {
     sqlx::query_as(
         r#"
-        SELECT id, text, image_capture_ids, video_clip FROM tweet_collateral
+        SELECT id, text,
+               COALESCE(copy_options, '[]'::jsonb) as copy_options,
+               image_capture_ids, video_clip,
+               COALESCE(media_options, '[]'::jsonb) as media_options,
+               rationale
+        FROM tweet_collateral
         WHERE id = $1 AND user_id = $2 AND posted_at IS NULL
         "#,
     )

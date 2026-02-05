@@ -1,9 +1,19 @@
-import { LitElement, html } from 'lit';
+import { LitElement, html, css } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { ThreadTweet, api } from '../api';
+import { ThreadTweet, api, VideoClip } from '../api';
 import { tailwindStyles } from '../styles/shared';
 import './media-browser';
 import './media-editor';
+
+const fadeInStyles = css`
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  .media-fade-in {
+    animation: fadeIn 0.3s ease-out;
+  }
+`;
 
 interface MediaUrl {
   url: string;
@@ -11,10 +21,16 @@ interface MediaUrl {
 }
 
 type VideoOrientation = 'horizontal' | 'vertical' | 'square';
+type ImageOrientation = 'horizontal' | 'vertical' | 'square';
+
+interface MediaChoice {
+  image_capture_ids: number[];
+  video_clip: VideoClip | null;
+}
 
 @customElement('tweet-content')
 export class TweetContent extends LitElement {
-  static styles = [tailwindStyles];
+  static styles = [tailwindStyles, fadeInStyles];
 
   @property({ type: Object }) tweet: ThreadTweet | null = null;
   @property({ type: Boolean }) compact = false;
@@ -23,6 +39,7 @@ export class TweetContent extends LitElement {
   @state() imageUrls: MediaUrl[] = [];
   @state() videoUrl: MediaUrl | null = null;
   @state() videoOrientation: VideoOrientation = 'horizontal';
+  @state() imageOrientation: ImageOrientation = 'square';
   @state() loadingMedia = true;
   @state() mediaError: string | null = null;
   @state() mediaBrowserOpen = false;
@@ -30,15 +47,55 @@ export class TweetContent extends LitElement {
   @state() editorOpen = false;
   @state() editorCaptureId: number | null = null;
   @state() editorMediaType: 'image' | 'video' = 'image';
+  @state() selectedMediaIndex = 0;
+  @state() mediaChoices: MediaChoice[] = [];
+  private lastTweetId: number | null = null;
+  private lastMediaKey: string | null = null;
 
   async connectedCallback() {
     super.connectedCallback();
     await this.loadMedia();
   }
 
+  protected updated(changedProperties: Map<string, unknown>) {
+    super.updated(changedProperties);
+    if (!changedProperties.has('tweet')) {
+      return;
+    }
+
+    if (!this.tweet) {
+      this.mediaChoices = [];
+      this.selectedMediaIndex = 0;
+      this.lastTweetId = null;
+      this.lastMediaKey = null;
+      return;
+    }
+
+    const tweetId = this.tweet.id;
+    const mediaKey = JSON.stringify({
+      imageIds: this.tweet.image_capture_ids,
+      videoClip: this.tweet.video_clip,
+    });
+
+    const choices = this.buildMediaChoices(this.tweet);
+    const selectedIndex = this.findMediaChoiceIndex(choices, this.tweet);
+    this.mediaChoices = choices;
+    this.selectedMediaIndex = selectedIndex === -1 ? 0 : selectedIndex;
+
+    if (tweetId !== this.lastTweetId) {
+      this.lastTweetId = tweetId;
+    }
+
+    if (mediaKey !== this.lastMediaKey) {
+      this.lastMediaKey = mediaKey;
+      this.loadMedia();
+    }
+  }
+
   async loadMedia() {
     if (!this.tweet) return;
 
+    console.log('[tweet-content] loadMedia - loading capture IDs:', this.tweet.image_capture_ids);
     this.loadingMedia = true;
     this.mediaError = null;
     try {
@@ -47,6 +104,7 @@ export class TweetContent extends LitElement {
         api.getCaptureUrl(id)
       );
       this.imageUrls = await Promise.all(imagePromises);
+      console.log('[tweet-content] loadMedia - got URLs:', this.imageUrls.map(u => u.url));
 
       // Load video or clear it
       if (this.tweet.video_clip) {
@@ -55,8 +113,14 @@ export class TweetContent extends LitElement {
         );
         // Detect video orientation by loading metadata
         this.videoOrientation = await this.detectVideoOrientation(this.videoUrl.url);
+        this.imageOrientation = 'square';
       } else {
         this.videoUrl = null;
+        if (this.imageUrls.length === 1) {
+          this.imageOrientation = await this.detectImageOrientation(this.imageUrls[0].url);
+        } else {
+          this.imageOrientation = 'square';
+        }
       }
     } catch (e) {
       console.error('Failed to load media:', e);
@@ -64,6 +128,84 @@ export class TweetContent extends LitElement {
     } finally {
       this.loadingMedia = false;
     }
+  }
+
+  private buildMediaChoices(tweet: ThreadTweet): MediaChoice[] {
+    const choices: MediaChoice[] = [
+      {
+        image_capture_ids: tweet.image_capture_ids,
+        video_clip: tweet.video_clip,
+      },
+    ];
+
+    const options = Array.isArray(tweet.media_options) ? tweet.media_options : [];
+    for (const option of options) {
+      const choice = this.mediaOptionToChoice(option);
+      if (choice) {
+        choices.push(choice);
+      }
+    }
+
+    return choices;
+  }
+
+  private mediaOptionToChoice(option: unknown): MediaChoice | null {
+    if (!option || typeof option !== 'object') return null;
+
+    const record = option as Record<string, unknown>;
+    const rawImageIds = record.image_capture_ids;
+    const imageIds = Array.isArray(rawImageIds)
+      ? rawImageIds.filter((id) => typeof id === 'number') as number[]
+      : [];
+
+    const videoCaptureId = typeof record.video_capture_id === 'number'
+      ? record.video_capture_id
+      : (record.video_clip && typeof record.video_clip === 'object'
+        ? (record.video_clip as Record<string, unknown>).source_capture_id
+        : null);
+
+    const startTimestamp = typeof record.video_timestamp === 'string'
+      ? record.video_timestamp
+      : (record.video_clip && typeof record.video_clip === 'object'
+        ? (record.video_clip as Record<string, unknown>).start_timestamp
+        : null);
+
+    const duration = typeof record.video_duration === 'number'
+      ? record.video_duration
+      : (record.video_clip && typeof record.video_clip === 'object'
+        ? (record.video_clip as Record<string, unknown>).duration_secs
+        : null);
+
+    if (typeof videoCaptureId === 'number' && typeof startTimestamp === 'string') {
+      return {
+        image_capture_ids: [],
+        video_clip: {
+          source_capture_id: videoCaptureId,
+          start_timestamp: startTimestamp,
+          duration_secs: typeof duration === 'number' ? duration : 10,
+        },
+      };
+    }
+
+    return {
+      image_capture_ids: imageIds,
+      video_clip: null,
+    };
+  }
+
+  private findMediaChoiceIndex(choices: MediaChoice[], tweet: ThreadTweet) {
+    return choices.findIndex((choice) => {
+      const sameImages = choice.image_capture_ids.length === tweet.image_capture_ids.length
+        && choice.image_capture_ids.every((id, i) => id === tweet.image_capture_ids[i]);
+      const choiceVideo = choice.video_clip;
+      const tweetVideo = tweet.video_clip;
+      const sameVideo = !choiceVideo && !tweetVideo
+        || (choiceVideo && tweetVideo
+          && choiceVideo.source_capture_id === tweetVideo.source_capture_id
+          && choiceVideo.start_timestamp === tweetVideo.start_timestamp
+          && choiceVideo.duration_secs === tweetVideo.duration_secs);
+      return sameImages && sameVideo;
+    });
   }
 
   private detectVideoOrientation(url: string): Promise<VideoOrientation> {
@@ -85,12 +227,61 @@ export class TweetContent extends LitElement {
     });
   }
 
+  private detectImageOrientation(url: string): Promise<ImageOrientation> {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const ratio = img.naturalWidth / img.naturalHeight;
+        if (ratio > 1.2) {
+          resolve('horizontal');
+        } else if (ratio < 0.85) {
+          resolve('vertical');
+        } else {
+          resolve('square');
+        }
+      };
+      img.onerror = () => resolve('square');
+      img.src = url;
+    });
+  }
+
   openMediaBrowser() {
     this.mediaBrowserOpen = true;
   }
 
   handleMediaBrowserClose() {
     this.mediaBrowserOpen = false;
+  }
+
+  private async selectMedia(index: number) {
+    if (!this.tweet) return;
+    const choice = this.mediaChoices[index];
+    if (!choice) return;
+
+    this.selectedMediaIndex = index;
+    this.tweet = {
+      ...this.tweet,
+      image_capture_ids: choice.image_capture_ids,
+      video_clip: choice.video_clip,
+    };
+
+    try {
+      await api.updateTweetCollateral(this.tweet.id, {
+        image_capture_ids: choice.image_capture_ids,
+        video_clip: choice.video_clip ?? null,
+      });
+      this.dispatchEvent(new CustomEvent('collateral-updated', {
+        detail: {
+          imageIds: choice.image_capture_ids,
+          videoId: choice.video_clip?.source_capture_id ?? null,
+        },
+        bubbles: true,
+        composed: true,
+      }));
+    } catch (e) {
+      console.error('Failed to update media option:', e);
+      this.mediaError = e instanceof Error ? e.message : 'Failed to update media option';
+    }
   }
 
   async handleCollateralUpdated(e: CustomEvent) {
@@ -128,6 +319,7 @@ export class TweetContent extends LitElement {
   async handleEditComplete(e: CustomEvent<{ newCaptureId: number }>) {
     if (!this.tweet) return;
     const { newCaptureId } = e.detail;
+    console.log('[tweet-content] handleEditComplete - newCaptureId:', newCaptureId, 'editorCaptureId:', this.editorCaptureId);
     this.editorOpen = false;
 
     // Replace the edited capture with the new one in the tweet
@@ -153,6 +345,7 @@ export class TweetContent extends LitElement {
       const newImageIds = this.tweet.image_capture_ids.map((id) =>
         id === this.editorCaptureId ? newCaptureId : id
       );
+      console.log('[tweet-content] handleEditComplete - old IDs:', this.tweet.image_capture_ids, 'new IDs:', newImageIds);
       await api.updateTweetCollateral(this.tweet.id, {
         image_capture_ids: newImageIds,
         video_clip: null,
@@ -163,6 +356,7 @@ export class TweetContent extends LitElement {
       };
     }
 
+    console.log('[tweet-content] handleEditComplete - calling loadMedia with IDs:', this.tweet.image_capture_ids);
     await this.loadMedia();
     this.dispatchEvent(new CustomEvent('collateral-updated', {
       detail: {
@@ -175,18 +369,21 @@ export class TweetContent extends LitElement {
   }
 
   renderMedia() {
+    // Wrapper ensures consistent min-height to prevent layout shift
+    const wrapperClass = 'mt-2 min-h-96 rounded-lg overflow-hidden bg-base-200 relative w-full';
+
     if (this.loadingMedia) {
       return html`
-        <div class="h-48 flex justify-center items-center bg-base-200 rounded-lg mt-3">
-          <span class="loading loading-spinner loading-md"></span>
+        <div class="${wrapperClass} h-96 flex justify-center items-center">
+          <span class="loading loading-spinner loading-sm"></span>
         </div>
       `;
     }
 
     if (this.mediaError) {
       return html`
-        <div class="mt-3 p-4 rounded-lg bg-error/10 border border-error/20">
-          <div class="flex items-center gap-2 text-error text-sm">
+        <div class="${wrapperClass} p-3 bg-error/10 border border-error/20">
+          <div class="flex items-center gap-2 text-error text-xs">
             <svg class="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
             </svg>
@@ -203,11 +400,11 @@ export class TweetContent extends LitElement {
     if (!hasMedia) {
       return html`
         <button
-          class="mt-3 w-full aspect-video rounded-xl border-2 border-dashed border-base-300 bg-base-200/50
-            flex items-center justify-center gap-2 text-base-content/50 hover:border-primary/50 hover:text-primary/70 transition-colors"
+          class="${wrapperClass} h-96 border-2 border-dashed border-base-300 bg-base-200/50
+            flex items-center justify-center gap-1.5 text-sm text-base-content/50 hover:border-primary/50 hover:text-primary/70 transition-colors"
           @click=${this.openMediaBrowser}
         >
-          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
           </svg>
           Add media
@@ -215,17 +412,9 @@ export class TweetContent extends LitElement {
       `;
     }
 
-    // Adaptive aspect ratio: square for images, orientation-based for video
-    const aspectClass = this.videoUrl
-      ? this.videoOrientation === 'vertical'
-        ? 'aspect-[9/16]'
-        : this.videoOrientation === 'square'
-        ? 'aspect-square'
-        : 'aspect-video'
-      : 'aspect-square';
-
+    // Fixed container - media fits within using object-contain (no reflow between items)
     return html`
-      <div class="mt-3 ${aspectClass} rounded-xl overflow-hidden bg-base-200 relative">
+      <div class="${wrapperClass} h-96 media-fade-in">
         ${this.videoUrl
           ? html`
               <video
@@ -312,7 +501,7 @@ export class TweetContent extends LitElement {
       return html`
         <img
           src=${this.imageUrls[0].url}
-          class="w-full h-full object-cover cursor-pointer"
+          class="w-full h-full object-contain cursor-pointer"
           @click=${() => this.openFullscreen(this.imageUrls[0].url)}
         />
       `;
@@ -386,20 +575,36 @@ export class TweetContent extends LitElement {
       return html`<p class="text-base-content/50">No tweet data</p>`;
     }
 
-    const textSize = this.compact ? 'text-base' : 'text-xl';
+    const textSize = this.compact ? 'text-sm' : 'text-base';
 
     return html`
-      <!-- Tweet text - no container, directly on card -->
-      <p class="${textSize} leading-relaxed whitespace-pre-wrap">${this.tweet.text}</p>
+      <!-- Tweet text - fixed 4-line height for consistent cards -->
+      <p class="${textSize} leading-relaxed whitespace-pre-wrap h-26 overflow-hidden">${this.tweet.text}</p>
+
+      ${this.mediaChoices.length > 1 ? html`
+        <div class="flex items-center gap-1 mt-2">
+          <span class="text-xs text-base-content/50">Media:</span>
+          ${this.mediaChoices.map((_, i) => html`
+            <button
+              class="w-5 h-5 text-xs rounded ${i === this.selectedMediaIndex
+                ? 'bg-primary text-primary-content font-semibold'
+                : 'bg-base-200 text-base-content/60 hover:bg-base-300'}"
+              @click=${() => this.selectMedia(i)}
+            >
+              ${i === 0 ? 'A' : i === 1 ? 'B' : 'C'}
+            </button>
+          `)}
+        </div>
+      ` : ''}
 
       <!-- Media -->
       ${this.renderMedia()}
 
       <!-- Rationale -->
       ${this.showRationale ? html`
-        <details class="mt-4 text-sm text-base-content/60">
+        <details class="mt-3 text-xs text-base-content/60">
           <summary class="cursor-pointer hover:text-base-content/80 font-medium">Why this moment?</summary>
-          <p class="mt-2 pl-3 border-l-2 border-primary/30">${this.tweet.rationale}</p>
+          <p class="mt-1.5 pl-2.5 border-l-2 border-primary/30">${this.tweet.rationale}</p>
         </details>
       ` : ''}
 

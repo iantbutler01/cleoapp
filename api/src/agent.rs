@@ -22,11 +22,14 @@ const MAX_TURNS: usize = 40;
 
 // Tool definitions
 
-/// Write a tweet with optional media attachments. Use this when you find something tweet-worthy.
+/// Write a tweet with 2-3 copy variations and optional media attachments.
+/// Primary copy goes in `text`, alternatives in `copy_options`.
 #[derive(Tool, Serialize, Deserialize, Debug)]
 pub struct WriteTweet {
     /// The tweet text content (max 280 chars)
     pub text: String,
+    /// 1-2 alternative tweet texts
+    pub copy_options: Option<Vec<String>>,
     /// Capture ID of the video to clip from - required if using video_timestamp
     pub video_capture_id: Option<i64>,
     /// Video timestamp to clip from (e.g., "0:30") - optional
@@ -35,8 +38,24 @@ pub struct WriteTweet {
     pub video_duration: Option<u32>,
     /// Capture IDs to attach as images - optional
     pub image_capture_ids: Option<Vec<i64>>,
+    /// 1-2 alternative media combinations
+    pub media_options: Option<Vec<MediaOption>>,
     /// Why this moment is tweet-worthy
     pub rationale: String,
+}
+
+#[derive(Tool, Serialize, Deserialize, Debug, Clone)]
+pub struct MediaOption {
+    pub video_capture_id: Option<i64>,
+    pub video_timestamp: Option<String>,
+    pub video_duration: Option<u32>,
+    pub image_capture_ids: Option<Vec<i64>>,
+}
+
+#[derive(Tool, Serialize, Deserialize, Debug, Clone)]
+pub struct ThreadCopyOption {
+    /// Full thread variation (each entry is a tweet's text)
+    pub tweets: Vec<String>,
 }
 
 /// Signal that you've finished reviewing all interesting content in this time window.
@@ -94,6 +113,8 @@ pub struct WriteThread {
     pub title: Option<String>,
     /// The tweets in order. First tweet posts normally, rest reply to previous.
     pub tweets: Vec<ThreadTweetInput>,
+    /// Alternative thread variations (each is an array of tweet texts)
+    pub copy_options: Option<Vec<ThreadCopyOption>>,
     /// Why this is thread-worthy (vs individual tweets)
     pub rationale: String,
 }
@@ -103,8 +124,10 @@ pub struct WriteThread {
 #[derive(Debug, Clone, Serialize)]
 pub struct TweetCollateral {
     pub text: String,
+    pub copy_options: Vec<String>,
     pub video_clip: Option<VideoClip>,
     pub image_capture_ids: Vec<i64>,
+    pub media_options: Vec<MediaOption>,
     pub rationale: String,
     pub created_at: DateTime<Utc>,
     /// Thread ID if this tweet belongs to a thread
@@ -124,6 +147,7 @@ pub struct VideoClip {
 pub struct ThreadMetadata {
     pub id: i64,
     pub title: Option<String>,
+    pub copy_options: Vec<Vec<String>>,
     #[allow(dead_code)]
     pub tweet_count: usize,
 }
@@ -303,15 +327,17 @@ pub async fn save_threads_and_tweets(
     // Save threads first and build mapping from temp ID -> real DB ID
     let mut thread_id_map = std::collections::HashMap::new();
     for thread in threads {
+        let copy_options_json = serde_json::to_value(&thread.copy_options).unwrap();
         let row: (i64,) = sqlx::query_as(
             r#"
-            INSERT INTO tweet_threads (user_id, title, status, created_at)
-            VALUES ($1, $2, 'draft', NOW())
+            INSERT INTO tweet_threads (user_id, title, copy_options, status, created_at)
+            VALUES ($1, $2, $3, 'draft', NOW())
             RETURNING id
             "#,
         )
         .bind(user_id)
         .bind(&thread.title)
+        .bind(copy_options_json)
         .fetch_one(&mut *tx)
         .await?;
         thread_id_map.insert(thread.id, row.0);
@@ -323,19 +349,23 @@ pub async fn save_threads_and_tweets(
             .video_clip
             .as_ref()
             .map(|c| serde_json::to_value(c).unwrap());
+        let copy_options_json = serde_json::to_value(&tweet.copy_options).unwrap();
+        let media_options_json = serde_json::to_value(&tweet.media_options).unwrap();
         let image_ids: Vec<i64> = tweet.image_capture_ids.clone();
         let real_thread_id = tweet.thread_id.and_then(|tid| thread_id_map.get(&tid).copied());
 
         sqlx::query(
             r#"
-            INSERT INTO tweet_collateral (user_id, text, video_clip, image_capture_ids, rationale, created_at, thread_id, thread_position)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO tweet_collateral (user_id, text, copy_options, video_clip, image_capture_ids, media_options, rationale, created_at, thread_id, thread_position)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             "#,
         )
         .bind(user_id)
         .bind(&tweet.text)
+        .bind(copy_options_json)
         .bind(video_clip_json)
         .bind(&image_ids)
+        .bind(media_options_json)
         .bind(&tweet.rationale)
         .bind(tweet.created_at)
         .bind(real_thread_id)
@@ -550,8 +580,10 @@ pub async fn run_collateral_agent(
 
                         let collateral = TweetCollateral {
                             text: tweet.text.clone(),
+                            copy_options: tweet.copy_options.clone().unwrap_or_default(),
                             video_clip,
                             image_capture_ids: tweet.image_capture_ids.unwrap_or_default(),
+                            media_options: tweet.media_options.clone().unwrap_or_default(),
                             rationale: tweet.rationale.clone(),
                             created_at: Utc::now(),
                             thread_id: None,
@@ -716,8 +748,10 @@ pub async fn run_collateral_agent(
 
                             let collateral = TweetCollateral {
                                 text: tweet_input.text.clone(),
+                                copy_options: Vec::new(),
                                 video_clip,
                                 image_capture_ids: tweet_input.image_capture_ids.clone().unwrap_or_default(),
+                                media_options: Vec::new(),
                                 rationale: thread.rationale.clone(),
                                 created_at: Utc::now(),
                                 thread_id: Some(thread_id),
@@ -727,9 +761,18 @@ pub async fn run_collateral_agent(
                         }
 
                         // Store thread metadata
+                        let thread_variations = thread
+                            .copy_options
+                            .clone()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|option| option.tweets)
+                            .collect();
+
                         guard.threads.push(ThreadMetadata {
                             id: thread_id,
                             title: thread.title.clone(),
+                            copy_options: thread_variations,
                             tweet_count: thread.tweets.len(),
                         });
 
@@ -952,7 +995,8 @@ Find moments worth tweeting. Good candidates:
 Skip anything mundane or needing context to understand.
 
 Use ExtractText if you see interesting text (code, errors, terminal output) - provide capture_id and timestamp for videos.
-Use WriteTweet for each tweet - attach media via video_capture_id + video_timestamp for clips, or image_capture_ids for screenshots.
+Use WriteTweet for each tweet. Provide 2-3 copy variations (primary in text, alternatives in copy_options) and 1-2 alternative media options when possible.
+Attach media via video_capture_id + video_timestamp for clips, or image_capture_ids for screenshots.
 Use MarkComplete when done."#,
         window_start_str,
         window_end_str,

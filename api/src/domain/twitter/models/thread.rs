@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::types::Json;
 use sqlx::encode::IsNull;
 use sqlx::error::BoxDynError;
 use sqlx::postgres::{PgArgumentBuffer, PgTypeInfo, PgValueRef};
@@ -71,6 +72,7 @@ pub struct Thread {
     #[allow(dead_code)] // Fetched from DB but intentionally not exposed in API responses
     pub user_id: i64,
     pub title: Option<String>,
+    pub copy_options: Json<Vec<Vec<String>>>,
     pub status: ThreadStatus,
     pub created_at: DateTime<Utc>,
     pub posted_at: Option<DateTime<Utc>>,

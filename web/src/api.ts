@@ -40,6 +40,7 @@ const TweetThreadSchema = z.object({
   id: z.number(),
   title: z.string().nullable(),
   status: ThreadStatusSchema,
+  copy_options: z.array(z.array(z.string())).default([]),
   created_at: z.string(),
   posted_at: z.string().nullable(),
   first_tweet_id: z.string().nullable(),
@@ -48,8 +49,10 @@ const TweetThreadSchema = z.object({
 const ThreadTweetSchema = z.object({
   id: z.number(),
   text: z.string(),
+  copy_options: z.array(z.string()).default([]),
   video_clip: VideoClipSchema.nullable(),
   image_capture_ids: z.array(z.number()),
+  media_options: z.array(z.any()).default([]),
   rationale: z.string(),
   created_at: z.string(),
   thread_position: z.number().nullable(),
@@ -539,7 +542,7 @@ class ApiClient {
 
   async updateTweetCollateral(
     tweetId: number,
-    collateral: { image_capture_ids?: number[]; video_clip?: VideoClip | null }
+    collateral: { text?: string; image_capture_ids?: number[]; video_clip?: VideoClip | null }
   ): Promise<void> {
     return this.fetchVoid(
       `${API_BASE}/tweets/${tweetId}/collateral`,

@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::{Executor, PgPool, Postgres};
+use sqlx::types::Json;
 use std::collections::HashMap;
 
 use super::twitter::{Thread, ThreadWithTweets, Tweet};
@@ -19,8 +20,10 @@ struct TweetWithThreadId {
     thread_id: i64,
     id: i64,
     text: String,
+    copy_options: Json<Vec<String>>,
     video_clip: Option<serde_json::Value>,
     image_capture_ids: Vec<i64>,
+    media_options: Json<Vec<serde_json::Value>>,
     rationale: String,
     created_at: DateTime<Utc>,
     thread_position: Option<i32>,
@@ -152,7 +155,11 @@ pub async fn list_content_paginated(
     let tweets: HashMap<i64, Tweet> = if !tweet_ids.is_empty() {
         let rows: Vec<Tweet> = sqlx::query_as(
             r#"
-            SELECT id, text, video_clip, image_capture_ids, rationale, created_at,
+            SELECT id, text,
+                   COALESCE(copy_options, '[]'::jsonb) as copy_options,
+                   video_clip, image_capture_ids,
+                   COALESCE(media_options, '[]'::jsonb) as media_options,
+                   rationale, created_at,
                    thread_position, reply_to_tweet_id, posted_at, tweet_id
             FROM tweet_collateral
             WHERE id = ANY($1) AND user_id = $2
@@ -173,7 +180,9 @@ pub async fn list_content_paginated(
         // First get the thread metadata
         let thread_structs: Vec<Thread> = sqlx::query_as(
             r#"
-            SELECT id, user_id, title, status, created_at, posted_at, first_tweet_id
+            SELECT id, user_id, title,
+                   COALESCE(copy_options, '[]'::jsonb) as copy_options,
+                   status, created_at, posted_at, first_tweet_id
             FROM tweet_threads
             WHERE id = ANY($1) AND user_id = $2
             "#,
@@ -186,7 +195,11 @@ pub async fn list_content_paginated(
         // Then batch fetch all tweets for all threads
         let all_thread_tweets: Vec<TweetWithThreadId> = sqlx::query_as(
             r#"
-            SELECT thread_id, id, text, video_clip, image_capture_ids, rationale, created_at,
+            SELECT thread_id, id, text,
+                   COALESCE(copy_options, '[]'::jsonb) as copy_options,
+                   video_clip, image_capture_ids,
+                   COALESCE(media_options, '[]'::jsonb) as media_options,
+                   rationale, created_at,
                    thread_position, reply_to_tweet_id, posted_at, tweet_id
             FROM tweet_collateral
             WHERE thread_id = ANY($1) AND user_id = $2
@@ -204,8 +217,10 @@ pub async fn list_content_paginated(
             let tweet = Tweet {
                 id: tweet_row.id,
                 text: tweet_row.text,
+                copy_options: tweet_row.copy_options,
                 video_clip: tweet_row.video_clip,
                 image_capture_ids: tweet_row.image_capture_ids,
+                media_options: tweet_row.media_options,
                 rationale: tweet_row.rationale,
                 created_at: tweet_row.created_at,
                 thread_position: tweet_row.thread_position,

@@ -500,8 +500,9 @@ struct VideoClipInput {
 
 #[derive(Deserialize)]
 struct UpdateCollateralRequest {
+    text: Option<String>,
     image_capture_ids: Option<Vec<i64>>,
-    video_clip: Option<VideoClipInput>,
+    video_clip: Option<Option<VideoClipInput>>,
 }
 
 /// PUT /tweets/:id/collateral - Update tweet's media attachments
@@ -533,20 +534,23 @@ async fn update_tweet_collateral(
     }
 
     // Convert typed VideoClipInput to JSON for storage
-    let video_clip_json: Option<serde_json::Value> = payload.video_clip.as_ref().map(|vc| {
-        serde_json::json!({
+    let video_clip_json: Option<Option<serde_json::Value>> = match payload.video_clip {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(vc)) => Some(Some(serde_json::json!({
             "source_capture_id": vc.source_capture_id,
             "start_timestamp": vc.start_timestamp,
             "duration_secs": vc.duration_secs
-        })
-    });
+        }))),
+    };
 
     let updated = threads::update_tweet_collateral(
         &state.db,
         tweet_id,
         user_id,
+        payload.text.as_deref(),
         payload.image_capture_ids.as_ref(),
-        video_clip_json.as_ref(),
+        video_clip_json,
     )
     .await
     .log_500("Update collateral error")?;

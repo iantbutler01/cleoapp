@@ -15,6 +15,23 @@ export class ThreadCard extends LitElement {
   @state() posting = false;
   @state() deleting = false;
   @state() error: string | null = null;
+  @state() selectedCopyIndex = 0;
+  @state() copyChoices: string[][] = [];
+  private lastThreadId: number | null = null;
+
+  protected updated(changedProperties: Map<string, unknown>) {
+    super.updated(changedProperties);
+    if (changedProperties.has('thread')) {
+      const threadId = this.thread?.thread.id ?? null;
+      if (threadId !== this.lastThreadId) {
+        this.lastThreadId = threadId;
+        this.selectedCopyIndex = 0;
+        this.copyChoices = this.thread
+          ? [this.thread.tweets.map((tweet) => tweet.text), ...this.thread.thread.copy_options]
+          : [];
+      }
+    }
+  }
 
   formatDate(dateStr: string) {
     return new Date(dateStr).toLocaleString();
@@ -63,6 +80,31 @@ export class ThreadCard extends LitElement {
     this.dispatchEvent(new CustomEvent('thread-updated', { detail: this.thread.thread.id }));
   }
 
+  private async selectCopy(index: number) {
+    if (!this.thread) return;
+    const variation = this.copyChoices[index];
+    if (!variation || variation.length !== this.thread.tweets.length) {
+      return;
+    }
+
+    this.selectedCopyIndex = index;
+    const updatedTweets = this.thread.tweets.map((tweet, i) => ({
+      ...tweet,
+      text: variation[i] ?? tweet.text,
+    }));
+    this.thread = { ...this.thread, tweets: updatedTweets };
+
+    try {
+      await Promise.all(updatedTweets.map((tweet, i) =>
+        api.updateTweetCollateral(tweet.id, { text: variation[i] })
+      ));
+      this.dispatchEvent(new CustomEvent('thread-updated', { detail: this.thread.thread.id }));
+    } catch (e) {
+      console.error('Failed to update thread copy:', e);
+      this.error = e instanceof Error ? e.message : 'Failed to update thread copy';
+    }
+  }
+
   render() {
     if (!this.thread) {
       return html`<card-shell><p class="text-base-content/50">No thread data</p></card-shell>`;
@@ -73,34 +115,50 @@ export class ThreadCard extends LitElement {
     const isPartialFailed = thread.status === 'partial_failed';
 
     return html`
-      <card-shell>
-        <!-- Header with thread info -->
-        <card-header slot="header">
-          <span slot="left" class="text-xs">${this.formatDate(thread.created_at)}</span>
-          <div slot="right" class="flex items-center gap-1.5">
-            <content-badge variant="accent">Thread</content-badge>
-            <content-badge variant="muted">${tweets.length} tweets</content-badge>
-            ${isPosted ? html`<content-badge variant="status-success">Posted</content-badge>` : ''}
-            ${isPartialFailed ? html`<content-badge variant="status-warning">Partial</content-badge>` : ''}
+      <div class="relative ${this.copyChoices.length > 1 ? 'ml-6' : ''}">
+        ${this.copyChoices.length > 1 ? html`
+          <div class="absolute -left-6 top-3 flex flex-col gap-0.5">
+            ${this.copyChoices.map((_, i) => html`
+              <button
+                class="w-6 h-7 text-[10px] font-semibold rounded-l-md border border-r-0 transition-colors
+                  ${i === this.selectedCopyIndex
+                    ? 'bg-primary text-primary-content border-primary'
+                    : 'bg-base-200 text-base-content/60 border-base-300 hover:bg-base-300'}"
+                @click=${() => this.selectCopy(i)}
+              >${i === 0 ? 'A' : i === 1 ? 'B' : 'C'}</button>
+            `)}
           </div>
-        </card-header>
-
-        <!-- All tweets in one container with dividers -->
-        ${tweets.map((tweet, i) => html`
-          ${i > 0 ? html`
-            <div class="border-t border-base-300/30 my-3 flex items-center gap-2">
-              <span class="bg-primary text-primary-content text-xs w-5 h-5 rounded-full flex items-center justify-center font-bold -ml-1">
-                ${i + 1}
-              </span>
+        ` : ''}
+        <card-shell>
+          <!-- Header with thread info -->
+          <card-header slot="header">
+            <span slot="left" class="text-xs">${this.formatDate(thread.created_at)}</span>
+            <div slot="right" class="flex items-center gap-1.5">
+              <content-badge variant="accent">Thread</content-badge>
+              <content-badge variant="muted">${tweets.length} tweets</content-badge>
+              ${isPosted ? html`<content-badge variant="status-success">Posted</content-badge>` : ''}
+              ${isPartialFailed ? html`<content-badge variant="status-warning">Partial</content-badge>` : ''}
             </div>
-          ` : ''}
-          <tweet-content
-            .tweet=${tweet}
-            ?compact=${i > 0}
-            ?showRationale=${i === 0}
-            @collateral-updated=${this.handleTweetUpdated}
-          ></tweet-content>
-        `)}
+          </card-header>
+
+        <!-- Scrollable tweets container -->
+        <div class="max-h-128 overflow-y-auto w-full">
+          ${tweets.map((tweet, i) => html`
+            ${i > 0 ? html`
+              <div class="border-t border-base-300/30 my-3 flex items-center gap-2">
+                <span class="bg-primary text-primary-content text-xs w-5 h-5 rounded-full flex items-center justify-center font-bold">
+                  ${i + 1}
+                </span>
+              </div>
+            ` : ''}
+            <tweet-content
+              .tweet=${tweet}
+              ?compact=${i > 0}
+              ?showRationale=${i === 0}
+              @collateral-updated=${this.handleTweetUpdated}
+            ></tweet-content>
+          `)}
+        </div>
 
         ${this.error ? html`
           <div class="alert alert-error mt-3 py-2 px-3 text-sm">
@@ -140,7 +198,8 @@ export class ThreadCard extends LitElement {
             </button>
           </div>
         ` : ''}
-      </card-shell>
+        </card-shell>
+      </div>
     `;
   }
 }

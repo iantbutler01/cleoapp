@@ -165,6 +165,7 @@ export class MediaEditor extends LitElement {
       case 'complete':
         this.processing = false;
         this.progress = 100;
+        console.log('[media-editor] Edit complete - new_capture_id from server:', response.new_capture_id);
         // Dispatch event with new capture ID
         this.dispatchEvent(
           new CustomEvent('edit-complete', {
