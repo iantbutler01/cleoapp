@@ -40,6 +40,9 @@ pub struct AppState {
     pub jwt_secret: Vec<u8>,
     /// Gemini client for AI agent (optional)
     pub gemini: Option<GoogleGenAIClient>,
+    /// Optional allowlist of Twitter usernames that can log in (lowercase)
+    /// If None, anyone can log in. If Some, only listed usernames are allowed.
+    pub allowed_users: Option<std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +179,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         panic!("JWT_SECRET must be at least 32 bytes for security");
     }
 
+    // Optional allowlist of Twitter usernames that can log in
+    // Comma-separated, case-insensitive. If not set, anyone can log in.
+    let allowed_users: Option<std::collections::HashSet<String>> =
+        std::env::var("ALLOWED_USERS").ok().map(|s| {
+            let users: std::collections::HashSet<String> = s
+                .split(',')
+                .map(|u| u.trim().to_lowercase())
+                .filter(|u| !u.is_empty())
+                .collect();
+            println!("[startup] ALLOWED_USERS set: {:?}", users);
+            users
+        });
+    if allowed_users.is_none() {
+        println!("[startup] ALLOWED_USERS not set - anyone can log in");
+    }
+
     let state = Arc::new(AppState {
         db: pool.clone(),
         gcs: gcs.clone(),
@@ -183,6 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_storage_path: local_storage_path.clone(),
         jwt_secret,
         gemini: gemini.clone(),
+        allowed_users,
     });
 
     // Background agent scheduler configuration (override via env if needed)

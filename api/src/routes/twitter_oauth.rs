@@ -111,6 +111,17 @@ async fn auth_twitter_token(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    // Check if user is allowed to log in (if allowlist is configured)
+    if let Some(ref allowed) = state.allowed_users {
+        if !allowed.contains(&twitter_user.username.to_lowercase()) {
+            eprintln!(
+                "Login denied: @{} not in ALLOWED_USERS",
+                twitter_user.username
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
     // Calculate token expiry
     let expires_at = Utc::now() + Duration::seconds(token_response.expires_in);
 

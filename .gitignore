@@ -1,0 +1,3 @@
+# Environment-specific deployment configs (contain prod values)
+k8s/
+helm-values.yaml

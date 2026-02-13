@@ -4,6 +4,9 @@ import tailwindcss from '@tailwindcss/vite';
 export default defineConfig({
   plugins: [tailwindcss()],
   appType: 'spa',
+  preview: {
+    allowedHosts: ['cleo.kinglycrow.com'],
+  },
   server: {
     port: 5173,
     proxy: {
