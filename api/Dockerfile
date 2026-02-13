@@ -9,17 +9,8 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests first (for dependency caching)
+# Copy source and build
 COPY Cargo.toml Cargo.lock ./
-
-# Create dummy src to compile dependencies (caching optimization)
-# This lets Docker cache the expensive dependency compilation
-# When only source changes, deps don't need to recompile
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release || true
-RUN rm -rf src
-
-# Copy actual source and rebuild (only app code compiles now)
 COPY src ./src
 RUN cargo build --release
 
