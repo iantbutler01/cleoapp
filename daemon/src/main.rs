@@ -96,6 +96,10 @@ const PENDING_RECORDINGS_DIR: &str = ".cleo/captures/recordings";
 #[derive(Debug, Deserialize, Serialize)]
 struct CleoConfig {
     api_token: String,
+    /// API base URL (e.g. "https://cleo.example.com/api"). Falls back to
+    /// CLEO_CAPTURE_API_URL env var, then http://localhost:3000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_url: Option<String>,
     #[serde(default)]
     privacy: PrivacySettings,
 }
@@ -1261,7 +1265,7 @@ impl CleoDaemon {
 
     fn apply_api_token(&self, api_key: String) -> Result<(), CaptureError> {
         save_api_token(&api_key)?;
-        let base = env::var(API_BASE_ENV).unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
+        let base = resolve_api_base();
         let client = ApiClient::new(base, Some(api_key)).map_err(CaptureError::from)?;
         self.api.replace(Some(client));
         info!("API token saved from login link");
@@ -1462,12 +1466,12 @@ fn build_status_menu(
 }
 
 fn build_api_client() -> Result<ApiClient, CaptureError> {
-    let base = env::var(API_BASE_ENV).unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
+    let base = resolve_api_base();
     let auth_token = load_api_token()?;
     ApiClient::new(base, Some(auth_token)).map_err(CaptureError::from)
 }
 
-fn load_api_token() -> Result<String, CaptureError> {
+fn load_config() -> Result<CleoConfig, CaptureError> {
     let path = cleo_config_path()?;
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -1480,14 +1484,30 @@ fn load_api_token() -> Result<String, CaptureError> {
         Err(err) => return Err(CaptureError::from(err)),
     };
 
-    let config: CleoConfig = serde_json::from_str(&contents).map_err(|err| {
+    serde_json::from_str(&contents).map_err(|err| {
         CaptureError::Config(format!(
             "Failed to parse Cleo config {}: {err}",
             path.display()
         ))
-    })?;
+    })
+}
 
+fn load_api_token() -> Result<String, CaptureError> {
+    let config = load_config()?;
+    let path = cleo_config_path()?;
     validate_api_token(&config.api_token, &format!("Config {}", path.display()))
+}
+
+/// Resolve API base URL: config file → env var → default
+fn resolve_api_base() -> String {
+    if let Ok(config) = load_config() {
+        if let Some(url) = config.api_url {
+            if !url.is_empty() {
+                return url;
+            }
+        }
+    }
+    env::var(API_BASE_ENV).unwrap_or_else(|_| DEFAULT_API_BASE.to_string())
 }
 
 fn cleo_config_path() -> Result<PathBuf, CaptureError> {
@@ -1509,9 +1529,13 @@ fn save_api_token(token: &str) -> Result<(), CaptureError> {
         fs::create_dir_all(parent).map_err(CaptureError::from)?;
     }
 
-    // Preserve existing privacy settings if config exists
-    let privacy = load_privacy_settings().unwrap_or_default();
-    let config = CleoConfig { api_token, privacy };
+    // Preserve existing settings if config exists
+    let existing = load_config().ok();
+    let config = CleoConfig {
+        api_token,
+        api_url: existing.as_ref().and_then(|c| c.api_url.clone()),
+        privacy: existing.map(|c| c.privacy).unwrap_or_default(),
+    };
     let payload = serde_json::to_string_pretty(&config).map_err(|err| {
         CaptureError::Config(format!(
             "Failed to serialize Cleo config at {}: {err}",
@@ -1523,21 +1547,14 @@ fn save_api_token(token: &str) -> Result<(), CaptureError> {
 }
 
 fn load_privacy_settings() -> Result<PrivacySettings, CaptureError> {
-    let path = cleo_config_path()?;
-    let contents = fs::read_to_string(&path).map_err(CaptureError::from)?;
-    let config: CleoConfig = serde_json::from_str(&contents).map_err(|err| {
-        CaptureError::Config(format!(
-            "Failed to parse Cleo config {}: {err}",
-            path.display()
-        ))
-    })?;
-    Ok(config.privacy)
+    load_config().map(|c| c.privacy)
 }
 
 fn save_privacy_settings(privacy: &PrivacySettings) -> Result<(), CaptureError> {
     let path = cleo_config_path()?;
 
-    // Load existing config to preserve API token
+    // Load existing config to preserve API token and api_url
+    let existing = load_config().ok();
     let api_token = load_api_token().unwrap_or_default();
 
     if let Some(parent) = path.parent() {
@@ -1546,6 +1563,7 @@ fn save_privacy_settings(privacy: &PrivacySettings) -> Result<(), CaptureError> 
 
     let config = CleoConfig {
         api_token,
+        api_url: existing.and_then(|c| c.api_url),
         privacy: privacy.clone(),
     };
     let payload = serde_json::to_string_pretty(&config).map_err(|err| {
