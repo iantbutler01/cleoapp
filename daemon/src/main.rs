@@ -2172,7 +2172,7 @@ impl BatchUploader {
                     break;
                 }
                 eprintln!("[DEBUG] BatchUploader: calling process_pending");
-                Self::process_pending(&api, &*content_filter);
+                Self::process_pending(&api, &*content_filter, &flag);
             }
             eprintln!("[DEBUG] BatchUploader: thread exiting");
         });
@@ -2188,7 +2188,14 @@ impl BatchUploader {
         join_task_handle(&mut self.handle, "batch uploader");
     }
 
-    fn process_pending(api: &ApiClient, content_filter: &dyn ContentFilter) {
+    fn process_pending(
+        api: &ApiClient,
+        content_filter: &dyn ContentFilter,
+        cancel_flag: &AtomicBool,
+    ) {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return;
+        }
         eprintln!("[DEBUG] process_pending() called");
         // Process screenshots - batch classify then upload, processing ALL files continuously
         let screenshot_dir = pending_screenshots_dir();
@@ -2205,10 +2212,14 @@ impl BatchUploader {
             // Process all files continuously until exhausted (dedup happens inside)
             if !files.is_empty() {
                 info!("Processing {} pending screenshots", files.len());
-                Self::batch_process_screenshots(api, content_filter, &files);
+                Self::batch_process_screenshots(api, content_filter, cancel_flag, &files);
             }
         } else {
             eprintln!("[DEBUG] Could not read screenshot dir");
+        }
+
+        if cancel_flag.load(Ordering::Relaxed) {
+            return;
         }
 
         // Process recordings - batch classify then upload
@@ -2224,7 +2235,7 @@ impl BatchUploader {
             // Process all recordings continuously
             if !files.is_empty() {
                 info!("Processing {} pending recordings", files.len());
-                Self::batch_process_recordings(api, content_filter, &files);
+                Self::batch_process_recordings(api, content_filter, cancel_flag, &files);
             }
         }
     }
@@ -2232,6 +2243,7 @@ impl BatchUploader {
     fn batch_process_screenshots(
         api: &ApiClient,
         content_filter: &dyn ContentFilter,
+        cancel_flag: &AtomicBool,
         files: &[PathBuf],
     ) {
         eprintln!(
@@ -2252,10 +2264,20 @@ impl BatchUploader {
         let mut file_iter = files.iter().peekable();
 
         while file_iter.peek().is_some() {
+            if cancel_flag.load(Ordering::Relaxed) {
+                info!("Cancelling screenshot batch processing");
+                return;
+            }
+
             // Fill a batch with up to BATCH_SIZE unique images
             let mut prepared: Vec<(PathBuf, Vec<u8>, Vec<u8>, ImageFormat)> = Vec::new(); // (path, media bytes, scaled_rgb, format)
 
             while prepared.len() < BATCH_SIZE {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    info!("Cancelling screenshot batch preparation");
+                    return;
+                }
+
                 let path = match file_iter.next() {
                     Some(p) => p,
                     None => break, // No more files
@@ -2336,6 +2358,11 @@ impl BatchUploader {
                 continue; // Try next iteration (may have more files after duplicates)
             }
 
+            if cancel_flag.load(Ordering::Relaxed) {
+                info!("Cancelling screenshot classification");
+                return;
+            }
+
             // Classify this batch
             eprintln!(
                 "[DEBUG] Starting batch classification of {} images",
@@ -2370,6 +2397,11 @@ impl BatchUploader {
 
             // Upload this batch
             if !safe_uploads.is_empty() {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    info!("Cancelling screenshot upload");
+                    return;
+                }
+
                 eprintln!(
                     "[DEBUG] Starting batch upload of {} safe screenshots",
                     safe_uploads.len()
@@ -2453,12 +2485,18 @@ impl BatchUploader {
     fn batch_process_recordings(
         api: &ApiClient,
         content_filter: &dyn ContentFilter,
+        cancel_flag: &AtomicBool,
         files: &[PathBuf],
     ) {
         // Step 1: Sample frames from all recordings
         let mut prepared: Vec<(PathBuf, Vec<Vec<u8>>)> = Vec::new(); // (path, scaled_frames)
 
         for path in files {
+            if cancel_flag.load(Ordering::Relaxed) {
+                info!("Cancelling recording batch processing");
+                return;
+            }
+
             let frames = match content_filter.sample(path, 2) {
                 Ok(f) => f,
                 Err(e) => {
@@ -2471,6 +2509,11 @@ impl BatchUploader {
             let mut scaled_frames = Vec::new();
             let mut ok = true;
             for frame in &frames {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    info!("Cancelling recording frame processing");
+                    return;
+                }
+
                 match content_filter.scale(&frame.rgba, frame.width, frame.height) {
                     Ok(s) => scaled_frames.push(s),
                     Err(e) => {
@@ -2489,6 +2532,10 @@ impl BatchUploader {
         }
 
         if prepared.is_empty() {
+            return;
+        }
+
+        if cancel_flag.load(Ordering::Relaxed) {
             return;
         }
 
@@ -2522,6 +2569,11 @@ impl BatchUploader {
         let mut safe_paths: Vec<PathBuf> = Vec::new();
         let mut result_idx = 0;
         for (path, _) in prepared {
+            if cancel_flag.load(Ordering::Relaxed) {
+                info!("Cancelling recording result mapping");
+                return;
+            }
+
             let frame_count = frame_counts.remove(0);
             let frame_results = &results[result_idx..result_idx + frame_count];
             result_idx += frame_count;
@@ -2538,6 +2590,11 @@ impl BatchUploader {
         // Step 3: Read and collect all safe recordings for batch upload
         let mut safe_uploads: Vec<(PathBuf, Vec<u8>, VideoFormat)> = Vec::new();
         for path in safe_paths {
+            if cancel_flag.load(Ordering::Relaxed) {
+                info!("Cancelling recording upload preparation");
+                return;
+            }
+
             let bytes = match fs::read(&path) {
                 Ok(b) => b,
                 Err(e) => {
@@ -2561,6 +2618,11 @@ impl BatchUploader {
 
         // Step 4: Batch upload all safe recordings
         if !safe_uploads.is_empty() {
+            if cancel_flag.load(Ordering::Relaxed) {
+                info!("Cancelling recording upload");
+                return;
+            }
+
             info!(
                 "{} recordings passed filter, uploading as batch",
                 safe_uploads.len()
