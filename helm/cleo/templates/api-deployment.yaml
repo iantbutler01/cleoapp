@@ -41,13 +41,13 @@ spec:
             {{- $_ := set $apiEnv "APP_ORIGIN" $appOrigin }}
             {{- end }}
             {{- if not (hasKey $apiEnv "CORS_ORIGIN") }}
-            {{- $_ = set $apiEnv "CORS_ORIGIN" $corsOrigin }}
+            {{- $_ := set $apiEnv "CORS_ORIGIN" $corsOrigin }}
             {{- end }}
             {{- if not (hasKey $apiEnv "COOKIE_SAMESITE") }}
-            {{- $_ = set $apiEnv "COOKIE_SAMESITE" (default "Lax" .Values.app.cookieSameSite) }}
+            {{- $_ := set $apiEnv "COOKIE_SAMESITE" (default "Lax" .Values.app.cookieSameSite) }}
             {{- end }}
             {{- if not (hasKey $apiEnv "TWITTER_REDIRECT_URI") }}
-            {{- $_ = set $apiEnv "TWITTER_REDIRECT_URI" $redirectUri }}
+            {{- $_ := set $apiEnv "TWITTER_REDIRECT_URI" $redirectUri }}
             {{- end }}
             {{- range $key, $value := $apiEnv }}
             - name: {{ $key }}
