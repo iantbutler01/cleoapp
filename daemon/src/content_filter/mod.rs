@@ -20,8 +20,8 @@ pub trait ContentFilter: Send + Sync {
     fn classify(&self, scaled_images: &[Vec<u8>]) -> Result<Vec<bool>>;
 }
 
-mod nsfw;
 mod noop;
+mod nsfw;
 
-pub use nsfw::NsfwFilter;
 pub use noop::NoOpFilter;
+pub use nsfw::NsfwFilter;

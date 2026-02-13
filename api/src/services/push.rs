@@ -3,7 +3,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 use web_push::{
     ContentEncoding, IsahcWebPushClient, SubscriptionInfo, Urgency, VapidSignatureBuilder,
-    WebPushClient, WebPushMessageBuilder,
+    URL_SAFE_NO_PAD, WebPushClient, WebPushMessageBuilder,
 };
 
 #[derive(Debug, Serialize)]
@@ -31,7 +31,7 @@ fn build_vapid_signature(
             .build()
             .map_err(|error| error.to_string())
     } else {
-        VapidSignatureBuilder::from_base64(private_key, subscription_info)
+        VapidSignatureBuilder::from_base64(private_key, URL_SAFE_NO_PAD, subscription_info)
             .map_err(|error| error.to_string())?
             .build()
             .map_err(|error| error.to_string())

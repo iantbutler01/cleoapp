@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use objc2::declare::ClassBuilder;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Sel};
-use objc2::{class, msg_send, sel, ClassType, MainThreadOnly};
+use objc2::{ClassType, MainThreadOnly, class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
     NSStatusItem,
@@ -24,7 +24,6 @@ type OpenUrlsCallback = Box<dyn FnMut(Vec<Url>) + 'static>;
 #[derive(Clone, Copy)]
 pub enum TerminateReply {
     Now,
-    Cancel,
     Later,
 }
 
@@ -69,11 +68,16 @@ impl StatusItem {
                 let resource_type = NSString::from_str("png");
                 let subdir = NSString::from_str("assets");
 
-                if let Some(path) = bundle.pathForResource_ofType_inDirectory(Some(&resource_name), Some(&resource_type), Some(&subdir)) {
+                if let Some(path) = bundle.pathForResource_ofType_inDirectory(
+                    Some(&resource_name),
+                    Some(&resource_type),
+                    Some(&subdir),
+                ) {
                     // Load image from file path
                     let image_ptr: *mut NSImage = msg_send![class!(NSImage), alloc];
                     if !image_ptr.is_null() {
-                        let image_ptr: *mut NSImage = msg_send![image_ptr, initWithContentsOfFile: &*path];
+                        let image_ptr: *mut NSImage =
+                            msg_send![image_ptr, initWithContentsOfFile: &*path];
                         if let Some(image) = Retained::retain(image_ptr) {
                             image.setTemplate(true);
                             button.setImage(Some(&image));
@@ -123,14 +127,18 @@ fn menu_action_target_class() -> &'static AnyClass {
     static CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
     CLASS.get_or_init(|| {
         let superclass = NSObject::class();
-        let mut builder = ClassBuilder::new(c"CleoMenuActionTarget", superclass)
-            .expect("Failed to create class");
+        let mut builder =
+            ClassBuilder::new(c"CleoMenuActionTarget", superclass).expect("Failed to create class");
 
         // Add instance variable for action index
         builder.add_ivar::<usize>(c"actionIndex");
 
         // Add performAction: method
-        unsafe extern "C" fn perform_action(this: *mut AnyObject, _sel: Sel, _sender: *mut AnyObject) {
+        unsafe extern "C" fn perform_action(
+            this: *mut AnyObject,
+            _sel: Sel,
+            _sender: *mut AnyObject,
+        ) {
             let cls = (*this).class();
             let ivar = cls.instance_variable(c"actionIndex").unwrap();
             let idx = *ivar.load::<usize>(&*this);
@@ -168,22 +176,6 @@ impl MenuBuilder {
             mtm,
             targets: Vec::new(),
         }
-    }
-
-    /// Add a menu item with an action selector
-    pub fn add_item(self, title: &str, action: Option<Sel>, key: &str) -> Self {
-        let title_str = NSString::from_str(title);
-        let key_str = NSString::from_str(key);
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(self.mtm),
-                &title_str,
-                action,
-                &key_str,
-            )
-        };
-        self.menu.addItem(&item);
-        self
     }
 
     /// Add a menu item with a closure action
@@ -284,49 +276,10 @@ impl MenuBuilder {
         (self, handle)
     }
 
-    /// Add a menu item and return a handle to it
-    pub fn add_item_with_handle(
-        self,
-        title: &str,
-        action: Option<Sel>,
-        key: &str,
-    ) -> (Self, MenuItemHandle) {
-        let title_str = NSString::from_str(title);
-        let key_str = NSString::from_str(key);
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(self.mtm),
-                &title_str,
-                action,
-                &key_str,
-            )
-        };
-        let handle = MenuItemHandle::new(item.clone());
-        self.menu.addItem(&item);
-        (self, handle)
-    }
-
     /// Add a separator item
     pub fn add_separator(self) -> Self {
         let sep = NSMenuItem::separatorItem(self.mtm);
         self.menu.addItem(&sep);
-        self
-    }
-
-    /// Add a disabled label item
-    pub fn add_disabled_label(self, title: &str) -> Self {
-        let title_str = NSString::from_str(title);
-        let key_str = NSString::from_str("");
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(self.mtm),
-                &title_str,
-                None,
-                &key_str,
-            )
-        };
-        item.setEnabled(false);
-        self.menu.addItem(&item);
         self
     }
 
@@ -355,10 +308,6 @@ impl MenuItemHandle {
     pub fn set_enabled(&self, enabled: bool) {
         self.item.setEnabled(enabled);
     }
-
-    pub fn item(&self) -> &NSMenuItem {
-        &self.item
-    }
 }
 
 /// Create the AppDelegate class using ClassBuilder
@@ -370,7 +319,11 @@ fn app_delegate_class() -> &'static AnyClass {
             ClassBuilder::new(c"CleoAppDelegate", superclass).expect("Failed to create class");
 
         // Add applicationDidFinishLaunching: method
-        unsafe extern "C" fn did_finish_launching(_this: *mut AnyObject, _sel: Sel, _notif: *mut AnyObject) {
+        unsafe extern "C" fn did_finish_launching(
+            _this: *mut AnyObject,
+            _sel: Sel,
+            _notif: *mut AnyObject,
+        ) {
             DID_FINISH_LAUNCHING.with(|cb| {
                 if let Some(callback) = cb.borrow_mut().as_mut() {
                     callback();
@@ -399,21 +352,25 @@ fn app_delegate_class() -> &'static AnyClass {
                 }
             });
             match reply {
-                TerminateReply::Cancel => 0, // NSTerminateCancel
-                TerminateReply::Now => 1,    // NSTerminateNow
-                TerminateReply::Later => 2,  // NSTerminateLater
+                TerminateReply::Now => 1,   // NSTerminateNow
+                TerminateReply::Later => 2, // NSTerminateLater
             }
         }
 
         unsafe {
             builder.add_method(
                 sel!(applicationShouldTerminate:),
-                should_terminate as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize,
+                should_terminate
+                    as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize,
             );
         }
 
         // Add applicationWillTerminate: method
-        unsafe extern "C" fn will_terminate(_this: *mut AnyObject, _sel: Sel, _notif: *mut AnyObject) {
+        unsafe extern "C" fn will_terminate(
+            _this: *mut AnyObject,
+            _sel: Sel,
+            _notif: *mut AnyObject,
+        ) {
             WILL_TERMINATE.with(|cb| {
                 if let Some(callback) = cb.borrow_mut().as_mut() {
                     callback();
@@ -456,7 +413,8 @@ fn app_delegate_class() -> &'static AnyClass {
         unsafe {
             builder.add_method(
                 sel!(application:openURLs:),
-                open_urls as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, *mut AnyObject),
+                open_urls
+                    as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, *mut AnyObject),
             );
         }
 
@@ -466,9 +424,9 @@ fn app_delegate_class() -> &'static AnyClass {
 
 /// Application runner
 pub struct App {
-    mtm: MainThreadMarker,
+    _mtm: MainThreadMarker,
     app: Retained<NSApplication>,
-    delegate: Retained<AnyObject>,
+    _delegate: Retained<AnyObject>,
 }
 
 impl App {
@@ -487,7 +445,11 @@ impl App {
             let _: () = msg_send![&app, setDelegate: &*delegate];
         }
 
-        Self { mtm, app, delegate }
+        Self {
+            _mtm: mtm,
+            app,
+            _delegate: delegate,
+        }
     }
 
     /// Set the callback for applicationDidFinishLaunching
@@ -518,29 +480,10 @@ impl App {
         });
     }
 
-    /// Get the main thread marker
-    pub fn mtm(&self) -> MainThreadMarker {
-        self.mtm
-    }
-
-    /// Get the NSApplication instance
-    pub fn ns_app(&self) -> &NSApplication {
-        &self.app
-    }
-
     /// Run the application event loop
     pub fn run(self) {
         unsafe {
             self.app.run();
-        }
-    }
-
-    /// Run one iteration of the event loop (for polling)
-    pub fn run_once(&self) {
-        unsafe {
-            let run_loop = objc2_foundation::NSRunLoop::currentRunLoop();
-            let date: *mut AnyObject = msg_send![class!(NSDate), distantPast];
-            let _: bool = msg_send![&run_loop, runMode: objc2_foundation::NSDefaultRunLoopMode, beforeDate: date];
         }
     }
 }

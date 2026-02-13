@@ -6,10 +6,7 @@ const K_CGEVENT_SOURCE_STATE_HIDDEN_STATE: u32 = 0xFFFFFFFF;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
-    fn CGEventSourceSecondsSinceLastEventType(
-        state_id: i32,
-        event_type: u32,
-    ) -> f64;
+    fn CGEventSourceSecondsSinceLastEventType(state_id: i32, event_type: u32) -> f64;
 }
 
 /// Returns seconds since last user input (mouse move, click, or keyboard)

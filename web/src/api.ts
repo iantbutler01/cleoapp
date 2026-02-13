@@ -13,16 +13,17 @@ declare global {
 const runtimeConfig = globalThis.window?.__CLEO_RUNTIME_CONFIG__;
 const API_BASE = (runtimeConfig?.apiBase || '/api').replace(/\/$/, '');
 const isAbsoluteApiBase = /^https?:\/\//.test(API_BASE);
-const currentOrigin = globalThis.window?.location.origin || '';
-const API_BASE_ORIGIN = isAbsoluteApiBase ? new URL(API_BASE).origin : currentOrigin;
-const API_BASE_PATH = isAbsoluteApiBase
-  ? new URL(API_BASE).pathname.replace(/\/$/, '')
-  : API_BASE;
+const currentOrigin = globalThis.window?.location.origin || 'http://localhost';
+const apiBaseUrl = isAbsoluteApiBase
+  ? new URL(API_BASE)
+  : new URL(API_BASE, currentOrigin);
+const API_BASE_PATH = apiBaseUrl.pathname.replace(/\/$/, '');
 
 const normalizeApiPath = (path: string): string => (path.startsWith('/') ? path : `/${path}`);
 
 export const apiBaseForWs = {
-  origin: API_BASE_ORIGIN,
+  protocol: apiBaseUrl.protocol === 'https:' ? 'wss:' : 'ws:',
+  host: apiBaseUrl.host,
   path: API_BASE_PATH,
 };
 
@@ -492,9 +493,8 @@ class ApiClient {
   ): Promise<PostTweetResponse> {
     return new Promise((resolve, reject) => {
       // Build WebSocket URL - uses cookies for auth
-      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsPath = normalizeApiPath(`${API_BASE_PATH}/tweets/${id}/publish/ws`);
-      const wsUrl = `${wsProtocol}//${apiBaseForWs.origin}${wsPath}`;
+      const wsUrl = `${apiBaseForWs.protocol}//${apiBaseForWs.host}${wsPath}`;
 
       const ws = new WebSocket(wsUrl);
 

@@ -17,7 +17,7 @@ use log::{info, warn};
 use objc2::declare::ClassBuilder;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Sel};
-use objc2::{msg_send, sel, ClassType};
+use objc2::{ClassType, msg_send, sel};
 use objc2_app_kit::NSWorkspace;
 use objc2_foundation::{NSObject, NSString};
 

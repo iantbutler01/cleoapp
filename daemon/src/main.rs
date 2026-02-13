@@ -1,3 +1,7 @@
+#![allow(unused_doc_comments)]
+#![allow(unused_unsafe)]
+#![allow(unsafe_op_in_unsafe_fn)]
+
 mod accessibility;
 mod api;
 mod app;
@@ -178,9 +182,6 @@ enum AppMessage {
     RefreshLimits,
     FlushActivity,
     SetApiToken,
-    ShowCommandPalette,
-    HideCommandPalette,
-    ToggleCaptureMode,
     PollHotkey,
     PaletteKey { key_code: u16 },
     ManageBannedApps,
@@ -456,9 +457,6 @@ impl CleoDaemon {
             AppMessage::RefreshLimits => self.fetch_recording_limits(),
             AppMessage::FlushActivity => self.flush_activity_events(),
             AppMessage::SetApiToken => self.show_api_token_dialog(),
-            AppMessage::ShowCommandPalette => self.show_command_palette(),
-            AppMessage::HideCommandPalette => self.hide_command_palette(),
-            AppMessage::ToggleCaptureMode => self.toggle_capture_mode(),
             AppMessage::PollHotkey => self.poll_hotkey(),
             AppMessage::PaletteKey { key_code } => self.handle_palette_key(key_code),
             AppMessage::ManageBannedApps => self.show_banned_apps_window(),
@@ -539,8 +537,7 @@ impl CleoDaemon {
 
     fn stop_logging_daemon(&self) {
         if let Some(daemon) = self.logging_daemon.borrow_mut().take() {
-            daemon.stop.store(true, Ordering::Relaxed);
-            // Don't wait for thread - let it terminate in background
+            daemon.shutdown();
         }
     }
 
@@ -778,28 +775,29 @@ impl CleoDaemon {
     }
 
     fn poll_hotkey(&self) {
-        // Hide palette if it lost key window status (user clicked elsewhere)
-        if let Some(palette) = self.command_palette.borrow().as_ref() {
-            if palette.is_visible() {
-                let is_key = palette.panel_ptr().isKeyWindow();
-                if !is_key {
-                    palette.hide();
-                }
+        let should_mark_deactivated = {
+            let palette_ref = self.command_palette.borrow();
+            palette_ref
+                .as_ref()
+                .is_some_and(|palette| palette.is_visible() && !palette.panel_ptr().isKeyWindow())
+        };
+
+        if should_mark_deactivated {
+            if let Some(palette) = self.command_palette.borrow().as_ref() {
+                palette.hide();
             }
         }
 
-        if let Some(tracker) = self.hotkey_tracker.borrow().as_ref() {
-            if tracker.poll() {
-                // Toggle palette - allows Cmd+Shift+C to open and close
-                if let Some(palette) = self.command_palette.borrow().as_ref() {
-                    if palette.is_visible() {
-                        palette.hide();
-                    } else {
-                        self.show_command_palette();
-                    }
-                } else {
-                    self.show_command_palette();
-                }
+        let should_toggle = {
+            let tracker_ref = self.hotkey_tracker.borrow();
+            tracker_ref.as_ref().is_some_and(|tracker| tracker.poll())
+        };
+
+        if should_toggle {
+            if let Some(palette) = self.command_palette.borrow().as_ref() {
+                palette.toggle();
+            } else {
+                self.show_command_palette();
             }
         }
     }
@@ -820,13 +818,6 @@ impl CleoDaemon {
             });
 
             info!("Command palette shown");
-        }
-    }
-
-    fn hide_command_palette(&self) {
-        if let Some(palette) = self.command_palette.borrow().as_ref() {
-            palette.hide();
-            info!("Command palette hidden");
         }
     }
 
@@ -1108,27 +1099,26 @@ impl CleoDaemon {
             }
         }
 
-        // Check if window is empty AFTER cleaning (determines if this is a new burst)
-        let was_empty = window.is_empty();
-
         // Add the new event
         window.push_back(BurstAction { time: now, kind });
 
-        // If window was empty, this is a new burst - use threshold based on action type
-        // If window already had events, we're extending an existing burst
-        let burst_threshold = if was_empty {
-            match kind {
-                BurstActionKind::AppSwitch => BURST_THRESHOLD_WITH_SWITCH,
-                BurstActionKind::Click | BurstActionKind::Keypress => BURST_THRESHOLD_ACTIONS_ONLY,
-            }
-        } else {
-            0 // Already in a burst, any action extends
-        };
+        let app_switch_count = window
+            .iter()
+            .filter(|event| event.kind == BurstActionKind::AppSwitch)
+            .count();
+        let action_count = window
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    BurstActionKind::Click | BurstActionKind::Keypress
+                )
+            })
+            .count();
+        let burst_triggered = app_switch_count >= BURST_THRESHOLD_WITH_SWITCH
+            || action_count >= BURST_THRESHOLD_ACTIONS_ONLY;
 
-        if window.len() >= burst_threshold
-            && self.recorder.borrow().is_none()
-            && self.auto_capture_enabled.get()
-        {
+        if burst_triggered && self.recorder.borrow().is_none() && self.auto_capture_enabled.get() {
             eprintln!(
                 "[recording] Automatic recording triggered by activity burst ({} events in {}s window)",
                 window.len(),
@@ -1218,13 +1208,17 @@ impl CleoDaemon {
         if let Some(api) = self.api.borrow().as_ref() {
             match api.fetch_limits() {
                 Ok(limits) => {
+                    let storage_remaining = limits.storage_remaining();
+                    let storage_exceeded = limits.storage_exceeded();
                     info!(
-                        "Fetched recording limits: max_duration={}s, budget={}s, inactivity={}s, storage={}/{}",
+                        "Fetched recording limits: max_duration={}s, budget={}s, inactivity={}s, storage={}/{}, remaining={}B, exceeded={}",
                         limits.max_recording_duration_secs,
                         limits.recording_budget_secs,
                         limits.inactivity_timeout_secs,
                         limits.storage_used_bytes,
-                        limits.storage_limit_bytes
+                        limits.storage_limit_bytes,
+                        storage_remaining,
+                        storage_exceeded
                     );
                     self.recording_limits.borrow_mut().replace(limits);
                 }
@@ -1684,18 +1678,16 @@ impl LoggingDaemon {
         }
     }
 
-    fn shutdown(self) {
+    fn shutdown(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Thread will exit on next sleep_with_cancellation check (max 100ms)
-        // Drop impl will not block
+        join_task_handle(&mut self.handle, "logging daemon");
     }
 }
 
 impl Drop for LoggingDaemon {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Thread will exit on next sleep_with_cancellation check (max 100ms)
-        // Don't block on join during app termination
+        join_task_handle(&mut self.handle, "logging daemon");
     }
 }
 
@@ -1736,8 +1728,7 @@ impl RepeatingTask {
 impl Drop for RepeatingTask {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Thread will exit on next sleep_with_cancellation check (max 100ms)
-        // Don't block on join during app termination
+        join_task_handle(&mut self.handle, "repeating task");
     }
 }
 
@@ -1774,8 +1765,7 @@ impl DelayedTask {
 impl Drop for DelayedTask {
     fn drop(&mut self) {
         self.cancel();
-        // Thread will exit on next sleep_with_cancellation check (max 100ms)
-        // Don't block on join during app termination
+        join_task_handle(&mut self.handle, "delayed task");
     }
 }
 
@@ -1795,6 +1785,22 @@ fn sleep_with_cancellation(flag: &AtomicBool, duration: Duration) -> bool {
         elapsed += step;
     }
     flag.load(Ordering::Relaxed)
+}
+
+fn join_task_handle(handle: &mut Option<thread::JoinHandle<()>>, task_name: &str) {
+    if let Some(handle) = handle.take() {
+        if handle.thread().id() == thread::current().id() {
+            warn!(
+                "Skipping join for `{}` because shutdown was called from the same thread",
+                task_name
+            );
+            return;
+        }
+
+        if handle.join().is_err() {
+            error!("`{}` thread panicked during shutdown", task_name);
+        }
+    }
 }
 
 struct ScreenRecorder {
@@ -1878,6 +1884,7 @@ impl ScreenRecorder {
     fn stop(mut self) -> Result<(), CaptureError> {
         self.stop_stream()?;
         thread::sleep(Duration::from_millis(100));
+        let recorded_for = self.started_at.elapsed();
 
         // Move to pending recordings folder
         let pending_dir = pending_recordings_dir();
@@ -1892,7 +1899,11 @@ impl ScreenRecorder {
         let pending_path = pending_dir.join(filename);
 
         fs::rename(&self.file_path, &pending_path)?;
-        info!("Recording saved to {}", pending_path.display());
+        info!(
+            "Recording saved to {} (duration {:.1}s)",
+            pending_path.display(),
+            recorded_for.as_secs_f32()
+        );
 
         Ok(())
     }
@@ -1932,7 +1943,6 @@ enum CaptureError {
     ApiUnavailable,
     ImageEncoding(String),
     Config(String),
-    ContentFilter(String),
 }
 
 impl fmt::Display for CaptureError {
@@ -1954,7 +1964,6 @@ impl fmt::Display for CaptureError {
             }
             CaptureError::ImageEncoding(err) => write!(f, "Failed to encode image: {err}"),
             CaptureError::Config(err) => write!(f, "{err}"),
-            CaptureError::ContentFilter(err) => write!(f, "Content filter error: {err}"),
         }
     }
 }
@@ -2000,6 +2009,34 @@ fn pending_recordings_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(PENDING_RECORDINGS_DIR)
+}
+
+fn image_format_from_path(path: &Path) -> Option<ImageFormat> {
+    let ext = path.extension()?.to_str()?;
+    if ext.eq_ignore_ascii_case("png") {
+        Some(ImageFormat::Png)
+    } else if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
+        Some(ImageFormat::Jpeg)
+    } else if ext.eq_ignore_ascii_case("gif") {
+        Some(ImageFormat::Gif)
+    } else if ext.eq_ignore_ascii_case("webp") {
+        Some(ImageFormat::Webp)
+    } else {
+        None
+    }
+}
+
+fn video_format_from_path(path: &Path) -> Option<VideoFormat> {
+    let ext = path.extension()?.to_str()?;
+    if ext.eq_ignore_ascii_case("mov") {
+        Some(VideoFormat::QuickTime)
+    } else if ext.eq_ignore_ascii_case("mp4") {
+        Some(VideoFormat::Mp4)
+    } else if ext.eq_ignore_ascii_case("webm") {
+        Some(VideoFormat::Webm)
+    } else {
+        None
+    }
 }
 
 /// Save screenshot to local pending folder (no classification, no upload)
@@ -2148,9 +2185,7 @@ impl BatchUploader {
 
     fn shutdown(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            std::mem::forget(handle);
-        }
+        join_task_handle(&mut self.handle, "batch uploader");
     }
 
     fn process_pending(api: &ApiClient, content_filter: &dyn ContentFilter) {
@@ -2162,7 +2197,7 @@ impl BatchUploader {
             let mut files: Vec<PathBuf> = entries
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|e| e == "png"))
+                .filter(|p| image_format_from_path(p).is_some())
                 .collect();
             files.sort(); // Process oldest first
             eprintln!("[DEBUG] Found {} screenshots to process", files.len());
@@ -2182,10 +2217,7 @@ impl BatchUploader {
             let mut files: Vec<PathBuf> = entries
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .filter(|p| {
-                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    matches!(ext, "mov" | "mp4")
-                })
+                .filter(|p| video_format_from_path(p).is_some())
                 .collect();
             files.sort(); // Process oldest first
 
@@ -2221,12 +2253,21 @@ impl BatchUploader {
 
         while file_iter.peek().is_some() {
             // Fill a batch with up to BATCH_SIZE unique images
-            let mut prepared: Vec<(PathBuf, Vec<u8>, Vec<u8>)> = Vec::new(); // (path, png_bytes, scaled_rgb)
+            let mut prepared: Vec<(PathBuf, Vec<u8>, Vec<u8>, ImageFormat)> = Vec::new(); // (path, media bytes, scaled_rgb, format)
 
             while prepared.len() < BATCH_SIZE {
                 let path = match file_iter.next() {
                     Some(p) => p,
                     None => break, // No more files
+                };
+
+                let format = match image_format_from_path(path) {
+                    Some(format) => format,
+                    None => {
+                        warn!("Unsupported screenshot format for {}", path.display());
+                        let _ = fs::remove_file(path);
+                        continue;
+                    }
                 };
 
                 let bytes = match fs::read(path) {
@@ -2288,7 +2329,7 @@ impl BatchUploader {
                 }
                 last_hash = Some(current_hash);
 
-                prepared.push((path.clone(), bytes, scaled));
+                prepared.push((path.clone(), bytes, scaled, format));
             }
 
             if prepared.is_empty() {
@@ -2301,7 +2342,8 @@ impl BatchUploader {
                 prepared.len()
             );
             info!("Classifying batch of {} screenshots", prepared.len());
-            let scaled_batch: Vec<Vec<u8>> = prepared.iter().map(|(_, _, s)| s.clone()).collect();
+            let scaled_batch: Vec<Vec<u8>> =
+                prepared.iter().map(|(_, _, s, _)| s.clone()).collect();
             let results = match content_filter.classify(&scaled_batch) {
                 Ok(r) => {
                     eprintln!("[DEBUG] Classification complete, got {} results", r.len());
@@ -2309,17 +2351,17 @@ impl BatchUploader {
                 }
                 Err(e) => {
                     error!("Batch classification failed: {}", e);
-                    for (path, _, _) in &prepared {
+                    for (path, _, _, _) in &prepared {
                         let _ = fs::remove_file(path);
                     }
                     continue;
                 }
             };
 
-            let mut safe_uploads: Vec<(PathBuf, Vec<u8>)> = Vec::new();
-            for ((path, bytes, _), is_safe) in prepared.into_iter().zip(results) {
+            let mut safe_uploads: Vec<(PathBuf, Vec<u8>, ImageFormat)> = Vec::new();
+            for ((path, bytes, _, format), is_safe) in prepared.into_iter().zip(results) {
                 if is_safe {
-                    safe_uploads.push((path, bytes));
+                    safe_uploads.push((path, bytes, format));
                 } else {
                     info!("BLOCKED: {}", path.display());
                     let _ = fs::remove_file(&path);
@@ -2338,7 +2380,7 @@ impl BatchUploader {
                 );
                 let batch: Vec<_> = safe_uploads
                     .iter()
-                    .map(|(_, bytes)| (bytes.clone(), ImageFormat::Png))
+                    .map(|(_, bytes, format)| (bytes.clone(), *format))
                     .collect();
                 match api.upload_images(batch) {
                     Ok(result) => {
@@ -2348,9 +2390,38 @@ impl BatchUploader {
                             result.uploaded, result.failed
                         );
                         total_processed += result.uploaded;
-                        // Only delete files on successful upload
-                        for (path, _) in safe_uploads {
-                            let _ = fs::remove_file(&path);
+                        // Delete only files confirmed as successfully uploaded.
+                        if result.failed == 0 {
+                            for (path, _, _) in &safe_uploads {
+                                let _ = fs::remove_file(path);
+                            }
+                        } else if !result.successful_indices.is_empty() {
+                            let mut deleted = 0usize;
+                            for idx in result.successful_indices {
+                                match safe_uploads.get(idx) {
+                                    Some((path, _, _)) => {
+                                        let _ = fs::remove_file(path);
+                                        deleted += 1;
+                                    }
+                                    None => {
+                                        warn!(
+                                            "Upload result returned out-of-range screenshot index {} (batch size {})",
+                                            idx,
+                                            safe_uploads.len()
+                                        );
+                                    }
+                                }
+                            }
+                            info!(
+                                "Deleted {} uploaded screenshots; retained {} for retry",
+                                deleted,
+                                safe_uploads.len().saturating_sub(deleted)
+                            );
+                        } else {
+                            warn!(
+                                "Partial screenshot batch upload without per-file success metadata; retaining all {} files for retry",
+                                safe_uploads.len()
+                            );
                         }
                     }
                     Err(e) => {
@@ -2476,9 +2547,13 @@ impl BatchUploader {
                 }
             };
 
-            let format = match path.extension().and_then(|e| e.to_str()) {
-                Some("mov") => VideoFormat::QuickTime,
-                Some("mp4") | _ => VideoFormat::Mp4,
+            let format = match video_format_from_path(&path) {
+                Some(format) => format,
+                None => {
+                    warn!("Unsupported recording format for {}", path.display());
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
             };
 
             safe_uploads.push((path, bytes, format));
@@ -2504,9 +2579,38 @@ impl BatchUploader {
                         "Batch upload complete: {} uploaded, {} failed",
                         result.uploaded, result.failed
                     );
-                    // Only delete files on successful upload
-                    for (path, _, _) in safe_uploads {
-                        let _ = fs::remove_file(&path);
+                    // Delete only files confirmed as successfully uploaded.
+                    if result.failed == 0 {
+                        for (path, _, _) in &safe_uploads {
+                            let _ = fs::remove_file(path);
+                        }
+                    } else if !result.successful_indices.is_empty() {
+                        let mut deleted = 0usize;
+                        for idx in result.successful_indices {
+                            match safe_uploads.get(idx) {
+                                Some((path, _, _)) => {
+                                    let _ = fs::remove_file(path);
+                                    deleted += 1;
+                                }
+                                None => {
+                                    warn!(
+                                        "Upload result returned out-of-range recording index {} (batch size {})",
+                                        idx,
+                                        safe_uploads.len()
+                                    );
+                                }
+                            }
+                        }
+                        info!(
+                            "Deleted {} uploaded recordings; retained {} for retry",
+                            deleted,
+                            safe_uploads.len().saturating_sub(deleted)
+                        );
+                    } else {
+                        warn!(
+                            "Partial recording batch upload without per-file success metadata; retaining all {} files for retry",
+                            safe_uploads.len()
+                        );
                     }
                 }
                 Err(e) => {

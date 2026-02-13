@@ -119,8 +119,7 @@ export class MediaEditor extends LitElement {
   private connectWs() {
     if (this.ws) return;
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${apiBaseForWs.origin}${apiBaseForWs.path}/media/edit/ws`;
+    const wsUrl = `${apiBaseForWs.protocol}//${apiBaseForWs.host}${apiBaseForWs.path}/media/edit/ws`;
 
     this.ws = new WebSocket(wsUrl);
 

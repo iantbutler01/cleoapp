@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::vit;
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::Api};
 use image::{ImageBuffer, Rgba};
 use std::path::Path;
 use std::process::Command;
@@ -49,7 +49,8 @@ impl NsfwFilter {
         let config_path = repo.get("config.json")?;
 
         let config: vit::Config = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_path], DType::F32, &device)? };
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[model_path], DType::F32, &device)? };
         let model = vit::Model::new(&config, 5, vb)?; // 5 classes: drawings, hentai, neutral, porn, sexy
 
         log::info!("NSFW model loaded successfully");
@@ -176,17 +177,14 @@ impl ContentFilter for NsfwFilter {
                     height,
                 }])
             }
-            "mp4" | "mov" | "webm" | "mkv" => {
-                self.sample_video(path, interval_secs)
-            }
+            "mp4" | "mov" | "webm" | "mkv" => self.sample_video(path, interval_secs),
             _ => Err(anyhow!("Unsupported file type: {}", ext)),
         }
     }
 
     fn scale(&self, rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
-        let img: ImageBuffer<Rgba<u8>, _> =
-            ImageBuffer::from_raw(width, height, rgba.to_vec())
-                .ok_or_else(|| anyhow!("Invalid image dimensions"))?;
+        let img: ImageBuffer<Rgba<u8>, _> = ImageBuffer::from_raw(width, height, rgba.to_vec())
+            .ok_or_else(|| anyhow!("Invalid image dimensions"))?;
 
         let resized = image::imageops::resize(
             &img,
@@ -212,12 +210,18 @@ impl ContentFilter for NsfwFilter {
         }
 
         // Validate all images
-        eprintln!("[DEBUG] classify: validating {} images", scaled_images.len());
+        eprintln!(
+            "[DEBUG] classify: validating {} images",
+            scaled_images.len()
+        );
         for (i, img) in scaled_images.iter().enumerate() {
             if img.len() != IMAGE_SIZE * IMAGE_SIZE * 3 {
                 return Err(anyhow!(
                     "Image {} expected {}x{}x3 RGB, got {} bytes",
-                    i, IMAGE_SIZE, IMAGE_SIZE, img.len()
+                    i,
+                    IMAGE_SIZE,
+                    IMAGE_SIZE,
+                    img.len()
                 ));
             }
         }
@@ -226,8 +230,14 @@ impl ContentFilter for NsfwFilter {
         eprintln!("[DEBUG] classify: preprocessing batch");
         let input = self.preprocess_batch(scaled_images)?;
         eprintln!("[DEBUG] classify: acquiring model lock");
-        let model = self.model.lock().map_err(|e| anyhow!("Lock error: {}", e))?;
-        eprintln!("[DEBUG] classify: running forward pass on {} images...", batch_size);
+        let model = self
+            .model
+            .lock()
+            .map_err(|e| anyhow!("Lock error: {}", e))?;
+        eprintln!(
+            "[DEBUG] classify: running forward pass on {} images...",
+            batch_size
+        );
         let logits = model.forward(&input)?;
         eprintln!("[DEBUG] classify: forward pass complete");
 
@@ -239,9 +249,15 @@ impl ContentFilter for NsfwFilter {
 
         for batch_idx in 0..batch_size {
             let offset = batch_idx * 5;
-            let drawings_prob = probs_vec.get(offset + CLASS_DRAWINGS).copied().unwrap_or(0.0);
+            let drawings_prob = probs_vec
+                .get(offset + CLASS_DRAWINGS)
+                .copied()
+                .unwrap_or(0.0);
             let hentai_prob = probs_vec.get(offset + CLASS_HENTAI).copied().unwrap_or(0.0);
-            let neutral_prob = probs_vec.get(offset + CLASS_NEUTRAL).copied().unwrap_or(0.0);
+            let neutral_prob = probs_vec
+                .get(offset + CLASS_NEUTRAL)
+                .copied()
+                .unwrap_or(0.0);
             let porn_prob = probs_vec.get(offset + CLASS_PORN).copied().unwrap_or(0.0);
             let sexy_prob = probs_vec.get(offset + CLASS_SEXY).copied().unwrap_or(0.0);
 
@@ -262,20 +278,28 @@ impl ContentFilter for NsfwFilter {
             if is_safe {
                 log::info!(
                     "[NSFW] #{} SAFE - nsfw: {:.1}% (drawings={:.1}%, neutral={:.1}%)",
-                    batch_idx, nsfw_prob * 100.0, drawings_prob * 100.0, neutral_prob * 100.0
+                    batch_idx,
+                    nsfw_prob * 100.0,
+                    drawings_prob * 100.0,
+                    neutral_prob * 100.0
                 );
             } else {
                 let (class_name, class_prob) = blocked_class.unwrap();
                 log::warn!(
                     "[NSFW] #{} BLOCKED - {} at {:.1}%",
-                    batch_idx, class_name, class_prob * 100.0
+                    batch_idx,
+                    class_name,
+                    class_prob * 100.0
                 );
             }
 
             results.push(is_safe);
         }
 
-        log::info!("[NSFW] Batch of {} classified in single forward pass", batch_size);
+        log::info!(
+            "[NSFW] Batch of {} classified in single forward pass",
+            batch_size
+        );
         Ok(results)
     }
 }

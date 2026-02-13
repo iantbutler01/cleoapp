@@ -69,6 +69,7 @@ pub struct BatchCaptureResponse {
     ids: Vec<i64>,
     uploaded: usize,
     failed: usize,
+    successful_indices: Vec<usize>,
 }
 
 pub fn get_extension(content_type: &str) -> &'static str {
@@ -184,18 +185,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gemini: gemini.clone(),
     });
 
+    // Background agent scheduler configuration (override via env if needed)
+    let agent_idle_minutes: i64 = std::env::var("AGENT_IDLE_MINUTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v| v >= 1)
+        .unwrap_or(20);
+    let agent_check_interval_secs: u64 = std::env::var("AGENT_CHECK_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v| v >= 30)
+        .unwrap_or(5 * 60);
+
     // Start background scheduler for idle user processing (only if Gemini is configured)
     if let Some(gemini_client) = state.gemini.clone() {
-        // Checks every 5 minutes for users idle for 30+ minutes
         tokio::spawn(agent::start_background_scheduler(
             pool.clone(),
             gcs.clone(),
             gemini_client,
-            1,  // idle_minutes
-            30, // check_interval_secs (5 min)
+            agent_idle_minutes,
+            agent_check_interval_secs,
             local_storage_path.clone(),
         ));
-        println!("[scheduler] Background scheduler started (30min idle, 5min check)");
+        println!(
+            "[scheduler] Background scheduler started ({}min idle, {}s check)",
+            agent_idle_minutes, agent_check_interval_secs
+        );
     } else {
         println!("[scheduler] Background scheduler DISABLED (no Gemini API key)");
     }

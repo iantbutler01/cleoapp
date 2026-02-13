@@ -10,12 +10,12 @@ use global_hotkey::{
 };
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{MainThreadOnly, msg_send, ClassType};
+use objc2::{ClassType, MainThreadOnly, msg_send};
 use objc2_app_kit::{
-    NSColor, NSEvent, NSEventMask, NSFont, NSImage, NSImageSymbolConfiguration,
+    NSBox, NSBoxType, NSColor, NSEvent, NSEventMask, NSFont, NSImage, NSImageSymbolConfiguration,
     NSImageSymbolScale, NSImageView, NSPanel, NSScreen, NSTextField, NSView,
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindowStyleMask, NSBox, NSBoxType,
+    NSWindowStyleMask,
 };
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::CGColor;
@@ -43,7 +43,6 @@ fn cg_tertiary_label_color() -> CFRetained<CGColor> {
     // Approximate tertiary label - light gray with transparency
     CGColor::new_srgb(0.0, 0.0, 0.0, 0.1)
 }
-
 
 /// Key codes for keyboard handling
 const KEY_ESCAPE: u16 = 53;
@@ -117,13 +116,11 @@ impl PaletteCommand {
                 }
             }
             PaletteCommand::TakeScreenshot => "Take Screenshot".to_string(),
-            PaletteCommand::ToggleBanApp => {
-                match &state.current_app_name {
-                    Some(name) if state.current_app_banned => format!("Unban {}", name),
-                    Some(name) => format!("Ban {}", name),
-                    None => "Ban Current App".to_string(),
-                }
-            }
+            PaletteCommand::ToggleBanApp => match &state.current_app_name {
+                Some(name) if state.current_app_banned => format!("Unban {}", name),
+                Some(name) => format!("Ban {}", name),
+                None => "Ban Current App".to_string(),
+            },
         }
     }
 }
@@ -181,7 +178,8 @@ impl CommandPalette {
 
         // Get screen frame to center the panel
         let screen_frame = unsafe {
-            let screen = NSScreen::mainScreen(mtm).ok_or(CommandPaletteError::PanelCreationFailed)?;
+            let screen =
+                NSScreen::mainScreen(mtm).ok_or(CommandPaletteError::PanelCreationFailed)?;
             screen.frame()
         };
 
@@ -237,7 +235,9 @@ impl CommandPalette {
 
         // Add NSVisualEffectView as a subview behind other content
         let content_view = unsafe {
-            let content_view = panel.contentView().ok_or(CommandPaletteError::PanelCreationFailed)?;
+            let content_view = panel
+                .contentView()
+                .ok_or(CommandPaletteError::PanelCreationFailed)?;
             let bounds = content_view.bounds();
 
             // Make content view layer-backed
@@ -344,10 +344,9 @@ impl CommandPalette {
                     FONT_WEIGHT_MEDIUM,
                     NSImageSymbolScale::Medium,
                 );
-                if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                    &icon_name,
-                    None,
-                ) {
+                if let Some(image) =
+                    NSImage::imageWithSystemSymbolName_accessibilityDescription(&icon_name, None)
+                {
                     if let Some(configured) = image.imageWithSymbolConfiguration(&config) {
                         image_view.setImage(Some(&configured));
                     }
@@ -488,9 +487,8 @@ impl CommandPalette {
 
     /// Hide the command palette
     pub fn hide(&self) {
-        eprintln!("[palette.hide] called, setting visible=false");
-        self.visible.set(false);
-        self.uninstall_local_monitor();
+        eprintln!("[palette.hide] called");
+        self.on_deactivate();
         unsafe {
             self.panel.orderOut(None);
         }

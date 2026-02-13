@@ -255,6 +255,7 @@ async fn browse_captures(
 /// GET /media/*path - Serve local media files
 async fn serve_media(
     State(state): State<Arc<AppState>>,
+    AuthUser(user_id): AuthUser,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
     // Security: reject paths with traversal attempts or null bytes upfront
@@ -266,6 +267,14 @@ async fn serve_media(
         .local_storage_path
         .as_ref()
         .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Enforce per-user access control for locally served media.
+    let owns_path = captures_domain::user_owns_media_path(&state.db, user_id, &path)
+        .await
+        .log_500("Verify media ownership error")?;
+    if !owns_path {
+        return Err(StatusCode::NOT_FOUND);
+    }
 
     let full_path = local_path.join(&path);
 
@@ -335,12 +344,17 @@ async fn capture_batch(
 
     let mut ids = Vec::new();
     let mut failed = 0usize;
+    let mut successful_indices = Vec::new();
+    let mut field_index = 0usize;
 
     while let Some(field) = multipart
         .next_field()
         .await
         .log_status("Multipart field error", StatusCode::BAD_REQUEST)?
     {
+        let current_index = field_index;
+        field_index += 1;
+
         let content_type = field
             .content_type()
             .map(|s| s.to_string())
@@ -449,6 +463,7 @@ async fn capture_batch(
         {
             Ok(id) => {
                 ids.push(id);
+                successful_indices.push(current_index);
             }
             Err(e) => {
                 eprintln!("[capture_batch] DB insert failed: {}", e);
@@ -493,6 +508,7 @@ async fn capture_batch(
         ids: ids.clone(),
         uploaded: ids.len(),
         failed,
+        successful_indices,
     })))
 }
 

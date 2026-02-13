@@ -30,7 +30,6 @@ export class DashboardPage extends LitElement {
 
   private readonly pollIntervalMs = 45_000;
   private pollTimer: number | null = null;
-  private pushSubscriptionInitialized = false;
   private pushSetupInProgress = false;
   private queueItemKeys = new Set<string>();
   private queueInitialized = false;
@@ -98,7 +97,10 @@ export class DashboardPage extends LitElement {
   }
 
   private getItemKey(item: ContentItem): string {
-    return `${item.type}-${item.id}`;
+    if (item.type === "tweet") {
+      return `${item.type}-${item.id}`;
+    }
+    return `${item.type}-${item.thread.id}`;
   }
 
   private async processQueueNotifications(items: ContentItem[]) {
@@ -186,11 +188,8 @@ export class DashboardPage extends LitElement {
           auth: json.keys.auth,
         },
       });
-
-      this.pushSubscriptionInitialized = true;
     } catch (error) {
       console.error("Failed to configure push notifications:", error);
-      this.pushSubscriptionInitialized = false;
     } finally {
       this.pushSetupInProgress = false;
     }
@@ -199,12 +198,18 @@ export class DashboardPage extends LitElement {
   private async recreateSubscription(
     serviceWorker: ServiceWorkerRegistration,
     existing: PushSubscription | null,
-    applicationServerKey: Uint8Array,
+    applicationServerKeyBytes: Uint8Array,
   ): Promise<PushSubscription | null> {
     try {
       if (existing) {
         await existing.unsubscribe();
       }
+
+      // PushManager expects an ArrayBuffer-backed key in strict DOM typings.
+      const applicationServerKey = applicationServerKeyBytes.buffer.slice(
+        applicationServerKeyBytes.byteOffset,
+        applicationServerKeyBytes.byteOffset + applicationServerKeyBytes.byteLength,
+      ) as ArrayBuffer;
 
       return await serviceWorker.pushManager.subscribe({
         userVisibleOnly: true,
@@ -221,13 +226,15 @@ export class DashboardPage extends LitElement {
       return false;
     }
 
-    const existingKeyBytes = existingAppKey instanceof ArrayBuffer
-      ? new Uint8Array(existingAppKey)
-      : typeof existingAppKey === "string"
-        ? this.urlBase64ToUint8Array(existingAppKey)
-        : existingAppKey instanceof Uint8Array
-          ? existingAppKey
-          : new Uint8Array(existingAppKey as ArrayBufferLike);
+    let existingKeyBytes: Uint8Array;
+    if (typeof existingAppKey === "string") {
+      existingKeyBytes = this.urlBase64ToUint8Array(existingAppKey);
+    } else if (existingAppKey instanceof ArrayBuffer) {
+      existingKeyBytes = new Uint8Array(existingAppKey);
+    } else {
+      const view = existingAppKey as ArrayBufferView;
+      existingKeyBytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    }
 
     if (existingKeyBytes.length !== appKey.length) {
       return false;
@@ -240,7 +247,7 @@ export class DashboardPage extends LitElement {
     const padding = "=".repeat((4 - (value.length % 4)) % 4);
     const base64 = (value + padding).replace(/-/g, "+").replace(/_/g, "/");
     const rawData = atob(base64);
-    const outputArray = new Uint8Array(rawData.length);
+    const outputArray = new Uint8Array(new ArrayBuffer(rawData.length));
 
     for (let i = 0; i < rawData.length; i++) {
       outputArray[i] = rawData.charCodeAt(i);
@@ -279,11 +286,16 @@ export class DashboardPage extends LitElement {
         type,
         id,
       },
-      timestamp: Date.now(),
-      renotify: true,
       requireInteraction: false,
-      vibrate: [80, 40, 80],
     };
+    const extra = options as NotificationOptions & {
+      timestamp?: number;
+      renotify?: boolean;
+      vibrate?: number[];
+    };
+    extra.timestamp = Date.now();
+    extra.renotify = true;
+    extra.vibrate = [80, 40, 80];
 
     if (!("Notification" in window) || Notification.permission !== "granted") {
       return;

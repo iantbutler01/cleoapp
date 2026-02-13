@@ -3,7 +3,7 @@ use std::fmt;
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{msg_send, ClassType};
+use objc2::{ClassType, msg_send};
 use objc2_app_kit::{NSEvent, NSEventMask};
 
 #[derive(Debug)]
@@ -37,7 +37,8 @@ impl MouseTracker {
             handler();
         });
 
-        let mask = NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::OtherMouseDown;
+        let mask =
+            NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::OtherMouseDown;
         let monitor: *mut AnyObject = unsafe {
             msg_send![
                 NSEvent::class(),

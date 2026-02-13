@@ -21,6 +21,7 @@ pub struct Tweet {
     pub publish_status: String,
     pub publish_attempts: i32,
     pub publish_error: Option<String>,
+    #[allow(dead_code)]
     pub publish_error_at: Option<DateTime<Utc>>,
 }
 

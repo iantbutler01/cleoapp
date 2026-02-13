@@ -3,15 +3,15 @@
 use std::cell::RefCell;
 use std::sync::OnceLock;
 
+use objc2::declare::ClassBuilder;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
 use objc2::sel;
 use objc2::{ClassType, MainThreadOnly, msg_send};
-use objc2::declare::ClassBuilder;
 use objc2_app_kit::{
-    NSColor, NSFont, NSImage, NSImageView, NSScrollView, NSSwitch,
-    NSTextField, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowStyleMask, NSWorkspace,
+    NSColor, NSFont, NSImage, NSImageView, NSScrollView, NSSwitch, NSTextField, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindow, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString};
 
@@ -85,7 +85,11 @@ fn window_delegate_class() -> &'static AnyClass {
             .expect("Failed to create WindowDelegate class");
 
         // windowShouldClose: - return NO and hide the window instead
-        unsafe extern "C" fn window_should_close(_this: *mut AnyObject, _sel: Sel, window: *mut AnyObject) -> Bool {
+        unsafe extern "C" fn window_should_close(
+            _this: *mut AnyObject,
+            _sel: Sel,
+            window: *mut AnyObject,
+        ) -> Bool {
             // Hide the window instead of closing it
             let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
             Bool::NO
@@ -94,7 +98,8 @@ fn window_delegate_class() -> &'static AnyClass {
         unsafe {
             builder.add_method(
                 sel!(windowShouldClose:),
-                window_should_close as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> Bool,
+                window_should_close
+                    as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> Bool,
             );
         }
 
@@ -127,7 +132,7 @@ fn flipped_view_class() -> &'static AnyClass {
 }
 
 /// Get app icon by app name
-fn get_app_icon(app_name: &str, mtm: MainThreadMarker) -> Option<Retained<NSImage>> {
+fn get_app_icon(app_name: &str, _mtm: MainThreadMarker) -> Option<Retained<NSImage>> {
     unsafe {
         let workspace = NSWorkspace::sharedWorkspace();
 
@@ -183,9 +188,8 @@ impl BannedAppsWindow {
             NSSize::new(WINDOW_WIDTH, window_height),
         );
 
-        let style_mask = NSWindowStyleMask::Titled
-            | NSWindowStyleMask::Closable
-            | NSWindowStyleMask::Resizable;
+        let style_mask =
+            NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Resizable;
 
         // Create window delegate to hide instead of close
         let delegate: Retained<AnyObject> = unsafe {
@@ -218,7 +222,9 @@ impl BannedAppsWindow {
 
         // Get content view and set up visual effect background
         let content_view = unsafe {
-            let content_view = window.contentView().ok_or(BannedAppsWindowError::CreationFailed)?;
+            let content_view = window
+                .contentView()
+                .ok_or(BannedAppsWindowError::CreationFailed)?;
             let bounds = content_view.bounds();
 
             content_view.setWantsLayer(true);
@@ -269,7 +275,11 @@ impl BannedAppsWindow {
 
     /// Update the window with the current list of apps
     /// `apps` is a list of (app_name, is_banned) tuples
-    pub fn update_apps(&self, apps: &[(String, bool)], on_toggle: impl Fn(String, bool) + Send + Sync + 'static + Clone) {
+    pub fn update_apps(
+        &self,
+        apps: &[(String, bool)],
+        on_toggle: impl Fn(String, bool) + Send + Sync + 'static + Clone,
+    ) {
         let mtm = match MainThreadMarker::new() {
             Some(m) => m,
             None => return,
@@ -392,7 +402,8 @@ impl BannedAppsWindow {
                 // Set callback index
                 {
                     let ivar = cls.instance_variable(c"callbackIndex").unwrap();
-                    *ivar.load_mut::<usize>(&mut *Retained::as_ptr(&target).cast_mut()) = callback_idx;
+                    *ivar.load_mut::<usize>(&mut *Retained::as_ptr(&target).cast_mut()) =
+                        callback_idx;
                 }
 
                 // Set target and action on the switch
@@ -414,7 +425,9 @@ impl BannedAppsWindow {
                 );
                 let label = NSTextField::new(mtm);
                 label.setFrame(label_frame);
-                let text = NSString::from_str("No apps have been banned yet.\nUse the command palette (Cmd+Shift+C) to ban apps.");
+                let text = NSString::from_str(
+                    "No apps have been banned yet.\nUse the command palette (Cmd+Shift+C) to ban apps.",
+                );
                 label.setStringValue(&text);
                 label.setBezeled(false);
                 label.setDrawsBackground(false);

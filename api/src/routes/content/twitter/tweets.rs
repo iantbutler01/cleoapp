@@ -144,7 +144,7 @@ async fn post_tweet(
             .map_err(|e| format!("Failed to mark posted: {}", e))?;
 
         Ok::<(String, String), String>((twitter_response.id, twitter_response.text))
-    })
+    })()
     .await;
 
     match publish_result {
@@ -329,7 +329,7 @@ async fn do_publish_with_progress(
             .map_err(|e| format!("Failed to mark posted: {}", e))?;
 
         Ok::<(String, String), String>((twitter_response.id, twitter_response.text))
-    })
+    })()
     .await;
 
     match publish_result {

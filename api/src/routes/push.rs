@@ -1,8 +1,8 @@
 use axum::{
-    extract::{HeaderMap, Json, State},
-    http::{StatusCode, header},
+    extract::{Json, State},
+    http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{get, post},
     Router,
 };
 use serde::Deserialize;

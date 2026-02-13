@@ -34,6 +34,8 @@ impl std::error::Error for ApiError {}
 pub struct BatchUploadResult {
     pub uploaded: usize,
     pub failed: usize,
+    #[serde(default)]
+    pub successful_indices: Vec<usize>,
 }
 
 /// Recording limits fetched from the API.
@@ -54,7 +56,8 @@ pub struct RecordingLimits {
 impl RecordingLimits {
     /// Returns remaining storage in bytes
     pub fn storage_remaining(&self) -> u64 {
-        self.storage_limit_bytes.saturating_sub(self.storage_used_bytes)
+        self.storage_limit_bytes
+            .saturating_sub(self.storage_used_bytes)
     }
 
     /// Returns true if storage limit has been exceeded
@@ -90,20 +93,39 @@ impl ApiClient {
     }
 
     /// Uploads a batch of images to the `/captures/batch` endpoint.
-    pub fn upload_images(&self, captures: Vec<(Vec<u8>, ImageFormat)>) -> Result<BatchUploadResult, ApiError> {
-        let parts: Vec<_> = captures.into_iter().map(|(b, f)| (b, f.mime_type())).collect();
+    pub fn upload_images(
+        &self,
+        captures: Vec<(Vec<u8>, ImageFormat)>,
+    ) -> Result<BatchUploadResult, ApiError> {
+        let parts: Vec<_> = captures
+            .into_iter()
+            .map(|(b, f)| (b, f.mime_type()))
+            .collect();
         self.upload_batch(parts)
     }
 
     /// Uploads a batch of videos to the `/captures/batch` endpoint.
-    pub fn upload_videos(&self, captures: Vec<(Vec<u8>, VideoFormat)>) -> Result<BatchUploadResult, ApiError> {
-        let parts: Vec<_> = captures.into_iter().map(|(b, f)| (b, f.mime_type())).collect();
+    pub fn upload_videos(
+        &self,
+        captures: Vec<(Vec<u8>, VideoFormat)>,
+    ) -> Result<BatchUploadResult, ApiError> {
+        let parts: Vec<_> = captures
+            .into_iter()
+            .map(|(b, f)| (b, f.mime_type()))
+            .collect();
         self.upload_batch(parts)
     }
 
-    fn upload_batch(&self, captures: Vec<(Vec<u8>, &'static str)>) -> Result<BatchUploadResult, ApiError> {
+    fn upload_batch(
+        &self,
+        captures: Vec<(Vec<u8>, &'static str)>,
+    ) -> Result<BatchUploadResult, ApiError> {
         if captures.is_empty() {
-            return Ok(BatchUploadResult { uploaded: 0, failed: 0 });
+            return Ok(BatchUploadResult {
+                uploaded: 0,
+                failed: 0,
+                successful_indices: vec![],
+            });
         }
 
         let url = format!("{}/captures/batch", self.base_url);
@@ -126,7 +148,11 @@ impl ApiClient {
         let response = self.authorized(request).send()?;
 
         if response.status().is_success() {
-            let result: BatchUploadResult = response.json().unwrap_or(BatchUploadResult { uploaded: 0, failed: 0 });
+            let result: BatchUploadResult = response.json().unwrap_or(BatchUploadResult {
+                uploaded: 0,
+                failed: 0,
+                successful_indices: vec![],
+            });
             Ok(result)
         } else {
             let status = response.status();

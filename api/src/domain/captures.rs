@@ -73,6 +73,32 @@ where
     .await
 }
 
+/// Check whether a media path (capture or thumbnail) belongs to the user
+pub async fn user_owns_media_path<'e, E>(
+    executor: E,
+    user_id: i64,
+    media_path: &str,
+) -> Result<bool, sqlx::Error>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let row: Option<(i64,)> = sqlx::query_as(
+        r#"
+        SELECT 1
+        FROM captures
+        WHERE user_id = $1
+          AND (gcs_path = $2 OR thumbnail_path = $2)
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(media_path)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(row.is_some())
+}
+
 /// Capture row with total count from window function
 #[derive(Debug, sqlx::FromRow)]
 pub struct CaptureRowWithTotal {

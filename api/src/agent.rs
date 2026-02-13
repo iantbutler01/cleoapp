@@ -321,6 +321,7 @@ async fn clear_stale_running_runs(db: &PgPool, user_id: i64) -> Result<(), sqlx:
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn record_run(
     db: &PgPool,
     user_id: i64,
