@@ -14,9 +14,13 @@ Rust API server using Axum, TimescaleDB, and Twitter OAuth 2.0.
 export DATABASE_URL=postgres://cleo:cleo@localhost/cleo
 export TWITTER_CLIENT_ID=your_client_id
 export TWITTER_CLIENT_SECRET=your_client_secret
-export TWITTER_REDIRECT_URI=http://localhost:5173/auth/twitter/callback
+export APP_ORIGIN=http://localhost:5173
+export TWITTER_REDIRECT_URI=${APP_ORIGIN}/auth/twitter/callback
+export COOKIE_SAMESITE=Lax
 export PORT=3000  # optional, defaults to 3000
 ```
+
+For split-domain deployments (e.g. `cleo.kinglycrow.com` ↔ `cleoapi.kinglycrow.com`), set `COOKIE_SAMESITE=None`.
 
 ## Database Setup
 

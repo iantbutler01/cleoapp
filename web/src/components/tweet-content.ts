@@ -49,6 +49,10 @@ export class TweetContent extends LitElement {
   @state() editorMediaType: 'image' | 'video' = 'image';
   @state() selectedMediaIndex = 0;
   @state() mediaChoices: MediaChoice[] = [];
+  @state() private editing = false;
+  @state() private editText = '';
+  @state() private saving = false;
+  @state() private regenerating = false;
   private lastTweetId: number | null = null;
   private lastMediaKey: string | null = null;
 
@@ -368,6 +372,62 @@ export class TweetContent extends LitElement {
     }));
   }
 
+  private startEditing() {
+    if (!this.tweet) return;
+    this.editText = this.tweet.text;
+    this.editing = true;
+  }
+
+  private cancelEditing() {
+    this.editing = false;
+    this.editText = '';
+  }
+
+  private async saveText() {
+    if (!this.tweet || !this.editText.trim()) return;
+
+    this.saving = true;
+    try {
+      await api.updateTweetCollateral(this.tweet.id, { text: this.editText.trim() });
+      this.tweet = { ...this.tweet, text: this.editText.trim() };
+      this.editing = false;
+      this.editText = '';
+      this.dispatchEvent(new CustomEvent('text-updated', {
+        detail: { text: this.tweet.text },
+        bubbles: true,
+        composed: true,
+      }));
+    } catch (e) {
+      console.error('Failed to save text:', e);
+    } finally {
+      this.saving = false;
+    }
+  }
+
+  private handleTextInput(e: InputEvent) {
+    const textarea = e.target as HTMLTextAreaElement;
+    this.editText = textarea.value;
+  }
+
+  private async regenerateTweet() {
+    if (!this.tweet || this.regenerating) return;
+
+    this.regenerating = true;
+    try {
+      const result = await api.regenerateTweet(this.tweet.id);
+      this.tweet = { ...this.tweet, text: result.text };
+      this.dispatchEvent(new CustomEvent('text-updated', {
+        detail: { text: result.text },
+        bubbles: true,
+        composed: true,
+      }));
+    } catch (e) {
+      console.error('Failed to regenerate tweet:', e);
+    } finally {
+      this.regenerating = false;
+    }
+  }
+
   renderMedia() {
     // Wrapper ensures consistent min-height to prevent layout shift
     const wrapperClass = 'mt-2 min-h-96 rounded-lg overflow-hidden bg-base-200 relative w-full';
@@ -577,9 +637,72 @@ export class TweetContent extends LitElement {
 
     const textSize = this.compact ? 'text-sm' : 'text-base';
 
+    const charCount = this.editing ? this.editText.length : this.tweet.text.length;
+    const isOverLimit = charCount > 280;
+
     return html`
-      <!-- Tweet text - fixed 4-line height for consistent cards -->
-      <p class="${textSize} leading-relaxed whitespace-pre-wrap h-26 overflow-hidden">${this.tweet.text}</p>
+      <!-- Tweet text with edit/refresh controls -->
+      <div class="relative group">
+        ${this.editing ? html`
+          <!-- Edit mode -->
+          <div class="space-y-2">
+            <textarea
+              class="textarea textarea-bordered w-full ${textSize} leading-relaxed resize-none ${isOverLimit ? 'textarea-error' : ''}"
+              rows="4"
+              .value=${this.editText}
+              @input=${this.handleTextInput}
+              ?disabled=${this.saving}
+              placeholder="Tweet text..."
+            ></textarea>
+            <div class="flex items-center justify-between">
+              <span class="text-xs ${isOverLimit ? 'text-error' : 'text-base-content/50'}">
+                ${charCount}/280
+              </span>
+              <div class="flex gap-2">
+                <button
+                  class="btn btn-sm btn-ghost"
+                  @click=${this.cancelEditing}
+                  ?disabled=${this.saving}
+                >Cancel</button>
+                <button
+                  class="btn btn-sm btn-primary"
+                  @click=${this.saveText}
+                  ?disabled=${this.saving || isOverLimit || !this.editText.trim()}
+                >
+                  ${this.saving ? html`<span class="loading loading-spinner loading-xs"></span>` : 'Save'}
+                </button>
+              </div>
+            </div>
+          </div>
+        ` : html`
+          <!-- Display mode -->
+          <p class="${textSize} leading-relaxed whitespace-pre-wrap h-26 overflow-hidden">${this.tweet.text}</p>
+          <!-- Edit/Refresh buttons - show on hover -->
+          <div class="absolute top-0 right-0 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1">
+            <button
+              class="btn btn-xs btn-ghost btn-circle"
+              @click=${this.regenerateTweet}
+              ?disabled=${this.regenerating}
+              title="Regenerate tweet"
+            >
+              ${this.regenerating
+                ? html`<span class="loading loading-spinner loading-xs"></span>`
+                : html`<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>`}
+            </button>
+            <button
+              class="btn btn-xs btn-ghost btn-circle"
+              @click=${this.startEditing}
+              title="Edit tweet"
+            >
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+              </svg>
+            </button>
+          </div>
+        `}
+      </div>
 
       ${this.mediaChoices.length > 1 ? html`
         <div class="flex items-center gap-1 mt-2">

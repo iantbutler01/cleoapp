@@ -26,16 +26,37 @@ export class DashboardPage extends LitElement {
   @state() currentIndex = 0;
   @state() viewMode: "queue" | "sent" = "queue";
   @state() showNudgesModal = false;
+  @state() notificationPermission: NotificationPermission | "unsupported" = "unsupported";
+
+  private readonly pollIntervalMs = 45_000;
+  private pollTimer: number | null = null;
+  private pushSubscriptionInitialized = false;
+  private pushSetupInProgress = false;
+  private queueItemKeys = new Set<string>();
+  private queueInitialized = false;
 
   async connectedCallback() {
     super.connectedCallback();
     document.addEventListener("keydown", this.handleGlobalKeydown);
+    document.addEventListener("visibilitychange", this.handleVisibilityChange);
+    this.updateNotificationPermission();
+    this.startPolling();
+    const urlParams = new URLSearchParams(window.location.search);
+    const requestedView = urlParams.get("view");
+    if (requestedView === "queue" || requestedView === "sent") {
+      this.viewMode = requestedView;
+    }
     await this.loadData();
+    if (this.notificationPermission === "granted") {
+      void this.setupPushNotifications();
+    }
   }
 
   disconnectedCallback() {
     super.disconnectedCallback();
     document.removeEventListener("keydown", this.handleGlobalKeydown);
+    document.removeEventListener("visibilitychange", this.handleVisibilityChange);
+    this.stopPolling();
   }
 
   private handleGlobalKeydown = (e: KeyboardEvent) => {
@@ -46,8 +67,248 @@ export class DashboardPage extends LitElement {
     }
   };
 
+  private handleVisibilityChange = () => {
+    if (document.visibilityState === "visible" && this.viewMode === "queue") {
+      this.loadData();
+    }
+  };
+
+  private updateNotificationPermission() {
+    if (!("Notification" in window)) {
+      this.notificationPermission = "unsupported";
+      return;
+    }
+    this.notificationPermission = Notification.permission;
+  }
+
+  private startPolling() {
+    this.stopPolling();
+    this.pollTimer = window.setInterval(() => {
+      if (document.visibilityState === "hidden" && this.viewMode === "queue") {
+        this.loadData();
+      }
+    }, this.pollIntervalMs);
+  }
+
+  private stopPolling() {
+    if (this.pollTimer !== null) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+  }
+
+  private getItemKey(item: ContentItem): string {
+    return `${item.type}-${item.id}`;
+  }
+
+  private async processQueueNotifications(items: ContentItem[]) {
+    if (this.viewMode !== "queue" || this.notificationPermission !== "granted" || !document.hidden) {
+      this.queueItemKeys = new Set(items.map((item) => this.getItemKey(item)));
+      this.queueInitialized = true;
+      return;
+    }
+
+    const nextKeys = new Set(items.map((item) => this.getItemKey(item)));
+    const newItems = items.filter((item) => !this.queueItemKeys.has(this.getItemKey(item)));
+
+    if (!this.queueInitialized) {
+      this.queueItemKeys = nextKeys;
+      this.queueInitialized = true;
+      return;
+    }
+
+    if (newItems.length > 0) {
+      const maxNotifications = 3;
+      for (const item of newItems.slice(0, maxNotifications)) {
+        await this.showContentNotification(item);
+      }
+
+      const remaining = newItems.length - maxNotifications;
+      if (remaining > 0) {
+        await this.showSummaryNotification(remaining);
+      }
+    }
+
+    this.queueItemKeys = nextKeys;
+  }
+
+  private async requestNotificationPermission() {
+    if (!("Notification" in window)) {
+      this.notificationPermission = "unsupported";
+      return;
+    }
+
+    const permission = await Notification.requestPermission();
+    this.notificationPermission = permission;
+    if (permission === "granted") {
+      await this.setupPushNotifications();
+    }
+  }
+
+  private async setupPushNotifications() {
+    if (this.pushSetupInProgress) {
+      return;
+    }
+
+    if (!("serviceWorker" in navigator) || !("PushManager" in window) || this.notificationPermission !== "granted") {
+      return;
+    }
+
+    const maybeServiceWorker = await navigator.serviceWorker.ready;
+    this.pushSetupInProgress = true;
+
+    try {
+      const existing = await maybeServiceWorker.pushManager.getSubscription();
+      const payload = await api.getVapidPublicKey();
+      const appKey = this.urlBase64ToUint8Array(payload);
+
+      const subscription = (existing && this.applicationServerKeyMatches(existing, appKey))
+        ? existing
+        : await this.recreateSubscription(maybeServiceWorker, existing, appKey);
+
+      if (!subscription) {
+        throw new Error("Failed to create push subscription");
+      }
+
+      const json = subscription.toJSON() as {
+        endpoint?: string;
+        keys?: { p256dh?: string; auth?: string };
+      };
+
+      if (!json.endpoint || !json.keys?.p256dh || !json.keys?.auth) {
+        throw new Error("Missing endpoint or keys from push subscription");
+      }
+
+      await api.savePushSubscription({
+        endpoint: json.endpoint,
+        keys: {
+          p256dh: json.keys.p256dh,
+          auth: json.keys.auth,
+        },
+      });
+
+      this.pushSubscriptionInitialized = true;
+    } catch (error) {
+      console.error("Failed to configure push notifications:", error);
+      this.pushSubscriptionInitialized = false;
+    } finally {
+      this.pushSetupInProgress = false;
+    }
+  }
+
+  private async recreateSubscription(
+    serviceWorker: ServiceWorkerRegistration,
+    existing: PushSubscription | null,
+    applicationServerKey: Uint8Array,
+  ): Promise<PushSubscription | null> {
+    try {
+      if (existing) {
+        await existing.unsubscribe();
+      }
+
+      return await serviceWorker.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  private applicationServerKeyMatches(existing: PushSubscription, appKey: Uint8Array): boolean {
+    const existingAppKey = existing.options.applicationServerKey;
+    if (!existingAppKey) {
+      return false;
+    }
+
+    const existingKeyBytes = existingAppKey instanceof ArrayBuffer
+      ? new Uint8Array(existingAppKey)
+      : typeof existingAppKey === "string"
+        ? this.urlBase64ToUint8Array(existingAppKey)
+        : existingAppKey instanceof Uint8Array
+          ? existingAppKey
+          : new Uint8Array(existingAppKey as ArrayBufferLike);
+
+    if (existingKeyBytes.length !== appKey.length) {
+      return false;
+    }
+
+    return existingKeyBytes.every((value, index) => value === appKey[index]);
+  }
+
+  private urlBase64ToUint8Array(value: string): Uint8Array {
+    const padding = "=".repeat((4 - (value.length % 4)) % 4);
+    const base64 = (value + padding).replace(/-/g, "+").replace(/_/g, "/");
+    const rawData = atob(base64);
+    const outputArray = new Uint8Array(rawData.length);
+
+    for (let i = 0; i < rawData.length; i++) {
+      outputArray[i] = rawData.charCodeAt(i);
+    }
+
+    return outputArray;
+  }
+
+  private async showSummaryNotification(remaining: number) {
+    if (remaining <= 0) return;
+    await this.dispatchNotification(
+      "More content ready",
+      `${remaining} additional items are ready to review in Cleo.`,
+    );
+  }
+
+  private async showContentNotification(item: ContentItem) {
+    if (item.type === "tweet") {
+      await this.dispatchNotification("New tweet ready", item.text, item.id, item.type);
+      return;
+    }
+
+    const threadTitle = item.thread.title ?? `Thread (${item.tweets.length} tweets)`;
+    await this.dispatchNotification("New thread ready", threadTitle, item.thread.id, item.type);
+  }
+
+  private async dispatchNotification(title: string, body: string, id?: number, type?: string) {
+    const tag = id !== undefined && type ? `cleo-${type}-${id}` : "cleo-content";
+    const options: NotificationOptions = {
+      body,
+      icon: "/icon-192.png",
+      badge: "/icon-192.png",
+      tag,
+      data: {
+        url: "/?view=queue",
+        type,
+        id,
+      },
+      timestamp: Date.now(),
+      renotify: true,
+      requireInteraction: false,
+      vibrate: [80, 40, 80],
+    };
+
+    if (!("Notification" in window) || Notification.permission !== "granted") {
+      return;
+    }
+
+    try {
+      const registration = await navigator.serviceWorker.getRegistration();
+      if (registration) {
+        await registration.showNotification(title, options);
+        return;
+      }
+    } catch {
+      // Intentionally ignore and fall back to window notification.
+    }
+
+    try {
+      new Notification(title, options);
+    } catch (error) {
+      console.error("Failed to show notification:", error);
+    }
+  }
+
   async loadData() {
     // Use refreshing state if we already have content (keeps UI stable)
+    this.updateNotificationPermission();
     const isRefresh = this.content.length > 0;
     if (isRefresh) {
       this.refreshing = true;
@@ -69,6 +330,9 @@ export class DashboardPage extends LitElement {
         }),
       ]);
       this.user = user;
+      if (this.viewMode === "queue") {
+        await this.processQueueNotifications(contentResponse.items);
+      }
       this.content = contentResponse.items;
       this.currentIndex = 0;
     } catch (e) {
@@ -109,6 +373,9 @@ export class DashboardPage extends LitElement {
   private setViewMode(mode: "queue" | "sent") {
     if (this.viewMode === mode) return;
     this.viewMode = mode;
+    if (mode === "queue") {
+      this.queueInitialized = false;
+    }
     this.loadData();
   }
 
@@ -217,11 +484,25 @@ export class DashboardPage extends LitElement {
     return html`
       <div class="min-h-screen bg-base-200/30">
         <!-- Navbar -->
-        <div class="navbar bg-base-100 border-b border-base-200 px-6">
-          <div class="flex-1">
-            <span class="text-lg font-semibold tracking-tight">Cleo</span>
+        <div class="navbar bg-base-100 border-b border-base-200 px-4 sm:px-6">
+          <div class="flex-1 min-w-0">
+            <span class="text-lg sm:text-xl font-semibold tracking-tight truncate"
+              >Cleo</span
+            >
           </div>
           <div class="flex-none gap-2">
+            <button
+              class="btn btn-ghost btn-sm lg:hidden"
+              @click=${() => (this.showNudgesModal = true)}
+            >
+              Nudges
+            </button>
+            <button
+              class="btn btn-ghost btn-sm lg:hidden"
+              @click=${() => this.requestNotificationPermission()}
+            >
+              Notify
+            </button>
             <div class="dropdown dropdown-end">
               <div
                 tabindex="0"
@@ -255,6 +536,29 @@ export class DashboardPage extends LitElement {
                 tabindex="0"
                 class="menu menu-sm dropdown-content bg-base-100 rounded-lg z-10 mt-2 w-48 p-1 shadow-lg border border-base-200"
               >
+                <li>
+                  <a
+                    @click=${() => (this.showNudgesModal = true)}
+                    class="rounded-md"
+                    >Voice & Style</a
+                  >
+                </li>
+                <li>
+                  <a
+                    @click=${() => this.requestNotificationPermission()}
+                    class="rounded-md ${this.notificationPermission === "granted"
+                      ? "text-success"
+                      : this.notificationPermission === "unsupported"
+                        ? "pointer-events-none opacity-50"
+                        : ""}"
+                  >
+                    ${this.notificationPermission === "granted"
+                      ? "Notifications enabled"
+                      : this.notificationPermission === "denied"
+                        ? "Notifications blocked"
+                        : "Enable notifications"}
+                  </a>
+                </li>
                 <li>
                   <a @click=${this.openTokenModal} class="rounded-md"
                     >API Token</a
@@ -308,9 +612,9 @@ export class DashboardPage extends LitElement {
           : ""}
 
         <!-- Stack-Based Layout (Grid + Scroll Container) -->
-        <div class="flex h-[calc(100vh-65px)]">
+        <div class="flex flex-col lg:flex-row h-auto lg:h-[calc(100vh-65px)]">
           <!-- Left Sidebar - Toolbar -->
-          <div class="shrink-0 flex items-start pt-20 pl-4">
+          <div class="hidden lg:flex shrink-0 items-start pt-20 pl-4">
             <sidebar-toolbar
               @open-nudges=${() => (this.showNudgesModal = true)}
             ></sidebar-toolbar>
@@ -318,7 +622,7 @@ export class DashboardPage extends LitElement {
 
           <!-- Center - Single Item View -->
           <div
-            class="flex-1 flex flex-col items-center justify-center p-8 relative"
+            class="flex-1 flex flex-col items-center justify-start min-h-[calc(100vh-65px)] p-4 sm:p-6 lg:p-8 relative"
           >
             ${this.loading || this.refreshing
               ? html`
@@ -330,7 +634,7 @@ export class DashboardPage extends LitElement {
                 `
               : ""}
 
-            <div class="flex gap-2 mb-6 mt-6">
+            <div class="w-full max-w-2xl flex flex-wrap gap-2 mb-6 mt-6">
               <button
                 class="btn btn-sm ${this.viewMode === "queue"
                   ? "btn-primary"
@@ -390,7 +694,7 @@ export class DashboardPage extends LitElement {
 
           <!-- Right Sidebar - Context Panel -->
           <div
-            class="w-64 shrink-0 border-l border-base-300/30 bg-base-100/50 p-4 overflow-y-auto"
+            class="hidden lg:block w-64 shrink-0 border-l border-base-300/30 bg-base-100/50 p-4 overflow-y-auto"
           >
             <!-- Stats -->
             <div class="mb-6">

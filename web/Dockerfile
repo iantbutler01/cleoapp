@@ -29,7 +29,10 @@ RUN npm ci
 # Copy built assets and vite config
 COPY --from=builder /app/dist ./dist
 COPY vite.config.ts ./
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
 
 EXPOSE 4173
 
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["npm", "run", "preview", "--", "--host", "0.0.0.0"]

@@ -128,13 +128,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Public web origin used for callback URLs and CORS assumptions
+    let app_origin = std::env::var("APP_ORIGIN")
+        .unwrap_or_else(|_| "http://localhost:5173".to_string())
+        .trim_end_matches('/')
+        .to_string();
+
     // Twitter OAuth 2.0 client
     let twitter_client_id =
         std::env::var("TWITTER_CLIENT_ID").expect("TWITTER_CLIENT_ID must be set");
     let twitter_client_secret =
         std::env::var("TWITTER_CLIENT_SECRET").expect("TWITTER_CLIENT_SECRET must be set");
     let twitter_redirect_uri = std::env::var("TWITTER_REDIRECT_URI")
-        .unwrap_or_else(|_| "http://localhost:3000/auth/twitter/callback".to_string());
+        .unwrap_or_else(|_| {
+            let callback_path = std::env::var("TWITTER_CALLBACK_PATH")
+                .unwrap_or_else(|_| "/auth/twitter/callback".to_string());
+            let callback_path = if callback_path.is_empty() {
+                "/auth/twitter/callback".to_string()
+            } else if callback_path.starts_with('/') {
+                callback_path
+            } else {
+                format!("/{}", callback_path)
+            };
+            format!("{}{}", app_origin, callback_path)
+        });
     let twitter = TwitterClient::new(
         &twitter_client_id,
         &twitter_client_secret,
@@ -192,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // CORS configuration - allow web frontend origin
-    let cors_origin = std::env::var("CORS_ORIGIN").unwrap_or_else(|_| "http://localhost:5173".to_string());
+    let cors_origin = std::env::var("CORS_ORIGIN").unwrap_or_else(|_| app_origin.clone());
     let cors = CorsLayer::new()
         .allow_origin(cors_origin.parse::<HeaderValue>().unwrap_or_else(|_| HeaderValue::from_static("http://localhost:5173")))
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])

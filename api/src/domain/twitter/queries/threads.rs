@@ -29,7 +29,7 @@ impl ThreadStatusFilter {
     /// Returns SQL WHERE clause fragment for filtering by thread status
     fn where_clause(&self) -> &'static str {
         match self {
-            ThreadStatusFilter::Pending => "AND status IN ('draft', 'partial_failed')",
+            ThreadStatusFilter::Pending => "AND status IN ('draft', 'posting', 'partial_failed')",
             ThreadStatusFilter::Posted => "AND status = 'posted'",
             ThreadStatusFilter::All => "",
         }
@@ -166,6 +166,7 @@ where
                video_clip, image_capture_ids,
                COALESCE(media_options, '[]'::jsonb) as media_options,
                rationale, created_at,
+               publish_status, publish_attempts, publish_error, publish_error_at,
                thread_position, reply_to_tweet_id, posted_at, tweet_id
         FROM tweet_collateral
         WHERE thread_id = $1 AND user_id = $2
@@ -191,6 +192,10 @@ struct ThreadTweetWithThreadId {
     media_options: Json<Vec<serde_json::Value>>,
     rationale: String,
     created_at: DateTime<Utc>,
+    publish_status: String,
+    publish_attempts: i32,
+    publish_error: Option<String>,
+    publish_error_at: Option<DateTime<Utc>>,
     thread_position: Option<i32>,
     reply_to_tweet_id: Option<String>,
     posted_at: Option<DateTime<Utc>>,
@@ -305,7 +310,9 @@ where
     sqlx::query(
         r#"
         UPDATE tweet_threads
-        SET status = $1, posted_at = NOW(), first_tweet_id = $2
+        SET status = $1,
+            posted_at = NOW(),
+            first_tweet_id = COALESCE($2, first_tweet_id)
         WHERE id = $3 AND user_id = $4
         "#,
     )
@@ -323,16 +330,21 @@ pub async fn set_thread_posting<'e, E>(
     executor: E,
     thread_id: i64,
     user_id: i64,
-) -> Result<(), sqlx::Error>
+) -> Result<bool, sqlx::Error>
 where
     E: Executor<'e, Database = Postgres>,
 {
-    sqlx::query("UPDATE tweet_threads SET status = 'posting' WHERE id = $1 AND user_id = $2")
-        .bind(thread_id)
-        .bind(user_id)
-        .execute(executor)
-        .await?;
-    Ok(())
+    let result = sqlx::query(
+        "UPDATE tweet_threads
+         SET status = 'posting'
+         WHERE id = $1 AND user_id = $2 AND status IN ('draft', 'partial_failed')"
+    )
+    .bind(thread_id)
+    .bind(user_id)
+    .execute(executor)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 /// Check if thread exists and belongs to user
@@ -454,7 +466,12 @@ where
     let result = sqlx::query(
         r#"
         UPDATE tweet_collateral
-        SET posted_at = NOW(), tweet_id = $1, reply_to_tweet_id = $2
+        SET posted_at = NOW(),
+            tweet_id = $1,
+            reply_to_tweet_id = $2,
+            publish_status = 'posted',
+            publish_error = NULL,
+            publish_error_at = NULL
         WHERE id = $3 AND user_id = $4
         "#,
     )
@@ -462,6 +479,61 @@ where
     .bind(reply_to)
     .bind(collateral_id)
     .bind(user_id)
+    .execute(executor)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Set a thread tweet publish status to posting
+pub async fn set_thread_tweet_posting<'e, E>(
+    executor: E,
+    tweet_id: i64,
+    user_id: i64,
+) -> Result<bool, sqlx::Error>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let result = sqlx::query(
+        r#"
+        UPDATE tweet_collateral
+        SET publish_status = 'posting',
+            publish_attempts = COALESCE(publish_attempts, 0) + 1,
+            publish_error = NULL,
+            publish_error_at = NULL
+        WHERE id = $1 AND user_id = $2 AND posted_at IS NULL AND publish_status IN ('pending', 'failed')
+        "#,
+    )
+    .bind(tweet_id)
+    .bind(user_id)
+    .execute(executor)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Mark a thread tweet publish attempt as failed
+pub async fn mark_thread_tweet_publish_failed<'e, E>(
+    executor: E,
+    collateral_id: i64,
+    user_id: i64,
+    error: &str,
+) -> Result<bool, sqlx::Error>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let result = sqlx::query(
+        r#"
+        UPDATE tweet_collateral
+        SET publish_status = 'failed',
+            publish_error = $3,
+            publish_error_at = NOW()
+        WHERE id = $1 AND user_id = $2 AND posted_at IS NULL
+        "#,
+    )
+    .bind(collateral_id)
+    .bind(user_id)
+    .bind(error)
     .execute(executor)
     .await?;
 
@@ -488,6 +560,35 @@ where
     .await?;
 
     Ok(count == tweet_ids.len() as i64)
+}
+
+/// Get latest posted tweet id for a thread, for continuing partial thread retries
+pub async fn get_last_posted_tweet_id<'e, E>(
+    executor: E,
+    thread_id: i64,
+    user_id: i64,
+) -> Result<Option<String>, sqlx::Error>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let result: Option<(Option<String>,)> = sqlx::query_as(
+        r#"
+        SELECT tweet_id
+        FROM tweet_collateral
+        WHERE thread_id = $1
+            AND user_id = $2
+            AND posted_at IS NOT NULL
+            AND tweet_id IS NOT NULL
+        ORDER BY thread_position DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(thread_id)
+    .bind(user_id)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(result.and_then(|(tweet_id,)| tweet_id))
 }
 
 /// Reorder tweets in a thread (batch update)

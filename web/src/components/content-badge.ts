@@ -13,7 +13,7 @@ export class ContentBadge extends LitElement {
     `
   ];
 
-  @property({ type: String }) variant: 'muted' | 'accent' | 'status-success' | 'status-warning' = 'muted';
+  @property({ type: String }) variant: 'muted' | 'accent' | 'status-success' | 'status-warning' | 'status-error' = 'muted';
 
   render() {
     const base = 'text-xs px-2 py-0.5 rounded-full font-medium';
@@ -23,6 +23,7 @@ export class ContentBadge extends LitElement {
       accent: 'bg-primary/20 text-primary',
       'status-success': 'bg-success/20 text-success',
       'status-warning': 'bg-warning/20 text-warning',
+      'status-error': 'bg-error/20 text-error',
     };
 
     return html`

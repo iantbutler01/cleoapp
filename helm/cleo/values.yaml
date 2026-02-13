@@ -5,6 +5,24 @@ image:
   registry: ""  # e.g., ghcr.io/username
   pullPolicy: IfNotPresent
 
+# Public web origin / app domain
+# Used for:
+# - TWITTER_REDIRECT_URI default
+# - CORS origin defaults
+app:
+  # Frontend origin (scheme + host + optional port, no trailing slash)
+  webOrigin: "http://localhost:5173"
+  # Callback path registered in Twitter OAuth app
+  # (SPA route can be any path; root callback is also supported)
+  twitterCallbackPath: "/auth/twitter/callback"
+  # Optional explicit CORS origin override (defaults to webOrigin)
+  corsOrigin: ""
+  # Optional explicit OAuth redirect URI override (defaults to <webOrigin><twitterCallbackPath>)
+  twitterRedirectUri: ""
+  # Cookie SameSite mode for auth cookies.
+  # Use "None" when web and API are different origins.
+  cookieSameSite: "Lax"
+
 # API configuration
 api:
   image:
@@ -32,6 +50,9 @@ web:
     repository: cleo-web
     tag: latest
   replicas: 1
+  # Base URL the web frontend should call for API traffic
+  # Can be same-origin (`/api`) or a full origin (`https://api.example.com`)
+  apiBaseUrl: "/api"
   resources:
     requests:
       memory: "128Mi"
@@ -45,6 +66,8 @@ ingress:
   enabled: true
   className: ""  # e.g., nginx, traefik
   annotations: {}
+  # Deprecated but kept for backwards compatibility:
+  # when either ingress.api.hosts or ingress.web.hosts is configured, this field is ignored.
   hosts:
     - host: cleo.example.com
       paths:
@@ -57,9 +80,26 @@ ingress:
         - path: /auth
           pathType: Prefix
           service: api
+        - path: /auth/twitter/callback
+          pathType: Prefix
+          service: web
         - path: /
           pathType: Prefix
           service: web
+  # New split-domain mode (takes precedence over ingress.hosts when host lists are set)
+  # Use this when web and api are served from different hosts.
+  api:
+    hosts: []
+    paths:
+      - /api
+      - /media
+      - /auth
+  web:
+    hosts: []
+    # Web hosts serve the SPA at / plus OAuth callback path.
+    # The callback path is merged from app.twitterCallbackPath automatically.
+    paths:
+      - /
   tls: []
   #  - secretName: cleo-tls
   #    hosts:

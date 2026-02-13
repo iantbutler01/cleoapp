@@ -13,8 +13,21 @@ export class CleoApp extends LitElement {
   @state() loading = true;
   @state() authError: string | null = null;
 
+  private async registerServiceWorker() {
+    if (!("serviceWorker" in navigator)) {
+      return;
+    }
+
+    try {
+      await navigator.serviceWorker.register("/sw.js");
+    } catch (error) {
+      console.error("Failed to register service worker:", error);
+    }
+  }
+
   async connectedCallback() {
     super.connectedCallback();
+    this.registerServiceWorker();
 
     // Set up callback for when session expires
     api.setUnauthorizedCallback(() => {

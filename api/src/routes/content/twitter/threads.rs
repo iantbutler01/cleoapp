@@ -366,7 +366,7 @@ async fn post_thread(
         .log_500("Get thread status error")?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    if status != ThreadStatus::Draft {
+    if status != ThreadStatus::Draft && status != ThreadStatus::PartialFailed {
         return Err(StatusCode::CONFLICT);
     }
 
@@ -381,33 +381,69 @@ async fn post_thread(
     // Record intent in transaction
     let mut tx = state.db.begin().await.log_500("Begin transaction error")?;
 
-    threads::set_thread_posting(&mut *tx, thread_id, user_id)
+    let started = threads::set_thread_posting(&mut *tx, thread_id, user_id)
         .await
         .log_500("Set thread posting error")?;
+    if !started {
+        return Err(StatusCode::CONFLICT);
+    }
 
     let tweet_list = threads::get_tweets_for_posting(&mut *tx, thread_id, user_id)
         .await
         .log_500("Get tweets for posting error")?;
 
+    let mut previous_tweet_id = if status == ThreadStatus::PartialFailed {
+        threads::get_last_posted_tweet_id(&mut *tx, thread_id, user_id)
+            .await
+            .log_500("Get last posted tweet error")?
+    } else {
+        None
+    };
+
     if tweet_list.is_empty() {
+        if status == ThreadStatus::PartialFailed {
+            if previous_tweet_id.is_none() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+
+            threads::update_thread_status(&mut *tx, thread_id, user_id, "posted", previous_tweet_id.as_deref())
+                .await
+                .log_500("Finalize partial thread status error")?;
+            tx.commit().await.log_500("Commit intent transaction error")?;
+            return Ok(Json(PostThreadResponse {
+                status: "posted".to_string(),
+                tweets: vec![],
+            }));
+        }
+
         return Err(StatusCode::BAD_REQUEST);
     }
 
     tx.commit().await.log_500("Commit intent transaction error")?;
 
     // Phase 2: External API calls with compensation tracking
-    let mut results = Vec::new();
+    let mut posted_results = Vec::new();
     let mut posted_twitter_ids: Vec<String> = Vec::new();
-    let mut previous_tweet_id: Option<String> = None;
+    let mut failed_results = Vec::new();
     let mut failed = false;
 
     for tweet in tweet_list {
+        let claimed = threads::set_thread_tweet_posting(&state.db, tweet.id, user_id)
+            .await
+            .log_500("Set thread tweet posting error")?;
+        if !claimed {
+            failed = true;
+            failed_results.push((tweet.id, "Tweet is already posting or posted".to_string()));
+            break;
+        }
+
         // Upload media for this tweet
         let media_ids = match upload_tweet_media(&state, user_id, &tweet, &access_token).await {
             Ok(ids) => ids,
             Err(e) => {
                 eprintln!("Failed to upload media for tweet {}: {}", tweet.id, e);
                 failed = true;
+                failed_results.push((tweet.id, format!("Failed to upload media: {}", e)));
                 break;
             }
         };
@@ -434,12 +470,13 @@ async fn post_thread(
                 let twitter_id = twitter_response.id.clone();
                 posted_twitter_ids.push(twitter_id.clone());
 
-                results.push((tweet.id, twitter_id.clone(), previous_tweet_id.clone()));
+                posted_results.push((tweet.id, twitter_id.clone(), previous_tweet_id.clone()));
                 previous_tweet_id = Some(twitter_id);
             }
             Err(e) => {
                 eprintln!("Failed to post tweet in thread: {}", e);
                 failed = true;
+                failed_results.push((tweet.id, format!("Failed to post tweet: {}", e)));
                 break;
             }
         }
@@ -448,14 +485,20 @@ async fn post_thread(
     // Phase 3: Record results in transaction
     let mut tx = state.db.begin().await.log_500("Begin results transaction error")?;
 
-    for (collateral_id, twitter_id, reply_to) in &results {
+    for (collateral_id, twitter_id, reply_to) in &posted_results {
         threads::mark_thread_tweet_posted(&mut *tx, *collateral_id, user_id, twitter_id, reply_to.as_deref())
             .await
             .log_500("Mark thread tweet posted error")?;
     }
 
+    for (collateral_id, message) in &failed_results {
+        threads::mark_thread_tweet_publish_failed(&mut *tx, *collateral_id, user_id, message)
+            .await
+            .log_500("Mark thread tweet failed error")?;
+    }
+
     let final_status = if failed { "partial_failed" } else { "posted" };
-    let first_tweet_id = results.first().map(|(_, twitter_id, _)| twitter_id.as_str());
+    let first_tweet_id = posted_results.first().map(|(_, twitter_id, _)| twitter_id.as_str());
 
     threads::update_thread_status(&mut *tx, thread_id, user_id, final_status, first_tweet_id)
         .await
@@ -475,7 +518,7 @@ async fn post_thread(
         );
     }
 
-    let response_tweets = results
+    let response_tweets = posted_results
         .into_iter()
         .map(|(id, twitter_id, reply_to)| PostThreadTweetResult {
             id,

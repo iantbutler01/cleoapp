@@ -24,6 +24,46 @@ spec:
     {{- end }}
   {{- end }}
   rules:
+    {{- $callbackPath := trimSuffix "/" (default "/auth/twitter/callback" .Values.app.twitterCallbackPath) }}
+    {{- $apiHostsConfigured := gt (len (.Values.ingress.api.hosts | default (list)) ) 0 }}
+    {{- $webHostsConfigured := gt (len (.Values.ingress.web.hosts | default (list)) ) 0 }}
+    {{- $splitMode := or $apiHostsConfigured $webHostsConfigured }}
+    {{- if $splitMode }}
+    {{- $apiPaths := default (list "/api" "/media" "/auth") .Values.ingress.api.paths }}
+    {{- $webPaths := default (list "/") .Values.ingress.web.paths }}
+    {{- $callbackPath := ternary $callbackPath (printf "/%s" $callbackPath) (hasPrefix "/" $callbackPath) }}
+    {{- if not (has $callbackPath $webPaths) }}
+    {{- $webPaths = append $webPaths $callbackPath }}
+    {{- end }}
+    {{- range $host := .Values.ingress.api.hosts }}
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          {{- range $apiPaths }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "cleo.fullname" $ }}-api
+                port:
+                  number: 3000
+          {{- end }}
+    {{- end }}
+    {{- range $host := .Values.ingress.web.hosts }}
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          {{- range $webPaths }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "cleo.fullname" $ }}-web
+                port:
+                  number: 4173
+          {{- end }}
+    {{- end }}
+    {{- else }}
     {{- range .Values.ingress.hosts }}
     - host: {{ .host | quote }}
       http:
@@ -43,5 +83,6 @@ spec:
                   number: 4173
                 {{- end }}
           {{- end }}
+    {{- end }}
     {{- end }}
 {{- end }}

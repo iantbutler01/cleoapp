@@ -14,10 +14,14 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::AppState;
-use crate::domain::twitter::tweets;
+use crate::domain::twitter::{tweets, queries::threads as thread_queries};
 use crate::routes::auth::AuthUser;
+use crate::routes::nudges::get_sanitized_nudges;
 use crate::services::{auth, error::LogErr, session, twitter};
 use crate::constants::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
+use reson_agentic::providers::{GenerationConfig, InferenceClient};
+use reson_agentic::types::ChatMessage;
+use reson_agentic::utils::ConversationMessage;
 use super::dto::TweetResponse;
 use super::media::{upload_tweet_media, upload_tweet_media_with_progress, UploadProgress};
 
@@ -27,6 +31,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/tweets/{id}/publish", post(post_tweet))
         .route("/tweets/{id}/publish/ws", get(publish_tweet_ws))
         .route("/tweets/{id}", delete(dismiss_tweet))
+        .route("/tweets/{id}/regenerate", post(regenerate_tweet))
 }
 
 #[derive(Deserialize)]
@@ -91,6 +96,13 @@ async fn post_tweet(
         .log_500("Get tweet for posting error")?
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    let can_publish = tweets::set_tweet_posting(&state.db, tweet_collateral_id, user_id)
+        .await
+        .log_500("Set tweet posting status error")?;
+    if !can_publish {
+        return Err(StatusCode::CONFLICT);
+    }
+
     // Get user tokens
     let tokens = twitter::get_user_tokens(&state.db, user_id)
         .await
@@ -100,44 +112,54 @@ async fn post_tweet(
     // Ensure token is valid (refresh if needed)
     let access_token = auth::ensure_valid_access_token(&state.db, &state.twitter, user_id, tokens).await?;
 
-    // Upload media if present
-    println!("[post_tweet] About to upload media. video_clip={:?}, image_ids={:?}",
-        tweet.video_clip.is_some(), tweet.image_capture_ids);
+    let publish_result = (|| async {
+        // Upload media if present
+        println!(
+            "[post_tweet] About to upload media. video_clip={:?}, image_ids={:?}",
+            tweet.video_clip.is_some(),
+            tweet.image_capture_ids
+        );
 
-    let media_ids = upload_tweet_media(&state, user_id, &tweet, &access_token)
-        .await
-        .log_500("Media upload error")?;
+        let media_ids = upload_tweet_media(&state, user_id, &tweet, &access_token)
+            .await
+            .map_err(|e| e.to_string())?;
 
-    println!("[post_tweet] Media upload complete, got {} media_ids", media_ids.len());
+        println!("[post_tweet] Media upload complete, got {} media_ids", media_ids.len());
 
-    let media_ids_ref: Option<Vec<String>> = if media_ids.is_empty() {
-        None
-    } else {
-        Some(media_ids)
-    };
+        let media_ids_ref: Option<Vec<String>> = if media_ids.is_empty() {
+            None
+        } else {
+            Some(media_ids)
+        };
 
-    // Post the tweet with media
-    let twitter_response = state
-        .twitter
-        .post_tweet(&access_token, &tweet.text, None, media_ids_ref.as_deref())
-        .await
-        .log_500("Post tweet error")?;
+        // Post the tweet with media
+        let twitter_response = state
+            .twitter
+            .post_tweet(&access_token, &tweet.text, None, media_ids_ref.as_deref())
+            .await
+            .map_err(|e| format!("Failed to post tweet: {}", e))?;
 
-    // Mark as posted (atomic - prevents double-posting race condition)
-    let marked = tweets::mark_tweet_posted(&state.db, tweet_collateral_id, &twitter_response.id)
-        .await
-        .log_500("Mark tweet posted error")?;
+        tweets::mark_tweet_posted(&state.db, tweet_collateral_id, &twitter_response.id)
+            .await
+            .map_err(|e| format!("Failed to mark posted: {}", e))?;
 
-    if !marked {
-        // Tweet was already posted by another request - still return success
-        // since the tweet is now on Twitter (just posted by another concurrent request)
-        eprintln!("Tweet {} was already marked as posted (concurrent request)", tweet_collateral_id);
+        Ok::<(String, String), String>((twitter_response.id, twitter_response.text))
+    })
+    .await;
+
+    match publish_result {
+        Ok((tweet_id, text)) => Ok(Json(PostTweetResponse { tweet_id, text })),
+        Err(error) => {
+            let _ = tweets::mark_tweet_publish_failed(
+                &state.db,
+                tweet_collateral_id,
+                user_id,
+                &error,
+            )
+            .await;
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
-
-    Ok(Json(PostTweetResponse {
-        tweet_id: twitter_response.id,
-        text: twitter_response.text,
-    }))
 }
 
 /// DELETE /tweets/:id - Dismiss a pending tweet without posting
@@ -256,39 +278,178 @@ async fn do_publish_with_progress(
         .map_err(|e| format!("DB error: {}", e))?
         .ok_or("Tweet not found")?;
 
-    // Get user tokens
-    let tokens = twitter::get_user_tokens(&state.db, user_id)
+    let can_publish = tweets::set_tweet_posting(&state.db, tweet_collateral_id, user_id)
         .await
-        .map_err(|e| format!("DB error: {}", e))?
-        .ok_or("Not authenticated with Twitter")?;
+        .map_err(|e| format!("DB error: {}", e))?;
+    if !can_publish {
+        return Err("Tweet is already posting or posted".into());
+    }
 
-    // Ensure token is valid (refresh if needed)
-    let access_token = auth::ensure_valid_access_token_str(&state.db, &state.twitter, user_id, tokens).await?;
+    // Get the tweet with media info
+    let publish_result = (|| async {
+        // Get user tokens
+        let tokens = twitter::get_user_tokens(&state.db, user_id)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?
+            .ok_or("Not authenticated with Twitter")?;
 
-    // Upload media with progress
-    let media_ids = upload_tweet_media_with_progress(state, user_id, &tweet, &access_token, progress_tx.clone())
-        .await?;
+        // Ensure token is valid (refresh if needed)
+        let access_token = auth::ensure_valid_access_token_str(&state.db, &state.twitter, user_id, tokens).await?;
 
-    // Send posting status
-    let _ = progress_tx.send(WsProgress::Posting).await;
+        // Upload media with progress
+        let media_ids = upload_tweet_media_with_progress(
+            state,
+            user_id,
+            &tweet,
+            &access_token,
+            progress_tx.clone(),
+        )
+        .await
+        .map_err(|e| format!("Media upload error: {}", e))?;
 
-    let media_ids_ref: Option<Vec<String>> = if media_ids.is_empty() {
-        None
-    } else {
-        Some(media_ids)
+        // Send posting status
+        let _ = progress_tx.send(WsProgress::Posting).await;
+
+        let media_ids_ref: Option<Vec<String>> = if media_ids.is_empty() {
+            None
+        } else {
+            Some(media_ids)
+        };
+
+        // Post the tweet
+        let twitter_response = state
+            .twitter
+            .post_tweet(&access_token, &tweet.text, None, media_ids_ref.as_deref())
+            .await
+            .map_err(|e| format!("Failed to post tweet: {}", e))?;
+
+        // Mark as posted (atomic - ignores result since tweet is already on Twitter)
+        tweets::mark_tweet_posted(&state.db, tweet_collateral_id, &twitter_response.id)
+            .await
+            .map_err(|e| format!("Failed to mark posted: {}", e))?;
+
+        Ok::<(String, String), String>((twitter_response.id, twitter_response.text))
+    })
+    .await;
+
+    match publish_result {
+        Ok((tweet_id, text)) => Ok((tweet_id, text)),
+        Err(error) => {
+            let _ = tweets::mark_tweet_publish_failed(
+                &state.db,
+                tweet_collateral_id,
+                user_id,
+                &error,
+            )
+            .await;
+            Err(error)
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RegenerateTweetResponse {
+    text: String,
+}
+
+/// POST /tweets/:id/regenerate - Generate a new variation of a tweet using AI
+async fn regenerate_tweet(
+    State(state): State<Arc<AppState>>,
+    AuthUser(user_id): AuthUser,
+    Path(tweet_id): Path<i64>,
+) -> Result<Json<RegenerateTweetResponse>, StatusCode> {
+    // Check if Gemini is available
+    let gemini = state.gemini.as_ref().ok_or_else(|| {
+        eprintln!("[regenerate_tweet] Gemini client not available");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    // Get the tweet with its context
+    let tweet = tweets::get_tweet_for_posting(&state.db, tweet_id, user_id)
+        .await
+        .log_500("Get tweet error")?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Get user's style nudges for voice customization
+    let nudges = get_sanitized_nudges(&state.db, user_id).await;
+
+    // Build the prompt
+    let nudges_section = match nudges {
+        Some(n) if !n.trim().is_empty() => format!(
+            "\n\nUser's style preferences:\n{}\n",
+            n
+        ),
+        _ => String::new(),
     };
 
-    // Post the tweet
-    let twitter_response = state
-        .twitter
-        .post_tweet(&access_token, &tweet.text, None, media_ids_ref.as_deref())
-        .await
-        .map_err(|e| format!("Failed to post tweet: {}", e))?;
+    let prompt = format!(
+        r#"You are a tweet ghostwriter. Generate a fresh take on this tweet while keeping the same core message and context.
 
-    // Mark as posted (atomic - ignores result since tweet is already on Twitter)
-    let _ = tweets::mark_tweet_posted(&state.db, tweet_collateral_id, &twitter_response.id)
-        .await
-        .map_err(|e| format!("Failed to mark posted: {}", e))?;
+Original tweet:
+"{}"
 
-    Ok((twitter_response.id, twitter_response.text))
+Why this moment matters:
+{}
+{}
+Rules:
+- Keep it under 280 characters
+- No AI-sounding phrases: "excited to share", "dive into", "game-changer", "incredibly", "just"
+- No emoji spam
+- No over-explaining or hedging
+- Keep it natural and conversational
+- Maintain the same general topic/message but vary the wording
+
+Respond with ONLY the new tweet text, nothing else."#,
+        tweet.text,
+        tweet.rationale,
+        nudges_section
+    );
+
+    // Call Gemini
+    let messages = vec![ConversationMessage::Chat(ChatMessage::user(prompt))];
+    let config = GenerationConfig {
+        model: "gemini-2.5-flash".to_string(),
+        max_tokens: Some(100),
+        temperature: Some(0.9), // Higher temperature for more variation
+        top_p: None,
+        tools: None,
+        native_tools: false,
+        reasoning_effort: None,
+        thinking_budget: None,
+        output_schema: None,
+        output_type_name: None,
+    };
+
+    let response = gemini
+        .get_generation(&messages, &config)
+        .await
+        .map_err(|e| {
+            eprintln!("[regenerate_tweet] Gemini error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Extract the text from the response (content is already a String)
+    let new_text = response.content.trim().trim_matches('"').to_string();
+
+    // Validate length
+    if new_text.is_empty() || new_text.len() > 280 {
+        eprintln!("[regenerate_tweet] Invalid generated text length: {}", new_text.len());
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Update the tweet in the database
+    thread_queries::update_tweet_collateral(
+        &state.db,
+        tweet_id,
+        user_id,
+        Some(&new_text),
+        None,
+        None,
+    )
+    .await
+    .log_500("Update tweet text error")?;
+
+    println!("[regenerate_tweet] Generated new text for tweet {}: {}", tweet_id, new_text);
+
+    Ok(Json(RegenerateTweetResponse { text: new_text }))
 }

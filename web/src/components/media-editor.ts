@@ -1,6 +1,6 @@
 import { LitElement, html, css } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { api } from '../api';
+import { api, apiBaseForWs } from '../api';
 import { tailwindStyles } from '../styles/shared';
 import './image-cropper';
 import './video-trimmer';
@@ -120,7 +120,7 @@ export class MediaEditor extends LitElement {
     if (this.ws) return;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/api/media/edit/ws`;
+    const wsUrl = `${protocol}//${apiBaseForWs.origin}${apiBaseForWs.path}/media/edit/ws`;
 
     this.ws = new WebSocket(wsUrl);
 

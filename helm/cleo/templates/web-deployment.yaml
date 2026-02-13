@@ -26,6 +26,9 @@ spec:
             - name: http
               containerPort: 4173
               protocol: TCP
+          env:
+            - name: API_BASE_URL
+              value: {{ .Values.web.apiBaseUrl | quote }}
           resources:
             {{- toYaml .Values.web.resources | nindent 12 }}
           livenessProbe:

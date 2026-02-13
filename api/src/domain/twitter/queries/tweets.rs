@@ -50,6 +50,7 @@ where
                video_clip, image_capture_ids,
                COALESCE(media_options, '[]'::jsonb) as media_options,
                rationale, created_at,
+               publish_status, publish_attempts, publish_error, publish_error_at,
                thread_position, reply_to_tweet_id, posted_at, tweet_id
         FROM tweet_collateral
         WHERE user_id = $1 AND posted_at IS NULL AND thread_id IS NULL
@@ -102,6 +103,7 @@ where
                   video_clip, image_capture_ids,
                   COALESCE(media_options, '[]'::jsonb) as media_options,
                   rationale, created_at,
+                  publish_status, publish_attempts, publish_error, publish_error_at,
                   thread_position, reply_to_tweet_id, posted_at, tweet_id
            FROM tweet_collateral
            WHERE user_id = $1 AND thread_id IS NULL {}
@@ -137,6 +139,7 @@ where
                   video_clip, image_capture_ids,
                   COALESCE(media_options, '[]'::jsonb) as media_options,
                   rationale, created_at,
+                  publish_status, publish_attempts, publish_error, publish_error_at,
                   thread_position, reply_to_tweet_id, posted_at, tweet_id
            FROM tweet_collateral
            WHERE user_id = $1 AND thread_id IS NULL {}
@@ -170,6 +173,7 @@ where
                   video_clip, image_capture_ids,
                   COALESCE(media_options, '[]'::jsonb) as media_options,
                   rationale, created_at,
+                  publish_status, publish_attempts, publish_error, publish_error_at,
                   thread_position, reply_to_tweet_id, posted_at, tweet_id
            FROM tweet_collateral
            WHERE user_id = $1 AND thread_id IS NULL {}
@@ -222,7 +226,11 @@ where
     let result = sqlx::query(
         r#"
         UPDATE tweet_collateral
-        SET posted_at = NOW(), tweet_id = $1
+        SET posted_at = NOW(),
+            tweet_id = $1,
+            publish_status = 'posted',
+            publish_error = NULL,
+            publish_error_at = NULL
         WHERE id = $2 AND posted_at IS NULL
         "#,
     )
@@ -244,17 +252,53 @@ pub async fn set_tweet_posting<'e, E>(
 where
     E: Executor<'e, Database = Postgres>,
 {
-    // We use a custom status field if available, or just verify ownership
-    // For now, just verify the tweet exists and is unposted
-    let result: Option<(i64,)> = sqlx::query_as(
-        "SELECT id FROM tweet_collateral WHERE id = $1 AND user_id = $2 AND posted_at IS NULL",
+    let result = sqlx::query(
+        r#"
+        UPDATE tweet_collateral
+        SET publish_status = 'posting',
+            publish_attempts = COALESCE(publish_attempts, 0) + 1,
+            publish_error = NULL,
+            publish_error_at = NULL
+        WHERE id = $1
+            AND user_id = $2
+            AND posted_at IS NULL
+            AND publish_status IN ('pending', 'failed')
+        "#,
     )
     .bind(tweet_id)
     .bind(user_id)
-    .fetch_optional(executor)
+    .execute(executor)
     .await?;
 
-    Ok(result.is_some())
+    Ok(result.rows_affected() > 0)
+}
+
+/// Mark tweet publish as failed
+pub async fn mark_tweet_publish_failed<'e, E>(
+    executor: E,
+    tweet_id: i64,
+    user_id: i64,
+    error: &str,
+) -> Result<bool, sqlx::Error>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let result = sqlx::query(
+        r#"
+        UPDATE tweet_collateral
+        SET publish_status = 'failed',
+            publish_error = $3,
+            publish_error_at = NOW()
+        WHERE id = $1 AND user_id = $2 AND posted_at IS NULL
+        "#,
+    )
+    .bind(tweet_id)
+    .bind(user_id)
+    .bind(error)
+    .execute(executor)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 /// Delete a pending tweet

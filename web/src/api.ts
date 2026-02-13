@@ -1,6 +1,30 @@
 import { z } from 'zod';
 
-const API_BASE = '/api';
+type RuntimeConfig = {
+  apiBase?: string;
+};
+
+declare global {
+  interface Window {
+    __CLEO_RUNTIME_CONFIG__?: RuntimeConfig;
+  }
+}
+
+const runtimeConfig = globalThis.window?.__CLEO_RUNTIME_CONFIG__;
+const API_BASE = (runtimeConfig?.apiBase || '/api').replace(/\/$/, '');
+const isAbsoluteApiBase = /^https?:\/\//.test(API_BASE);
+const currentOrigin = globalThis.window?.location.origin || '';
+const API_BASE_ORIGIN = isAbsoluteApiBase ? new URL(API_BASE).origin : currentOrigin;
+const API_BASE_PATH = isAbsoluteApiBase
+  ? new URL(API_BASE).pathname.replace(/\/$/, '')
+  : API_BASE;
+
+const normalizeApiPath = (path: string): string => (path.startsWith('/') ? path : `/${path}`);
+
+export const apiBaseForWs = {
+  origin: API_BASE_ORIGIN,
+  path: API_BASE_PATH,
+};
 
 // OAuth state storage key for CSRF protection
 const OAUTH_STATE_KEY = 'cleo_oauth_state';
@@ -27,6 +51,10 @@ const PendingTweetSchema = z.object({
   image_capture_ids: z.array(z.number()),
   rationale: z.string(),
   created_at: z.string(),
+  publish_status: z.string(),
+  publish_attempts: z.number(),
+  publish_error: z.string().nullable(),
+  publish_error_at: z.string().nullable(),
 });
 
 const PostTweetResponseSchema = z.object({
@@ -59,6 +87,10 @@ const ThreadTweetSchema = z.object({
   reply_to_tweet_id: z.string().nullable(),
   posted_at: z.string().nullable(),
   tweet_id: z.string().nullable(),
+  publish_status: z.string(),
+  publish_attempts: z.number(),
+  publish_error: z.string().nullable(),
+  publish_error_at: z.string().nullable(),
 });
 
 const ThreadWithTweetsSchema = z.object({
@@ -148,6 +180,18 @@ const ContentResponseSchema = z.object({
   has_more: z.boolean(),
 });
 
+const PushSubscriptionSchema = z.object({
+  endpoint: z.string(),
+  keys: z.object({
+    p256dh: z.string(),
+    auth: z.string(),
+  }),
+});
+
+const VapidPublicKeyResponseSchema = z.object({
+  vapid_public_key: z.string(),
+});
+
 // ============== TypeScript Types (inferred from Zod) ==============
 
 export type VideoClip = z.infer<typeof VideoClipSchema>;
@@ -164,6 +208,8 @@ export type CaptureItem = z.infer<typeof CaptureItemSchema>;
 export type BrowseCapturesResponse = z.infer<typeof BrowseCapturesResponseSchema>;
 export type ContentItem = z.infer<typeof ContentItemSchema>;
 export type ContentResponse = z.infer<typeof ContentResponseSchema>;
+export type PushSubscription = z.infer<typeof PushSubscriptionSchema>;
+export type VapidPublicKeyResponse = z.infer<typeof VapidPublicKeyResponseSchema>;
 export type Persona = z.infer<typeof PersonaSchema>;
 export type UserPersona = z.infer<typeof UserPersonaSchema>;
 export type NudgesResponse = z.infer<typeof NudgesResponseSchema>;
@@ -205,6 +251,7 @@ class ApiClient {
   private refreshPromise: Promise<boolean> | null = null;
   private onUnauthorized: (() => void) | null = null;
   private unauthorizedFired = false;
+  private vapidPublicKey: string | null = null;
 
   // Cache for capture URLs (signed URLs expire in 15 minutes, cache for 10)
   private captureUrlCache = new Map<number, { data: { url: string; content_type: string }; expires: number }>();
@@ -446,7 +493,8 @@ class ApiClient {
     return new Promise((resolve, reject) => {
       // Build WebSocket URL - uses cookies for auth
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${wsProtocol}//${window.location.host}${API_BASE}/tweets/${id}/publish/ws`;
+      const wsPath = normalizeApiPath(`${API_BASE_PATH}/tweets/${id}/publish/ws`);
+      const wsUrl = `${wsProtocol}//${apiBaseForWs.origin}${wsPath}`;
 
       const ws = new WebSocket(wsUrl);
 
@@ -621,6 +669,38 @@ class ApiClient {
     return this.fetchJson(`${API_BASE}/content?${query.toString()}`, {}, 'Failed to get content', ContentResponseSchema);
   }
 
+  async getVapidPublicKey(): Promise<string> {
+    if (this.vapidPublicKey !== null) {
+      return this.vapidPublicKey;
+    }
+
+    const parsed = await this.fetchJson(
+      `${API_BASE}/push/vapid-public-key`,
+      {},
+      'Failed to get VAPID public key',
+      VapidPublicKeyResponseSchema,
+    );
+
+    this.vapidPublicKey = parsed.vapid_public_key;
+    return parsed.vapid_public_key;
+  }
+
+  async savePushSubscription(subscription: PushSubscription): Promise<void> {
+    return this.fetchVoid(
+      `${API_BASE}/push/subscription`,
+      { method: 'POST', body: JSON.stringify(subscription) },
+      'Failed to save push subscription',
+    );
+  }
+
+  async deletePushSubscription(endpoint: string): Promise<void> {
+    return this.fetchVoid(
+      `${API_BASE}/push/subscription`,
+      { method: 'DELETE', body: JSON.stringify({ endpoint }) },
+      'Failed to delete push subscription',
+    );
+  }
+
   // Nudges & Personas
 
   async getPersonas(): Promise<Persona[]> {
@@ -654,6 +734,14 @@ class ApiClient {
       { method: 'PUT', body: JSON.stringify({ nudges, selected_persona_id: selectedPersonaId }) },
       'Failed to update nudges',
       NudgesResponseSchema
+    );
+  }
+
+  async regenerateTweet(tweetId: number): Promise<{ text: string }> {
+    return this.fetchJsonRaw(
+      `${API_BASE}/tweets/${tweetId}/regenerate`,
+      { method: 'POST' },
+      'Failed to regenerate tweet'
     );
   }
 }

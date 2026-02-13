@@ -45,6 +45,7 @@ export class TweetCard extends LitElement {
 
   async handlePost() {
     if (!this.tweet) return;
+    if (this.tweet.publish_status === "posting") return;
 
     this.posting = true;
     this.uploadProgress = null;
@@ -151,6 +152,20 @@ export class TweetCard extends LitElement {
     }
 
     const imageCount = this.tweet.image_capture_ids.length;
+    const isFailed = this.tweet.publish_status === "failed";
+    const isPosting = this.tweet.publish_status === "posting";
+    const statusText = this.tweet.publish_status === "posted"
+      ? "Posted"
+      : isPosting
+        ? "Posting"
+        : isFailed
+          ? "Failed"
+          : "Pending";
+    const statusVariant = isPosting
+      ? "status-warning"
+      : isFailed
+        ? "status-error"
+        : "status-success";
 
     return html`
       <div class="relative ${this.copyChoices.length > 1 ? 'ml-6' : ''}">
@@ -176,6 +191,10 @@ export class TweetCard extends LitElement {
             <span slot="left" class="text-xs">${this.formatDate(this.tweet.created_at)}</span>
             <div slot="right" class="flex gap-1.5">
             <slot name="extra-badges"></slot>
+            <content-badge variant=${statusVariant}>${statusText}</content-badge>
+            ${this.tweet.publish_attempts > 0
+              ? html`<content-badge variant="muted">Attempt ${this.tweet.publish_attempts}</content-badge>`
+              : ""}
             ${this.tweet.video_clip
               ? html`<content-badge variant="accent">Video</content-badge>`
               : ""}
@@ -193,6 +212,15 @@ export class TweetCard extends LitElement {
           ?compact=${this.compact}
           @collateral-updated=${this.handleCollateralUpdated}
         ></tweet-content>
+
+        ${isFailed && this.tweet.publish_error
+          ? html`
+              <div class="mt-2 text-xs text-error whitespace-pre-wrap">
+                <strong>Last error:</strong>
+                ${this.tweet.publish_error}
+              </div>
+            `
+          : ""}
 
         ${this.error
           ? html`
@@ -237,7 +265,7 @@ export class TweetCard extends LitElement {
                 <button
                   class="btn btn-primary btn-sm gap-1 min-w-24"
                   @click=${this.handlePost}
-                  ?disabled=${this.posting || this.dismissing}
+                  ?disabled=${this.posting || this.dismissing || isPosting}
                 >
                   ${this.posting
                     ? this.uploadStatus === "uploading" &&
@@ -265,17 +293,17 @@ export class TweetCard extends LitElement {
                           : html`<span
                               class="loading loading-spinner loading-sm"
                             ></span>`
-                    : html`
-                        <svg
-                          class="w-4 h-4"
-                          viewBox="0 0 24 24"
-                          fill="currentColor"
-                        >
-                          <path
-                            d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"
-                          />
-                        </svg>
-                        Post
+                        : html`
+                            <svg
+                              class="w-4 h-4"
+                              viewBox="0 0 24 24"
+                              fill="currentColor"
+                            >
+                              <path
+                                d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"
+                              />
+                            </svg>
+                            ${isFailed ? "Retry" : "Post"}
                       `}
                 </button>
               </div>

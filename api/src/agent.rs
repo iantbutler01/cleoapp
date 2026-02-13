@@ -17,6 +17,7 @@ use tokio::sync::Mutex;
 
 use crate::constants::BUCKET_NAME;
 use crate::routes::nudges::get_sanitized_nudges;
+use crate::services;
 
 const MAX_TURNS: usize = 40;
 
@@ -247,7 +248,7 @@ pub async fn get_last_run_time(db: &PgPool, user_id: i64) -> Option<DateTime<Utc
     sqlx::query_scalar::<_, DateTime<Utc>>(
         r#"
         SELECT completed_at FROM agent_runs
-        WHERE user_id = $1
+        WHERE user_id = $1 AND status = 'completed'
         ORDER BY completed_at DESC
         LIMIT 1
         "#,
@@ -272,12 +273,21 @@ pub async fn find_idle_users_with_pending_captures(
         r#"
         SELECT DISTINCT c.user_id
         FROM captures c
-        LEFT JOIN agent_runs ar ON ar.user_id = c.user_id
         WHERE
             -- Has captures after last run (or never ran)
             c.captured_at > COALESCE(
-                (SELECT MAX(completed_at) FROM agent_runs WHERE user_id = c.user_id),
+                (SELECT MAX(completed_at)
+                 FROM agent_runs
+                 WHERE user_id = c.user_id AND status = 'completed'),
                 '1970-01-01'::timestamptz
+            )
+            -- Skip users with an active run in progress
+            AND NOT EXISTS (
+                SELECT 1
+                FROM agent_runs ar2
+                WHERE ar2.user_id = c.user_id
+                    AND ar2.status = 'running'
+                    AND ar2.started_at > NOW() - INTERVAL '30 minutes'
             )
             -- No recent activity (user is idle)
             AND NOT EXISTS (
@@ -292,6 +302,25 @@ pub async fn find_idle_users_with_pending_captures(
     .await
 }
 
+async fn clear_stale_running_runs(db: &PgPool, user_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE agent_runs
+        SET status = 'failed',
+            completed_at = NOW(),
+            error_message = COALESCE(error_message, 'stale running state')
+        WHERE user_id = $1
+            AND status = 'running'
+            AND (started_at IS NULL OR started_at < NOW() - INTERVAL '30 minutes')
+        "#,
+    )
+    .bind(user_id)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
 pub async fn record_run(
     db: &PgPool,
     user_id: i64,
@@ -301,8 +330,21 @@ pub async fn record_run(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO agent_runs (user_id, window_start, window_end, tweets_generated, completed_at)
-        VALUES ($1, $2, $3, $4, NOW())
+        INSERT INTO agent_runs (
+            user_id,
+            window_start,
+            window_end,
+            tweets_generated,
+            status,
+            started_at,
+            completed_at,
+            attempts,
+            error_message
+        )
+        VALUES (
+            $1, $2, $3, $4,
+            'completed', NOW(), NOW(), 1, NULL
+        )
         "#,
     )
     .bind(user_id)
@@ -311,6 +353,80 @@ pub async fn record_run(
     .bind(tweets_generated)
     .execute(db)
     .await?;
+    Ok(())
+}
+
+pub async fn start_agent_run(db: &PgPool, user_id: i64) -> Result<Option<i64>, sqlx::Error> {
+    clear_stale_running_runs(db, user_id).await?;
+
+    let run_id = sqlx::query_scalar::<_, i64>(
+        r#"
+        INSERT INTO agent_runs (
+            user_id,
+            window_start,
+            window_end,
+            tweets_generated,
+            status,
+            started_at,
+            completed_at,
+            attempts,
+            error_message
+        )
+        VALUES (
+            $1,
+            NOW(),
+            NOW(),
+            0,
+            'running',
+            NOW(),
+            NOW(),
+            0,
+            NULL
+        )
+        ON CONFLICT (user_id) WHERE status = 'running'
+        DO NOTHING
+        RETURNING id
+        "#,
+        )
+        .bind(user_id)
+        .fetch_optional(db)
+        .await?;
+
+    Ok(run_id)
+}
+
+pub async fn finish_agent_run(
+    db: &PgPool,
+    run_id: i64,
+    status: &str,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+    tweets_generated: i32,
+    error_message: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE agent_runs
+        SET status = $1,
+            window_start = $2,
+            window_end = $3,
+            tweets_generated = $4,
+            completed_at = NOW(),
+            attempts = COALESCE(attempts, 0) + 1,
+            error_message = NULLIF($5, '')
+        WHERE id = $6
+            AND status = 'running'
+        "#,
+    )
+    .bind(status)
+    .bind(window_start)
+    .bind(window_end)
+    .bind(tweets_generated)
+    .bind(error_message.unwrap_or(""))
+    .bind(run_id)
+    .execute(db)
+    .await?;
+
     Ok(())
 }
 
@@ -1137,190 +1253,17 @@ pub async fn run_collateral_job(
     user_id: i64,
     local_storage_path: Option<std::path::PathBuf>,
 ) -> Result<Vec<TweetCollateral>, Box<dyn std::error::Error + Send + Sync>> {
-    // Determine time window
     let now = Utc::now();
     let window_start = get_last_run_time(&db, user_id)
         .await
         .unwrap_or_else(|| now - Duration::hours(4));
-    let window_end = now;
 
-    println!(
-        "[agent] User {} - processing window {} to {}",
-        user_id, window_start, window_end
-    );
-
-    // Fetch data
-    let captures = fetch_captures_in_window(&db, user_id, window_start, window_end).await?;
-    let activities = fetch_activities_in_window(&db, user_id, window_start, window_end).await?;
-
-    if captures.is_empty() {
-        println!("[agent] User {} - no captures found in window", user_id);
-        // Nothing to process - record run for tracking (don't fail if this errors)
-        if let Err(e) = record_run(&db, user_id, window_start, window_end, 0).await {
-            eprintln!("[agent] Failed to record empty run: {}", e);
-        }
+    let current_run_id = start_agent_run(&db, user_id).await?;
+    if current_run_id.is_none() {
+        println!("[agent] User {} already has an active run", user_id);
         return Ok(vec![]);
     }
-
-    // Upload media to Gemini
-    // - Videos: Use File API (large files, need processing)
-    // - Images: Base64 encode inline (smaller, no processing needed)
-    let mut uploaded_media: Vec<UploadedMedia> = Vec::new();
-    let mut uploaded_file_names: Vec<String> = Vec::new(); // For cleanup
-
-    for capture in &captures {
-        // Try to load capture data - from local storage or GCS
-        let data = if let Some(ref local_path) = local_storage_path {
-            // Try local storage first
-            let file_path = local_path.join(&capture.gcs_path);
-            match tokio::fs::read(&file_path).await {
-                Ok(data) => {
-                    println!(
-                        "[agent] User {} - loaded capture {} from local: {:?} ({} bytes)",
-                        user_id, capture.id, file_path, data.len()
-                    );
-                    data
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[agent] User {} - capture {} not found locally ({:?}): {}, skipping",
-                        user_id, capture.id, file_path, e
-                    );
-                    continue;
-                }
-            }
-        } else {
-            // Download from GCS
-            let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
-            println!(
-                "[agent] User {} - downloading capture {} from GCS: {}",
-                user_id, capture.id, capture.gcs_path
-            );
-
-            match gcs.read_object(&bucket, &capture.gcs_path).send().await {
-                Ok(mut resp) => {
-                    let mut data = Vec::new();
-                    let mut failed = false;
-                    while let Some(chunk) = resp.next().await {
-                        match chunk {
-                            Ok(bytes) => data.extend_from_slice(&bytes),
-                            Err(e) => {
-                                eprintln!(
-                                    "[agent] User {} - capture {} GCS read error: {}, skipping",
-                                    user_id, capture.id, e
-                                );
-                                failed = true;
-                                break;
-                            }
-                        }
-                    }
-                    if failed {
-                        continue;
-                    }
-                    println!(
-                        "[agent] User {} - downloaded capture {} ({} bytes)",
-                        user_id, capture.id, data.len()
-                    );
-                    data
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[agent] User {} - capture {} GCS download failed: {}, skipping",
-                        user_id, capture.id, e
-                    );
-                    continue;
-                }
-            }
-        };
-
-        if capture.media_type == "video" {
-            // Upload video to Gemini File API
-            match gemini_client
-                .upload_file(
-                    &data,
-                    &capture.content_type,
-                    Some(&format!("capture_{}", capture.id)),
-                )
-                .await
-            {
-                Ok(uploaded) => {
-                    println!(
-                        "[agent] User {} - uploaded video capture {} to Gemini File API: {} {:#?}",
-                        user_id, capture.id, uploaded.name, uploaded.state
-                    );
-
-                    if uploaded.state == FileState::Processing {
-                        match gemini_client
-                            .wait_for_file_processing(&uploaded.name, Some(120))
-                            .await
-                        {
-                            Ok(out) => {
-                                println!(
-                                    "[agent] User {} - video capture {} processing complete: {:#?}",
-                                    user_id, capture.id, out
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "[agent] User {} - video capture {} processing failed: {}, skipping",
-                                    user_id, capture.id, e
-                                );
-                                continue;
-                            }
-                        }
-                    }
-
-                    uploaded_media.push(UploadedMedia {
-                        capture_id: capture.id,
-                        uri: uploaded.uri.clone(),
-                        mime_type: capture.content_type.clone(),
-                        is_video: true,
-                    });
-                    uploaded_file_names.push(uploaded.name);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[agent] User {} - video capture {} upload failed: {}, skipping",
-                        user_id, capture.id, e
-                    );
-                    continue;
-                }
-            }
-        } else {
-            // Images: base64 encode for inline embedding
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-            uploaded_media.push(UploadedMedia {
-                capture_id: capture.id,
-                uri: b64,
-                mime_type: capture.content_type.clone(),
-                is_video: false,
-            });
-        }
-    }
-
-    // Get Reducto API key from env
-    let reducto_api_key = std::env::var("REDUCTO_API_KEY").ok();
-
-    // Get user's nudges for voice/style
-    let nudges = get_sanitized_nudges(&db, user_id).await;
-
-    // Create agent context
-    let context = Arc::new(Mutex::new(AgentContext {
-        db: db.clone(),
-        gcs: gcs.clone(),
-        user_id,
-        window_start,
-        window_end,
-        tweets: Vec::new(),
-        threads: Vec::new(),
-        completed: false,
-        next_thread_id: 1,
-        reducto_api_key,
-        nudges,
-    }));
-
-    // Run agent - ensure cleanup happens even on error
-    let agent_result = run_collateral_agent(context.clone(), captures, activities, uploaded_media).await;
+    let run_id = current_run_id.expect("run_id checked for Some");
 
     // Helper to cleanup uploaded files
     async fn cleanup_gemini_files(client: &GoogleGenAIClient, file_names: &[String]) {
@@ -1331,33 +1274,269 @@ pub async fn run_collateral_job(
         }
     }
 
-    // If agent failed, cleanup and return error
-    if let Err(e) = agent_result {
-        cleanup_gemini_files(&gemini_client, &uploaded_file_names).await;
-        return Err(e.into());
+    let mut uploaded_file_names: Vec<String> = Vec::new();
+
+    let run_result: Result<Vec<TweetCollateral>, Box<dyn std::error::Error + Send + Sync>> =
+        (async {
+            // Determine processing window
+            let window_end = Utc::now();
+            println!(
+                "[agent] User {} - processing window {} to {}",
+                user_id, window_start, window_end
+            );
+
+            // Fetch data
+            let captures = fetch_captures_in_window(&db, user_id, window_start, window_end).await?;
+            let activities =
+                fetch_activities_in_window(&db, user_id, window_start, window_end).await?;
+
+            if captures.is_empty() {
+                println!("[agent] User {} - no captures found in window", user_id);
+                return Ok(vec![]);
+            }
+
+            // Upload media to Gemini
+            // - Videos: Use File API (large files, need processing)
+            // - Images: Base64 encode inline (smaller, no processing needed)
+            let mut uploaded_media: Vec<UploadedMedia> = Vec::new();
+
+            for capture in &captures {
+                // Try to load capture data - from local storage or GCS
+                let data = if let Some(ref local_path) = local_storage_path {
+                    let file_path = local_path.join(&capture.gcs_path);
+                    match tokio::fs::read(&file_path).await {
+                        Ok(data) => {
+                            println!(
+                                "[agent] User {} - loaded capture {} from local: {:?} ({} bytes)",
+                                user_id, capture.id, file_path, data.len()
+                            );
+                            data
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[agent] User {} - capture {} not found locally ({:?}): {}, skipping",
+                                user_id, capture.id, file_path, e
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    // Download from GCS
+                    let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
+                    println!(
+                        "[agent] User {} - downloading capture {} from GCS: {}",
+                        user_id, capture.id, capture.gcs_path
+                    );
+
+                    match gcs.read_object(&bucket, &capture.gcs_path).send().await {
+                        Ok(mut resp) => {
+                            let mut data = Vec::new();
+                            let mut failed = false;
+                            while let Some(chunk) = resp.next().await {
+                                match chunk {
+                                    Ok(bytes) => data.extend_from_slice(&bytes),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[agent] User {} - capture {} GCS read error: {}, skipping",
+                                            user_id, capture.id, e
+                                        );
+                                        failed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if failed {
+                                continue;
+                            }
+                            println!(
+                                "[agent] User {} - downloaded capture {} ({} bytes)",
+                                user_id, capture.id, data.len()
+                            );
+                            data
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[agent] User {} - capture {} GCS download failed: {}, skipping",
+                                user_id, capture.id, e
+                            );
+                            continue;
+                        }
+                    }
+                };
+
+                if capture.media_type == "video" {
+                    // Upload video to Gemini File API
+                    match gemini_client
+                        .upload_file(
+                            &data,
+                            &capture.content_type,
+                            Some(&format!("capture_{}", capture.id)),
+                        )
+                        .await
+                    {
+                        Ok(uploaded) => {
+                            println!(
+                                "[agent] User {} - uploaded video capture {} to Gemini File API: {} {:#?}",
+                                user_id, capture.id, uploaded.name, uploaded.state
+                            );
+
+                            if uploaded.state == FileState::Processing {
+                                match gemini_client
+                                    .wait_for_file_processing(&uploaded.name, Some(120))
+                                    .await
+                                {
+                                    Ok(out) => {
+                                        println!(
+                                            "[agent] User {} - video capture {} processing complete: {:#?}",
+                                            user_id, capture.id, out
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[agent] User {} - video capture {} processing failed: {}, skipping",
+                                            user_id, capture.id, e
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            uploaded_media.push(UploadedMedia {
+                                capture_id: capture.id,
+                                uri: uploaded.uri.clone(),
+                                mime_type: capture.content_type.clone(),
+                                is_video: true,
+                            });
+                            uploaded_file_names.push(uploaded.name);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[agent] User {} - video capture {} upload failed: {}, skipping",
+                                user_id, capture.id, e
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    // Images: base64 encode for inline embedding
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                    uploaded_media.push(UploadedMedia {
+                        capture_id: capture.id,
+                        uri: b64,
+                        mime_type: capture.content_type.clone(),
+                        is_video: false,
+                    });
+                }
+            }
+
+            // Get Reducto API key from env
+            let reducto_api_key = std::env::var("REDUCTO_API_KEY").ok();
+
+            // Get user's nudges for voice/style
+            let nudges = get_sanitized_nudges(&db, user_id).await;
+
+            // Create agent context
+            let context = Arc::new(Mutex::new(AgentContext {
+                db: db.clone(),
+                gcs: gcs.clone(),
+                user_id,
+                window_start,
+                window_end: Utc::now(),
+                tweets: Vec::new(),
+                threads: Vec::new(),
+                completed: false,
+                next_thread_id: 1,
+                reducto_api_key,
+                nudges,
+            }));
+
+            // Run agent
+            let agent_result = run_collateral_agent(
+                context.clone(),
+                captures,
+                activities,
+                uploaded_media,
+            )
+            .await;
+
+            if let Err(e) = agent_result {
+                cleanup_gemini_files(&gemini_client, &uploaded_file_names).await;
+                return Err(e.into());
+            }
+
+            // Get results
+            let guard = context.lock().await;
+            let tweets = guard.tweets.clone();
+            let threads = guard.threads.clone();
+            drop(guard); // Release lock before DB operations
+
+            // Save threads and tweets atomically - if any fails, all are rolled back
+            if let Err(e) = save_threads_and_tweets(&db, user_id, &threads, &tweets).await {
+                cleanup_gemini_files(&gemini_client, &uploaded_file_names).await;
+                return Err(e.into());
+            }
+
+            Ok(tweets)
+        })
+        .await;
+
+    match run_result {
+        Ok(tweets) => {
+            if let Err(error) = finish_agent_run(
+                &db,
+                run_id,
+                "completed",
+                window_start,
+                Utc::now(),
+                tweets.len() as i32,
+                None,
+            )
+            .await
+            {
+                eprintln!(
+                    "[agent] User {} - failed to finalize completed run: {}",
+                    user_id, error
+                );
+            }
+
+            // Cleanup uploaded video files from Gemini File API
+            cleanup_gemini_files(&gemini_client, &uploaded_file_names).await;
+
+            if !tweets.is_empty() {
+                if let Err(e) = services::push::notify_new_content(&db, user_id, tweets.len()).await {
+                    eprintln!(
+                        "[agent] Failed to send push notification for user {}: {}",
+                        user_id,
+                        e
+                    );
+                }
+            }
+
+            Ok(tweets)
+        }
+        Err(error) => {
+            if let Err(finish_error) = finish_agent_run(
+                &db,
+                run_id,
+                "failed",
+                window_start,
+                Utc::now(),
+                0,
+                Some(&error.to_string()),
+            )
+            .await
+            {
+                eprintln!(
+                    "[agent] User {} - failed to finalize failed run: {}",
+                    user_id, finish_error
+                );
+            }
+
+            // Cleanup uploaded video files from Gemini File API
+            cleanup_gemini_files(&gemini_client, &uploaded_file_names).await;
+            Err(error)
+        }
     }
-
-    // Get results
-    let guard = context.lock().await;
-    let tweets = guard.tweets.clone();
-    let threads = guard.threads.clone();
-    drop(guard); // Release lock before DB operations
-
-    // Save threads and tweets atomically - if any fails, all are rolled back
-    if let Err(e) = save_threads_and_tweets(&db, user_id, &threads, &tweets).await {
-        cleanup_gemini_files(&gemini_client, &uploaded_file_names).await;
-        return Err(e.into());
-    }
-
-    // Record run - if this fails, cleanup but don't error (tweets are already saved)
-    if let Err(e) = record_run(&db, user_id, window_start, window_end, tweets.len() as i32).await {
-        eprintln!("[agent] Failed to record run (tweets already saved): {}", e);
-    }
-
-    // Cleanup uploaded video files from Gemini File API
-    cleanup_gemini_files(&gemini_client, &uploaded_file_names).await;
-
-    Ok(tweets)
 }
 
 /// Background scheduler that runs the agent for idle users

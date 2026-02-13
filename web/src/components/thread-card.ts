@@ -112,7 +112,12 @@ export class ThreadCard extends LitElement {
 
     const { thread, tweets } = this.thread;
     const isPosted = thread.status === 'posted';
+    const isPosting = thread.status === 'posting';
     const isPartialFailed = thread.status === 'partial_failed';
+    const hasFailedTweets = tweets.some((tweet) => tweet.publish_status === 'failed');
+    const failedCount = tweets.filter((tweet) => tweet.publish_status === 'failed').length;
+    const postingCount = tweets.filter((tweet) => tweet.publish_status === 'posting').length;
+    const canPost = !isPosted && !isPosting;
 
     return html`
       <div class="relative ${this.copyChoices.length > 1 ? 'ml-6' : ''}">
@@ -137,6 +142,9 @@ export class ThreadCard extends LitElement {
               <content-badge variant="accent">Thread</content-badge>
               <content-badge variant="muted">${tweets.length} tweets</content-badge>
               ${isPosted ? html`<content-badge variant="status-success">Posted</content-badge>` : ''}
+              ${isPosting ? html`<content-badge variant="status-warning">Posting</content-badge>` : ''}
+              ${hasFailedTweets ? html`<content-badge variant="status-error">${failedCount} failed</content-badge>` : ''}
+              ${postingCount > 0 ? html`<content-badge variant="status-warning">${postingCount} posting</content-badge>` : ''}
               ${isPartialFailed ? html`<content-badge variant="status-warning">Partial</content-badge>` : ''}
             </div>
           </card-header>
@@ -151,12 +159,33 @@ export class ThreadCard extends LitElement {
                 </span>
               </div>
             ` : ''}
+            ${tweet.publish_status === 'failed'
+              ? html`
+                  <div class="mt-1">
+                    <content-badge variant="status-error">Failed</content-badge>
+                    ${tweet.publish_attempts > 0
+                      ? html`<content-badge variant="muted">Attempt ${tweet.publish_attempts}</content-badge>`
+                      : ""}
+                  </div>
+                `
+              : ''}
+            ${tweet.publish_status === 'posting'
+              ? html`<content-badge variant="status-warning">Posting</content-badge>`
+              : ''}
             <tweet-content
               .tweet=${tweet}
               ?compact=${i > 0}
               ?showRationale=${i === 0}
               @collateral-updated=${this.handleTweetUpdated}
             ></tweet-content>
+            ${tweet.publish_status === 'failed' && tweet.publish_error
+              ? html`
+                  <div class="mt-2 text-xs text-error whitespace-pre-wrap">
+                    <strong>Last error:</strong>
+                    ${tweet.publish_error}
+                  </div>
+                `
+              : ""}
           `)}
         </div>
 
@@ -171,7 +200,7 @@ export class ThreadCard extends LitElement {
         ` : ''}
 
         <!-- Actions -->
-        ${!isPosted ? html`
+        ${canPost ? html`
           <div slot="actions" class="flex justify-end gap-2 mt-3 pt-2 border-t border-base-300/20">
             <button
               class="btn btn-ghost btn-sm"

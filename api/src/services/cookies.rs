@@ -27,14 +27,29 @@ fn is_dev() -> bool {
     std::env::var("ENV").as_deref() != Ok("prod")
 }
 
+fn cookie_same_site() -> &'static str {
+    match std::env::var("COOKIE_SAMESITE")
+        .unwrap_or_else(|_| "Lax".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "none" => "None",
+        "strict" => "Strict",
+        "lax" => "Lax",
+        _ => "Lax",
+    }
+}
+
 /// Build an access token Set-Cookie header value
 pub fn build_access_cookie(token: &str) -> Result<HeaderValue, StatusCode> {
+    let same_site = cookie_same_site();
     let secure = if is_dev() { "" } else { " Secure;" };
     let cookie = format!(
-        "{}={}; HttpOnly;{} SameSite=Lax; Path={}; Max-Age={}",
+        "{}={}; HttpOnly;{} SameSite={}; Path={}; Max-Age={}",
         config::ACCESS_TOKEN_NAME,
         token,
         secure,
+        same_site,
         config::ACCESS_COOKIE_PATH,
         config::ACCESS_TOKEN_MAX_AGE_SECS
     );
@@ -46,12 +61,14 @@ pub fn build_access_cookie(token: &str) -> Result<HeaderValue, StatusCode> {
 
 /// Build a refresh token Set-Cookie header value
 pub fn build_refresh_cookie(token: &str) -> Result<HeaderValue, StatusCode> {
+    let same_site = cookie_same_site();
     let secure = if is_dev() { "" } else { " Secure;" };
     let cookie = format!(
-        "{}={}; HttpOnly;{} SameSite=Lax; Path={}; Max-Age={}",
+        "{}={}; HttpOnly;{} SameSite={}; Path={}; Max-Age={}",
         config::REFRESH_TOKEN_NAME,
         token,
         secure,
+        same_site,
         config::REFRESH_COOKIE_PATH,
         config::REFRESH_TOKEN_MAX_AGE_SECS
     );

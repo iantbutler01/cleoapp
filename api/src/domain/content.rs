@@ -26,6 +26,10 @@ struct TweetWithThreadId {
     media_options: Json<Vec<serde_json::Value>>,
     rationale: String,
     created_at: DateTime<Utc>,
+    publish_status: String,
+    publish_attempts: i32,
+    publish_error: Option<String>,
+    publish_error_at: Option<DateTime<Utc>>,
     thread_position: Option<i32>,
     reply_to_tweet_id: Option<String>,
     posted_at: Option<DateTime<Utc>>,
@@ -160,6 +164,7 @@ pub async fn list_content_paginated(
                    video_clip, image_capture_ids,
                    COALESCE(media_options, '[]'::jsonb) as media_options,
                    rationale, created_at,
+                   publish_status, publish_attempts, publish_error, publish_error_at,
                    thread_position, reply_to_tweet_id, posted_at, tweet_id
             FROM tweet_collateral
             WHERE id = ANY($1) AND user_id = $2
@@ -200,6 +205,7 @@ pub async fn list_content_paginated(
                    video_clip, image_capture_ids,
                    COALESCE(media_options, '[]'::jsonb) as media_options,
                    rationale, created_at,
+                   publish_status, publish_attempts, publish_error, publish_error_at,
                    thread_position, reply_to_tweet_id, posted_at, tweet_id
             FROM tweet_collateral
             WHERE thread_id = ANY($1) AND user_id = $2
@@ -223,6 +229,10 @@ pub async fn list_content_paginated(
                 media_options: tweet_row.media_options,
                 rationale: tweet_row.rationale,
                 created_at: tweet_row.created_at,
+                publish_status: tweet_row.publish_status,
+                publish_attempts: tweet_row.publish_attempts,
+                publish_error: tweet_row.publish_error,
+                publish_error_at: tweet_row.publish_error_at,
                 thread_position: tweet_row.thread_position,
                 reply_to_tweet_id: tweet_row.reply_to_tweet_id,
                 posted_at: tweet_row.posted_at,

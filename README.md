@@ -77,7 +77,49 @@ export GCS_BUCKET_NAME=your-bucket-name
 # Twitter OAuth 2.0
 export TWITTER_CLIENT_ID=your_client_id
 export TWITTER_CLIENT_SECRET=your_client_secret
-export TWITTER_REDIRECT_URI=http://localhost:5173/auth/twitter/callback
+export APP_ORIGIN=http://localhost:5173
+export TWITTER_REDIRECT_URI=${APP_ORIGIN}/auth/twitter/callback
+```
+
+### Helm deployment notes (OAuth callback + multi-host)
+
+- For single-domain deployments:
+  - keep `web.apiBaseUrl` as `/api`
+  - set `app.webOrigin` to your public web origin
+  - point `TWITTER_REDIRECT_URI` at `${APP_ORIGIN}/auth/twitter/callback` (default)
+  - keep a single `ingress.hosts` entry with `/auth/twitter/callback` routed to `web` (already defaulted in chart values)
+- For web/API split domains:
+  - set `app.webOrigin` to the web origin used for OAuth redirects (e.g. `https://app.example.com`)
+  - set `app.twitterCallbackPath` if you want a custom callback path
+  - set `web.apiBaseUrl` to your API origin (e.g. `https://api.example.com`)
+  - configure `ingress.api.hosts` + `ingress.api.paths` for `/api`, `/media`, `/auth`
+  - configure `ingress.web.hosts` + `ingress.web.paths` (at least `/`) for UI routes
+  - chart now auto-includes the callback path into web routes in split-host mode
+  - if you use a fully custom `app.twitterRedirectUri`, ensure it still matches the web callback path you route through ingress
+  - for cross-domain deployments, set `app.cookieSameSite: None` so auth cookies are sent to the API domain
+
+Example split-domain snippet:
+
+```yaml
+app:
+  webOrigin: https://app.example.com
+  twitterCallbackPath: /auth/twitter/callback
+  cookieSameSite: None
+web:
+  apiBaseUrl: https://api.example.com
+ingress:
+  api:
+    hosts:
+      - api.example.com
+    paths:
+      - /api
+      - /media
+      - /auth
+  web:
+    hosts:
+      - app.example.com
+    paths:
+      - /
 ```
 
 ---

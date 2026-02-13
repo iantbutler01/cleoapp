@@ -18,6 +18,10 @@ pub struct Tweet {
     pub reply_to_tweet_id: Option<String>,
     pub posted_at: Option<DateTime<Utc>>,
     pub tweet_id: Option<String>,
+    pub publish_status: String,
+    pub publish_attempts: i32,
+    pub publish_error: Option<String>,
+    pub publish_error_at: Option<DateTime<Utc>>,
 }
 
 /// Tweet data needed for posting (includes media info)
