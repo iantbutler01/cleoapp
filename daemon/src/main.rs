@@ -22,9 +22,9 @@ use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -77,6 +77,11 @@ use crate::workspace_tracker::WorkspaceTracker;
 
 const API_BASE_ENV: &str = "CLEO_CAPTURE_API_URL";
 const DEFAULT_API_BASE: &str = "http://localhost:3000";
+const DEFAULT_PENDING_ROOT_DIR: &str = ".cleo/captures";
+const PENDING_SCREENSHOTS_SUBDIR: &str = "screenshots";
+const PENDING_RECORDINGS_SUBDIR: &str = "recordings";
+const CONFIG_SUBDIR: &str = "cleo";
+const CONFIG_FILENAME: &str = "config.json";
 const SCREENSHOT_INTERVAL_SECS: u64 = 5;
 const BURST_WINDOW_SECS: u64 = 5;
 const BURST_THRESHOLD_WITH_SWITCH: usize = 1; // App switch alone triggers recording
@@ -87,11 +92,40 @@ const TASK_SLEEP_CHUNK_MS: u64 = 100;
 const ACTIVITY_FLUSH_INTERVAL_SECS: u64 = 30;
 const UPLOAD_BATCH_INTERVAL_SECS: u64 = 60; // Batch classify and upload every 60 seconds
 const BATCH_SIZE: usize = 30; // Max unique images per batch for classification
+const RECORDING_BATCH_MAX_BYTES_DEFAULT: u64 = 2 * 1024 * 1024 * 1024; // 2GiB
+const RECORDING_BATCH_MAX_BYTES_CAP: u64 = 2 * 1024 * 1024 * 1024; // hard cap at 2GiB
+const RECORDING_BATCH_MAX_FILES_DEFAULT: usize = 16;
+const RECORDING_BATCH_MAX_BYTES_ENV: &str = "CLEO_RECORDING_BATCH_MAX_BYTES";
+const RECORDING_BATCH_MAX_FILES_ENV: &str = "CLEO_RECORDING_BATCH_MAX_FILES";
+const RECORDING_SAMPLE_MAX_FRAMES_DEFAULT: u32 = 12;
 const IDLE_THRESHOLD_SECS: f64 = 60.0; // Skip screenshots if idle for 60+ seconds
 const PHASH_DISTANCE_THRESHOLD: u32 = 10; // Max hamming distance to consider images similar (0 = identical)
 const LIMITS_REFRESH_INTERVAL_SECS: u64 = 5 * 60; // Refresh recording limits every 5 minutes
-const PENDING_SCREENSHOTS_DIR: &str = ".cleo/captures/screenshots";
-const PENDING_RECORDINGS_DIR: &str = ".cleo/captures/recordings";
+
+#[derive(Clone, Copy, Debug)]
+struct RecordingBatchConfig {
+    max_bytes: u64,
+    max_files: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeDaemonSettings {
+    pending_root_path: PathBuf,
+    screenshot_interval_secs: u64,
+    idle_threshold_secs: f64,
+    activity_window_secs: u64,
+    burst_threshold_with_switch: usize,
+    burst_threshold_actions_only: usize,
+    auto_stop_tail_secs: u64,
+    upload_batch_interval_secs: u64,
+    recording_batch_max_bytes: u64,
+    recording_batch_max_files: usize,
+    recording_sample_max_frames: u32,
+    activity_flush_interval_secs: u64,
+    limits_refresh_interval_secs: u64,
+}
+
+static RUNTIME_DAEMON_SETTINGS: OnceLock<RuntimeDaemonSettings> = OnceLock::new();
 
 #[derive(Debug, Deserialize, Serialize)]
 struct CleoConfig {
@@ -102,6 +136,8 @@ struct CleoConfig {
     api_url: Option<String>,
     #[serde(default)]
     privacy: PrivacySettings,
+    #[serde(default)]
+    daemon: DaemonSettings,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -119,6 +155,87 @@ struct PrivacySettings {
     /// This persists even after unbanning so users can easily re-ban apps.
     #[serde(default)]
     known_apps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+struct DaemonSettings {
+    capture: CaptureSettings,
+    upload: UploadSettings,
+    activity: ActivitySettings,
+}
+
+impl Default for DaemonSettings {
+    fn default() -> Self {
+        Self {
+            capture: CaptureSettings::default(),
+            upload: UploadSettings::default(),
+            activity: ActivitySettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+struct CaptureSettings {
+    #[serde(alias = "local_storage_path")]
+    pending_root_path: Option<PathBuf>,
+    screenshot_interval_secs: u64,
+    idle_threshold_secs: f64,
+    activity_window_secs: u64,
+    burst_threshold_with_switch: usize,
+    burst_threshold_actions_only: usize,
+    auto_stop_tail_secs: u64,
+}
+
+impl Default for CaptureSettings {
+    fn default() -> Self {
+        Self {
+            pending_root_path: None,
+            screenshot_interval_secs: SCREENSHOT_INTERVAL_SECS,
+            idle_threshold_secs: IDLE_THRESHOLD_SECS,
+            activity_window_secs: BURST_WINDOW_SECS,
+            burst_threshold_with_switch: BURST_THRESHOLD_WITH_SWITCH,
+            burst_threshold_actions_only: BURST_THRESHOLD_ACTIONS_ONLY,
+            auto_stop_tail_secs: AUTO_RECORDING_TAIL_SECS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+struct UploadSettings {
+    batch_interval_secs: u64,
+    recording_batch_max_bytes: u64,
+    recording_batch_max_files: usize,
+    recording_sample_max_frames: u32,
+}
+
+impl Default for UploadSettings {
+    fn default() -> Self {
+        Self {
+            batch_interval_secs: UPLOAD_BATCH_INTERVAL_SECS,
+            recording_batch_max_bytes: RECORDING_BATCH_MAX_BYTES_DEFAULT,
+            recording_batch_max_files: RECORDING_BATCH_MAX_FILES_DEFAULT,
+            recording_sample_max_frames: RECORDING_SAMPLE_MAX_FRAMES_DEFAULT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+struct ActivitySettings {
+    flush_interval_secs: u64,
+    limits_refresh_interval_secs: u64,
+}
+
+impl Default for ActivitySettings {
+    fn default() -> Self {
+        Self {
+            flush_interval_secs: ACTIVITY_FLUSH_INTERVAL_SECS,
+            limits_refresh_interval_secs: LIMITS_REFRESH_INTERVAL_SECS,
+        }
+    }
 }
 
 impl PrivacySettings {
@@ -513,7 +630,8 @@ impl CleoDaemon {
             return;
         }
         // Skip screenshot if user is idle
-        if idle::is_idle(IDLE_THRESHOLD_SECS) {
+        let idle_threshold = daemon_runtime_settings().idle_threshold_secs;
+        if idle::is_idle(idle_threshold) {
             debug!(
                 "Skipping screenshot - user idle for {:.0}s",
                 idle::seconds_since_last_input()
@@ -1039,7 +1157,8 @@ impl CleoDaemon {
         if self.screenshot_task.borrow().is_some() {
             return;
         }
-        let task = RepeatingTask::start(Duration::from_secs(SCREENSHOT_INTERVAL_SECS), || {
+        let interval_secs = daemon_runtime_settings().screenshot_interval_secs;
+        let task = RepeatingTask::start(Duration::from_secs(interval_secs), || {
             dispatch_main(AppMessage::TakeScreenshot);
         });
         self.screenshot_task.replace(Some(task));
@@ -1053,7 +1172,8 @@ impl CleoDaemon {
         if self.activity_flush_task.borrow().is_some() {
             return;
         }
-        let task = RepeatingTask::start(Duration::from_secs(ACTIVITY_FLUSH_INTERVAL_SECS), || {
+        let interval_secs = daemon_runtime_settings().activity_flush_interval_secs;
+        let task = RepeatingTask::start(Duration::from_secs(interval_secs), || {
             dispatch_main(AppMessage::FlushActivity);
         });
         self.activity_flush_task.replace(Some(task));
@@ -1067,7 +1187,8 @@ impl CleoDaemon {
         if self.limits_refresh_task.borrow().is_some() {
             return;
         }
-        let task = RepeatingTask::start(Duration::from_secs(LIMITS_REFRESH_INTERVAL_SECS), || {
+        let interval_secs = daemon_runtime_settings().limits_refresh_interval_secs;
+        let task = RepeatingTask::start(Duration::from_secs(interval_secs), || {
             dispatch_main(AppMessage::RefreshLimits);
         });
         self.limits_refresh_task.replace(Some(task));
@@ -1092,9 +1213,12 @@ impl CleoDaemon {
     fn track_activity_burst(&self, kind: BurstActionKind) {
         let mut window = self.activity_window.borrow_mut();
         let now = Instant::now();
+        let activity_window_secs = daemon_runtime_settings().activity_window_secs;
+        let burst_threshold_with_switch = daemon_runtime_settings().burst_threshold_with_switch;
+        let burst_threshold_actions_only = daemon_runtime_settings().burst_threshold_actions_only;
 
         // First, clean out stale events older than the burst window
-        let threshold = Duration::from_secs(BURST_WINDOW_SECS);
+        let threshold = Duration::from_secs(activity_window_secs);
         while let Some(front) = window.front() {
             if now.duration_since(front.time) > threshold {
                 window.pop_front();
@@ -1119,14 +1243,14 @@ impl CleoDaemon {
                 )
             })
             .count();
-        let burst_triggered = app_switch_count >= BURST_THRESHOLD_WITH_SWITCH
-            || action_count >= BURST_THRESHOLD_ACTIONS_ONLY;
+        let burst_triggered = app_switch_count >= burst_threshold_with_switch
+            || action_count >= burst_threshold_actions_only;
 
         if burst_triggered && self.recorder.borrow().is_none() && self.auto_capture_enabled.get() {
             eprintln!(
                 "[recording] Automatic recording triggered by activity burst ({} events in {}s window)",
                 window.len(),
-                BURST_WINDOW_SECS
+                activity_window_secs
             );
             self.start_recording();
         }
@@ -1143,12 +1267,14 @@ impl CleoDaemon {
             task.cancel();
         }
         if !had_task {
+            let auto_stop_tail_secs = daemon_runtime_settings().auto_stop_tail_secs;
             info!(
                 "Automatic recording will stop in {} seconds without more activity",
-                AUTO_RECORDING_TAIL_SECS
+                auto_stop_tail_secs
             );
         }
-        let task = DelayedTask::schedule(Duration::from_secs(AUTO_RECORDING_TAIL_SECS), || {
+        let auto_stop_tail_secs = daemon_runtime_settings().auto_stop_tail_secs;
+        let task = DelayedTask::schedule(Duration::from_secs(auto_stop_tail_secs), || {
             dispatch_main(AppMessage::AutoStopRecording);
         });
         slot.replace(task);
@@ -1510,16 +1636,43 @@ fn resolve_api_base() -> String {
     env::var(API_BASE_ENV).unwrap_or_else(|_| DEFAULT_API_BASE.to_string())
 }
 
+fn platform_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join(CONFIG_SUBDIR).join(CONFIG_FILENAME))
+}
+
+fn legacy_config_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".config").join("cleo.json"))
+}
+
+fn config_path_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(path) = platform_config_path() {
+        paths.push(path);
+    }
+    if let Some(path) = legacy_config_path() {
+        if !paths.iter().any(|candidate| candidate == &path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
 fn cleo_config_path() -> Result<PathBuf, CaptureError> {
-    let home = env::var("HOME").map_err(|_| {
-        CaptureError::Config(
-            "HOME environment variable must be set to locate ~/.config/cleo.json".into(),
-        )
-    })?;
-    let mut path = PathBuf::from(home);
-    path.push(".config");
-    path.push("cleo.json");
-    Ok(path)
+    let paths = config_path_candidates();
+
+    for path in &paths {
+        if path.is_file() {
+            return Ok(path.clone());
+        }
+    }
+
+    if let Some(path) = paths.into_iter().next() {
+        return Ok(path);
+    }
+
+    Err(CaptureError::Config(
+        "Unable to resolve config directory for cleo config file".into(),
+    ))
 }
 
 fn save_api_token(token: &str) -> Result<(), CaptureError> {
@@ -1534,7 +1687,14 @@ fn save_api_token(token: &str) -> Result<(), CaptureError> {
     let config = CleoConfig {
         api_token,
         api_url: existing.as_ref().and_then(|c| c.api_url.clone()),
-        privacy: existing.map(|c| c.privacy).unwrap_or_default(),
+        privacy: existing
+            .as_ref()
+            .map(|c| c.privacy.clone())
+            .unwrap_or_default(),
+        daemon: existing
+            .as_ref()
+            .map(|c| c.daemon.clone())
+            .unwrap_or_default(),
     };
     let payload = serde_json::to_string_pretty(&config).map_err(|err| {
         CaptureError::Config(format!(
@@ -1563,8 +1723,9 @@ fn save_privacy_settings(privacy: &PrivacySettings) -> Result<(), CaptureError> 
 
     let config = CleoConfig {
         api_token,
-        api_url: existing.and_then(|c| c.api_url),
+        api_url: existing.as_ref().and_then(|c| c.api_url.clone()),
         privacy: privacy.clone(),
+        daemon: existing.map(|c| c.daemon).unwrap_or_default(),
     };
     let payload = serde_json::to_string_pretty(&config).map_err(|err| {
         CaptureError::Config(format!(
@@ -2017,16 +2178,156 @@ fn recording_file_path() -> PathBuf {
     path
 }
 
-fn pending_screenshots_dir() -> PathBuf {
+fn legacy_pending_root_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(PENDING_SCREENSHOTS_DIR)
+        .join(DEFAULT_PENDING_ROOT_DIR)
+}
+
+fn default_pending_root_path() -> PathBuf {
+    legacy_pending_root_path()
+}
+
+fn daemon_runtime_settings() -> &'static RuntimeDaemonSettings {
+    RUNTIME_DAEMON_SETTINGS.get_or_init(|| {
+        let daemon = load_config().ok().map(|c| c.daemon).unwrap_or_default();
+
+        let pending_root_path = daemon
+            .capture
+            .pending_root_path
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(default_pending_root_path);
+
+        let screenshot_interval_secs = daemon.capture.screenshot_interval_secs.max(1);
+        let idle_threshold_secs = if daemon.capture.idle_threshold_secs > 0.0 {
+            daemon.capture.idle_threshold_secs
+        } else {
+            IDLE_THRESHOLD_SECS
+        };
+        let activity_window_secs = daemon.capture.activity_window_secs.max(1);
+        let burst_threshold_with_switch = daemon.capture.burst_threshold_with_switch.max(1);
+        let burst_threshold_actions_only = daemon.capture.burst_threshold_actions_only.max(1);
+        let auto_stop_tail_secs = daemon.capture.auto_stop_tail_secs.max(1);
+        let upload_batch_interval_secs = daemon.upload.batch_interval_secs.max(1);
+        let activity_flush_interval_secs = daemon.activity.flush_interval_secs.max(1);
+        let limits_refresh_interval_secs = daemon.activity.limits_refresh_interval_secs.max(1);
+
+        let recording_batch_max_bytes = env::var(RECORDING_BATCH_MAX_BYTES_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(daemon.upload.recording_batch_max_bytes)
+            .min(RECORDING_BATCH_MAX_BYTES_CAP)
+            .max(1);
+
+        let recording_batch_max_files = env::var(RECORDING_BATCH_MAX_FILES_ENV)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(daemon.upload.recording_batch_max_files)
+            .max(1);
+
+        let recording_sample_max_frames = daemon.upload.recording_sample_max_frames.max(1);
+
+        RuntimeDaemonSettings {
+            pending_root_path,
+            screenshot_interval_secs,
+            idle_threshold_secs,
+            activity_window_secs,
+            burst_threshold_with_switch,
+            burst_threshold_actions_only,
+            auto_stop_tail_secs,
+            upload_batch_interval_secs,
+            recording_batch_max_bytes,
+            recording_batch_max_files,
+            recording_sample_max_frames,
+            activity_flush_interval_secs,
+            limits_refresh_interval_secs,
+        }
+    })
+}
+
+fn pending_screenshots_dir() -> PathBuf {
+    daemon_runtime_settings()
+        .pending_root_path
+        .join(PENDING_SCREENSHOTS_SUBDIR)
 }
 
 fn pending_recordings_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(PENDING_RECORDINGS_DIR)
+    daemon_runtime_settings()
+        .pending_root_path
+        .join(PENDING_RECORDINGS_SUBDIR)
+}
+
+fn recording_batch_config() -> RecordingBatchConfig {
+    let settings = daemon_runtime_settings();
+    RecordingBatchConfig {
+        max_bytes: settings.recording_batch_max_bytes,
+        max_files: settings.recording_batch_max_files,
+    }
+}
+
+fn recording_file_size_bytes(path: &Path) -> Option<u64> {
+    fs::metadata(path).map(|m| m.len()).ok()
+}
+
+fn build_recording_chunks(
+    files: &[PathBuf],
+    max_files: usize,
+    max_bytes: u64,
+) -> Vec<Vec<PathBuf>> {
+    build_recording_chunks_with_sizes(files, max_files, max_bytes, |path| {
+        match recording_file_size_bytes(path) {
+            Some(size) => size,
+            None => {
+                warn!(
+                    "Failed to read recording metadata for {}, treating size as 0",
+                    path.display()
+                );
+                0
+            }
+        }
+    })
+}
+
+fn build_recording_chunks_with_sizes<F>(
+    files: &[PathBuf],
+    max_files: usize,
+    max_bytes: u64,
+    mut file_size: F,
+) -> Vec<Vec<PathBuf>>
+where
+    F: FnMut(&Path) -> u64,
+{
+    let max_files = max_files.max(1);
+    let max_bytes = max_bytes.max(1);
+
+    let mut chunks: Vec<Vec<PathBuf>> = Vec::new();
+    let mut current: Vec<PathBuf> = Vec::new();
+    let mut current_bytes = 0u64;
+
+    for path in files {
+        let size = file_size(path.as_path());
+
+        let would_exceed_files = current.len() >= max_files;
+        let would_exceed_bytes =
+            !current.is_empty() && current_bytes.saturating_add(size) > max_bytes;
+
+        if would_exceed_files || would_exceed_bytes {
+            chunks.push(current);
+            current = Vec::new();
+            current_bytes = 0;
+        }
+
+        current_bytes = current_bytes.saturating_add(size);
+        current.push(path.clone());
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
 }
 
 fn image_format_from_path(path: &Path) -> Option<ImageFormat> {
@@ -2141,6 +2442,8 @@ impl BatchUploader {
 
         thread::spawn(move || {
             eprintln!("[DEBUG] BatchUploader thread spawned");
+            let settings = daemon_runtime_settings().clone();
+            let upload_interval_secs = settings.upload_batch_interval_secs;
             // Create our own API client and content filter
             eprintln!("[DEBUG] BatchUploader: building API client");
             let api = match build_api_client() {
@@ -2155,32 +2458,43 @@ impl BatchUploader {
             };
 
             eprintln!("[DEBUG] BatchUploader: loading NSFW filter");
-            let content_filter: Box<dyn ContentFilter> = match NsfwFilter::new() {
-                Ok(filter) => {
-                    info!("BatchUploader: NSFW filter loaded");
-                    Box::new(filter)
-                }
-                Err(e) => {
-                    warn!(
-                        "BatchUploader: NSFW filter unavailable ({}), using no-op",
-                        e
-                    );
-                    Box::new(NoOpFilter::new())
-                }
-            };
+            let content_filter: Box<dyn ContentFilter> =
+                match NsfwFilter::new(settings.recording_sample_max_frames) {
+                    Ok(filter) => {
+                        info!("BatchUploader: NSFW filter loaded");
+                        Box::new(filter)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "BatchUploader: NSFW filter unavailable ({}), using no-op",
+                            e
+                        );
+                        Box::new(NoOpFilter::new())
+                    }
+                };
+
+            let recording_batch = recording_batch_config();
+            info!(
+                "BatchUploader: recording chunk limits max_files={}, max_bytes={} bytes",
+                recording_batch.max_files, recording_batch.max_bytes
+            );
+            info!(
+                "BatchUploader: interval={}s, frame_cap={}",
+                upload_interval_secs, settings.recording_sample_max_frames
+            );
 
             eprintln!("[DEBUG] BatchUploader: entering main loop");
             info!(
                 "BatchUploader: Started, processing every {}s",
-                UPLOAD_BATCH_INTERVAL_SECS
+                upload_interval_secs
             );
 
             while !flag.load(Ordering::Relaxed) {
                 eprintln!(
                     "[DEBUG] BatchUploader: sleeping for {}s",
-                    UPLOAD_BATCH_INTERVAL_SECS
+                    upload_interval_secs
                 );
-                if sleep_with_cancellation(&flag, Duration::from_secs(UPLOAD_BATCH_INTERVAL_SECS)) {
+                if sleep_with_cancellation(&flag, Duration::from_secs(upload_interval_secs)) {
                     eprintln!("[DEBUG] BatchUploader: sleep cancelled, exiting");
                     break;
                 }
@@ -2249,8 +2563,36 @@ impl BatchUploader {
 
             // Process all recordings continuously
             if !files.is_empty() {
-                info!("Processing {} pending recordings", files.len());
-                Self::batch_process_recordings(api, content_filter, cancel_flag, &files);
+                let config = recording_batch_config();
+                let chunks = build_recording_chunks(&files, config.max_files, config.max_bytes);
+                info!(
+                    "Processing {} pending recordings across {} chunks (max_files={}, max_bytes={} bytes)",
+                    files.len(),
+                    chunks.len(),
+                    config.max_files,
+                    config.max_bytes
+                );
+
+                let total_chunks = chunks.len();
+                for (idx, chunk) in chunks.into_iter().enumerate() {
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        info!("Cancelling recording chunk processing");
+                        return;
+                    }
+
+                    let chunk_bytes: u64 = chunk
+                        .iter()
+                        .filter_map(|p| recording_file_size_bytes(p))
+                        .sum();
+                    info!(
+                        "Processing recording chunk {}/{} ({} files, {} bytes)",
+                        idx + 1,
+                        total_chunks,
+                        chunk.len(),
+                        chunk_bytes
+                    );
+                    Self::batch_process_recordings(api, content_filter, cancel_flag, &chunk);
+                }
             }
         }
     }
@@ -2417,18 +2759,21 @@ impl BatchUploader {
                     return;
                 }
 
+                let safe_count = safe_uploads.len();
                 eprintln!(
                     "[DEBUG] Starting batch upload of {} safe screenshots",
-                    safe_uploads.len()
+                    safe_count
                 );
                 info!(
                     "{} screenshots passed filter, uploading as batch",
-                    safe_uploads.len()
+                    safe_count
                 );
-                let batch: Vec<_> = safe_uploads
-                    .iter()
-                    .map(|(_, bytes, format)| (bytes.clone(), *format))
-                    .collect();
+                let mut uploaded_paths: Vec<PathBuf> = Vec::with_capacity(safe_count);
+                let mut batch: Vec<(Vec<u8>, ImageFormat)> = Vec::with_capacity(safe_count);
+                for (path, bytes, format) in safe_uploads {
+                    uploaded_paths.push(path);
+                    batch.push((bytes, format));
+                }
                 match api.upload_images(batch) {
                     Ok(result) => {
                         eprintln!("[DEBUG] Batch upload finished");
@@ -2439,14 +2784,14 @@ impl BatchUploader {
                         total_processed += result.uploaded;
                         // Delete only files confirmed as successfully uploaded.
                         if result.failed == 0 {
-                            for (path, _, _) in &safe_uploads {
+                            for path in &uploaded_paths {
                                 let _ = fs::remove_file(path);
                             }
                         } else if !result.successful_indices.is_empty() {
                             let mut deleted = 0usize;
                             for idx in result.successful_indices {
-                                match safe_uploads.get(idx) {
-                                    Some((path, _, _)) => {
+                                match uploaded_paths.get(idx) {
+                                    Some(path) => {
                                         let _ = fs::remove_file(path);
                                         deleted += 1;
                                     }
@@ -2454,7 +2799,7 @@ impl BatchUploader {
                                         warn!(
                                             "Upload result returned out-of-range screenshot index {} (batch size {})",
                                             idx,
-                                            safe_uploads.len()
+                                            uploaded_paths.len()
                                         );
                                     }
                                 }
@@ -2462,12 +2807,12 @@ impl BatchUploader {
                             info!(
                                 "Deleted {} uploaded screenshots; retained {} for retry",
                                 deleted,
-                                safe_uploads.len().saturating_sub(deleted)
+                                uploaded_paths.len().saturating_sub(deleted)
                             );
                         } else {
                             warn!(
                                 "Partial screenshot batch upload without per-file success metadata; retaining all {} files for retry",
-                                safe_uploads.len()
+                                uploaded_paths.len()
                             );
                         }
                     }
@@ -2503,8 +2848,9 @@ impl BatchUploader {
         cancel_flag: &AtomicBool,
         files: &[PathBuf],
     ) {
-        // Step 1: Sample frames from all recordings
-        let mut prepared: Vec<(PathBuf, Vec<Vec<u8>>)> = Vec::new(); // (path, scaled_frames)
+        // Step 1: Sample and scale frames from all recordings
+        let mut prepared_paths: Vec<(PathBuf, usize)> = Vec::new(); // (path, frame_count)
+        let mut all_frames: Vec<Vec<u8>> = Vec::new();
 
         for path in files {
             if cancel_flag.load(Ordering::Relaxed) {
@@ -2521,7 +2867,7 @@ impl BatchUploader {
                 }
             };
 
-            let mut scaled_frames = Vec::new();
+            let mut frame_count = 0usize;
             let mut ok = true;
             for frame in &frames {
                 if cancel_flag.load(Ordering::Relaxed) {
@@ -2530,7 +2876,10 @@ impl BatchUploader {
                 }
 
                 match content_filter.scale(&frame.rgba, frame.width, frame.height) {
-                    Ok(s) => scaled_frames.push(s),
+                    Ok(s) => {
+                        all_frames.push(s);
+                        frame_count += 1;
+                    }
                     Err(e) => {
                         error!("Failed to scale frame in {}: {}", path.display(), e);
                         ok = false;
@@ -2540,13 +2889,13 @@ impl BatchUploader {
             }
 
             if ok {
-                prepared.push((path.clone(), scaled_frames));
+                prepared_paths.push((path.clone(), frame_count));
             } else {
                 let _ = fs::remove_file(path);
             }
         }
 
-        if prepared.is_empty() {
+        if prepared_paths.is_empty() {
             return;
         }
 
@@ -2555,25 +2904,17 @@ impl BatchUploader {
         }
 
         // Step 2: Batch classify all frames from all recordings in single forward pass
-        // Flatten all frames into one batch, track which video each belongs to
-        let mut all_frames: Vec<Vec<u8>> = Vec::new();
-        let mut frame_counts: Vec<usize> = Vec::new();
-        for (_, scaled_frames) in &prepared {
-            frame_counts.push(scaled_frames.len());
-            all_frames.extend(scaled_frames.iter().cloned());
-        }
-
         info!(
             "Classifying {} frames from {} recordings",
             all_frames.len(),
-            prepared.len()
+            prepared_paths.len()
         );
 
         let results = match content_filter.classify(&all_frames) {
             Ok(r) => r,
             Err(e) => {
                 error!("Batch classification failed: {}", e);
-                for (path, _) in &prepared {
+                for (path, _) in &prepared_paths {
                     let _ = fs::remove_file(path);
                 }
                 return;
@@ -2583,13 +2924,12 @@ impl BatchUploader {
         // Map results back to videos
         let mut safe_paths: Vec<PathBuf> = Vec::new();
         let mut result_idx = 0;
-        for (path, _) in prepared {
+        for (path, frame_count) in prepared_paths {
             if cancel_flag.load(Ordering::Relaxed) {
                 info!("Cancelling recording result mapping");
                 return;
             }
 
-            let frame_count = frame_counts.remove(0);
             let frame_results = &results[result_idx..result_idx + frame_count];
             result_idx += frame_count;
 
@@ -2603,7 +2943,8 @@ impl BatchUploader {
         }
 
         // Step 3: Read and collect all safe recordings for batch upload
-        let mut safe_uploads: Vec<(PathBuf, Vec<u8>, VideoFormat)> = Vec::new();
+        let mut uploaded_paths: Vec<PathBuf> = Vec::new();
+        let mut batch: Vec<(Vec<u8>, VideoFormat)> = Vec::new();
         for path in safe_paths {
             if cancel_flag.load(Ordering::Relaxed) {
                 info!("Cancelling recording upload preparation");
@@ -2628,11 +2969,12 @@ impl BatchUploader {
                 }
             };
 
-            safe_uploads.push((path, bytes, format));
+            uploaded_paths.push(path);
+            batch.push((bytes, format));
         }
 
         // Step 4: Batch upload all safe recordings
-        if !safe_uploads.is_empty() {
+        if !batch.is_empty() {
             if cancel_flag.load(Ordering::Relaxed) {
                 info!("Cancelling recording upload");
                 return;
@@ -2640,12 +2982,8 @@ impl BatchUploader {
 
             info!(
                 "{} recordings passed filter, uploading as batch",
-                safe_uploads.len()
+                batch.len()
             );
-            let batch: Vec<_> = safe_uploads
-                .iter()
-                .map(|(_, bytes, format)| (bytes.clone(), *format))
-                .collect();
             match api.upload_videos(batch) {
                 Ok(result) => {
                     eprintln!(
@@ -2658,14 +2996,14 @@ impl BatchUploader {
                     );
                     // Delete only files confirmed as successfully uploaded.
                     if result.failed == 0 {
-                        for (path, _, _) in &safe_uploads {
+                        for path in &uploaded_paths {
                             let _ = fs::remove_file(path);
                         }
                     } else if !result.successful_indices.is_empty() {
                         let mut deleted = 0usize;
                         for idx in result.successful_indices {
-                            match safe_uploads.get(idx) {
-                                Some((path, _, _)) => {
+                            match uploaded_paths.get(idx) {
+                                Some(path) => {
                                     let _ = fs::remove_file(path);
                                     deleted += 1;
                                 }
@@ -2673,7 +3011,7 @@ impl BatchUploader {
                                     warn!(
                                         "Upload result returned out-of-range recording index {} (batch size {})",
                                         idx,
-                                        safe_uploads.len()
+                                        uploaded_paths.len()
                                     );
                                 }
                             }
@@ -2681,12 +3019,12 @@ impl BatchUploader {
                         info!(
                             "Deleted {} uploaded recordings; retained {} for retry",
                             deleted,
-                            safe_uploads.len().saturating_sub(deleted)
+                            uploaded_paths.len().saturating_sub(deleted)
                         );
                     } else {
                         warn!(
                             "Partial recording batch upload without per-file success metadata; retaining all {} files for retry",
-                            safe_uploads.len()
+                            uploaded_paths.len()
                         );
                     }
                 }
@@ -2707,5 +3045,99 @@ impl Drop for BatchUploader {
         self.stop.store(true, Ordering::Relaxed);
         // Thread will exit on next sleep_with_cancellation check (max 100ms)
         // Don't block on join during app termination
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn flatten_chunks(chunks: &[Vec<PathBuf>]) -> Vec<PathBuf> {
+        chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter().cloned())
+            .collect()
+    }
+
+    #[test]
+    fn recording_chunks_preserve_order_and_all_files() {
+        let files = vec![
+            PathBuf::from("a.mp4"),
+            PathBuf::from("b.mp4"),
+            PathBuf::from("c.mp4"),
+            PathBuf::from("d.mp4"),
+        ];
+        let sizes: HashMap<PathBuf, u64> = HashMap::from([
+            (PathBuf::from("a.mp4"), 40),
+            (PathBuf::from("b.mp4"), 30),
+            (PathBuf::from("c.mp4"), 50),
+            (PathBuf::from("d.mp4"), 10),
+        ]);
+
+        let chunks = build_recording_chunks_with_sizes(&files, 2, 70, |p| {
+            sizes.get(p).copied().unwrap_or(0)
+        });
+
+        assert_eq!(files, flatten_chunks(&chunks));
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn recording_chunks_respect_file_and_byte_limits_for_normal_files() {
+        let files = vec![
+            PathBuf::from("1.mp4"),
+            PathBuf::from("2.mp4"),
+            PathBuf::from("3.mp4"),
+            PathBuf::from("4.mp4"),
+            PathBuf::from("5.mp4"),
+        ];
+        let sizes: HashMap<PathBuf, u64> = HashMap::from([
+            (PathBuf::from("1.mp4"), 100),
+            (PathBuf::from("2.mp4"), 120),
+            (PathBuf::from("3.mp4"), 80),
+            (PathBuf::from("4.mp4"), 90),
+            (PathBuf::from("5.mp4"), 110),
+        ]);
+
+        let chunks = build_recording_chunks_with_sizes(&files, 3, 300, |p| {
+            sizes.get(p).copied().unwrap_or(0)
+        });
+
+        for chunk in &chunks {
+            let chunk_bytes: u64 = chunk
+                .iter()
+                .map(|p| sizes.get(p).copied().unwrap_or(0))
+                .sum();
+            assert!(chunk.len() <= 3);
+            assert!(chunk_bytes <= 300);
+        }
+    }
+
+    #[test]
+    fn recording_chunks_allow_single_oversized_file() {
+        let files = vec![
+            PathBuf::from("small.mp4"),
+            PathBuf::from("huge.mp4"),
+            PathBuf::from("tail.mp4"),
+        ];
+        let sizes: HashMap<PathBuf, u64> = HashMap::from([
+            (PathBuf::from("small.mp4"), 40),
+            (PathBuf::from("huge.mp4"), 500),
+            (PathBuf::from("tail.mp4"), 20),
+        ]);
+
+        let chunks = build_recording_chunks_with_sizes(&files, 2, 100, |p| {
+            sizes.get(p).copied().unwrap_or(0)
+        });
+
+        assert_eq!(
+            chunks,
+            vec![
+                vec![PathBuf::from("small.mp4")],
+                vec![PathBuf::from("huge.mp4")],
+                vec![PathBuf::from("tail.mp4")]
+            ]
+        );
     }
 }

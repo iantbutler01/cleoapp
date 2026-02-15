@@ -13,6 +13,7 @@ use super::{ContentFilter, Frame};
 const MODEL_REPO: &str = "LukeJacob2023/nsfw-image-detector";
 const IMAGE_SIZE: usize = 224;
 const NSFW_THRESHOLD: f32 = 0.05; // Very aggressive - block anything with >5% NSFW probability
+const RECORDING_SAMPLE_MAX_FRAMES_ENV: &str = "CLEO_RECORDING_SAMPLE_MAX_FRAMES";
 
 // Class indices from model config:
 // 0: drawings (safe)
@@ -31,10 +32,11 @@ const CLASS_SEXY: usize = 4;
 pub struct NsfwFilter {
     model: Mutex<vit::Model>,
     device: Device,
+    recording_sample_max_frames: u32,
 }
 
 impl NsfwFilter {
-    pub fn new() -> Result<Self> {
+    pub fn new(default_recording_sample_max_frames: u32) -> Result<Self> {
         #[cfg(feature = "metal")]
         let device = Device::new_metal(0).unwrap_or(Device::Cpu);
         #[cfg(not(feature = "metal"))]
@@ -53,11 +55,23 @@ impl NsfwFilter {
             unsafe { VarBuilder::from_mmaped_safetensors(&[model_path], DType::F32, &device)? };
         let model = vit::Model::new(&config, 5, vb)?; // 5 classes: drawings, hentai, neutral, porn, sexy
 
+        let recording_sample_max_frames = std::env::var(RECORDING_SAMPLE_MAX_FRAMES_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default_recording_sample_max_frames.max(1));
+
+        log::info!(
+            "Recording sample frame cap: {} (env: {})",
+            recording_sample_max_frames,
+            RECORDING_SAMPLE_MAX_FRAMES_ENV
+        );
         log::info!("NSFW model loaded successfully");
 
         Ok(Self {
             model: Mutex::new(model),
             device,
+            recording_sample_max_frames,
         })
     }
 
@@ -107,6 +121,8 @@ impl NsfwFilter {
                 path.to_str().ok_or_else(|| anyhow!("Invalid path"))?,
                 "-vf",
                 &format!("fps=1/{}", interval_secs),
+                "-frames:v",
+                &self.recording_sample_max_frames.to_string(),
                 "-f",
                 "image2",
                 temp_dir.join("frame_%04d.png").to_str().unwrap(),
