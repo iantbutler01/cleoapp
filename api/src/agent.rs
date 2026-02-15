@@ -157,7 +157,7 @@ pub struct ThreadMetadata {
 pub struct AgentContext {
     pub db: PgPool,
     #[allow(dead_code)]
-    pub gcs: Storage,
+    pub gcs: Option<Storage>,
     pub user_id: i64,
     pub window_start: DateTime<Utc>,
     pub window_end: DateTime<Utc>,
@@ -960,8 +960,12 @@ pub async fn run_collateral_agent(
                                     };
 
                                     // Download video from GCS
+                                    let gcs = match &guard.gcs {
+                                        Some(gcs) => gcs,
+                                        None => return Ok("GCS not configured, cannot download video".to_string()),
+                                    };
                                     let bucket = format!("projects/_/buckets/{}", crate::constants::BUCKET_NAME);
-                                    let mut resp = match guard.gcs.read_object(&bucket, &capture_record.gcs_path).send().await {
+                                    let mut resp = match gcs.read_object(&bucket, &capture_record.gcs_path).send().await {
                                         Ok(r) => r,
                                         Err(e) => return Ok(format!("Failed to download video from GCS: {}", e)),
                                     };
@@ -1059,18 +1063,33 @@ pub async fn run_collateral_agent(
     // Build multimodal message with all media
     let mut parts: Vec<MediaPart> = Vec::new();
 
-    // Add media parts (videos via FileUri, images via base64)
+    // Determine if using local LLM (non-Gemini) for media source selection
+    let local_llm = std::env::var("LOCAL_LLM").ok();
+    let is_local = local_llm.is_some();
+
+    // Add media parts - video source depends on provider
     for media in &uploaded_media {
         if media.is_video {
-            parts.push(MediaPart::Video {
-                source: MediaSource::FileUri {
-                    uri: media.uri.clone(),
-                    mime_type: Some(media.mime_type.clone()),
-                },
-                metadata: None,
-            });
+            if is_local {
+                // Local models: use video_url (HTTP URL to local file)
+                parts.push(MediaPart::Video {
+                    source: MediaSource::Url {
+                        url: media.uri.clone(),
+                    },
+                    metadata: None,
+                });
+            } else {
+                // Gemini: use File API URI
+                parts.push(MediaPart::Video {
+                    source: MediaSource::FileUri {
+                        uri: media.uri.clone(),
+                        mime_type: Some(media.mime_type.clone()),
+                    },
+                    metadata: None,
+                });
+            }
         } else {
-            // Images are base64 encoded in the uri field
+            // Images are base64 encoded in the uri field (same for both)
             parts.push(MediaPart::Image {
                 source: MediaSource::Base64 {
                     data: media.uri.clone(),
@@ -1148,7 +1167,7 @@ Use MarkComplete when done."#,
                 None,
                 None,
                 None,
-                None,
+                local_llm.clone(),
                 None,
             )
             .await
@@ -1249,11 +1268,16 @@ Use MarkComplete when done."#,
 
 pub async fn run_collateral_job(
     db: PgPool,
-    gcs: Storage,
-    gemini_client: GoogleGenAIClient,
+    gcs: Option<Storage>,
+    gemini_client: Option<GoogleGenAIClient>,
     user_id: i64,
     local_storage_path: Option<std::path::PathBuf>,
 ) -> Result<Vec<TweetCollateral>, Box<dyn std::error::Error + Send + Sync>> {
+    let local_llm = std::env::var("LOCAL_LLM").ok();
+    if gemini_client.is_none() && local_llm.is_none() {
+        return Err("No LLM backend configured: set either GOOGLE_GEMINI_API_KEY or LOCAL_LLM".into());
+    }
+
     let now = Utc::now();
     let window_start = get_last_run_time(&db, user_id)
         .await
@@ -1266,11 +1290,13 @@ pub async fn run_collateral_job(
     }
     let run_id = current_run_id.expect("run_id checked for Some");
 
-    // Helper to cleanup uploaded files
-    async fn cleanup_gemini_files(client: &GoogleGenAIClient, file_names: &[String]) {
-        for file_name in file_names {
-            if let Err(e) = client.delete_file(file_name).await {
-                eprintln!("[agent] Failed to cleanup Gemini file {}: {}", file_name, e);
+    // Helper to cleanup uploaded Gemini files (only when using Gemini)
+    async fn cleanup_gemini_files(client: Option<&GoogleGenAIClient>, file_names: &[String]) {
+        if let Some(client) = client {
+            for file_name in file_names {
+                if let Err(e) = client.delete_file(file_name).await {
+                    eprintln!("[agent] Failed to cleanup Gemini file {}: {}", file_name, e);
+                }
             }
         }
     }
@@ -1296,13 +1322,33 @@ pub async fn run_collateral_job(
                 return Ok(vec![]);
             }
 
-            // Upload media to Gemini
-            // - Videos: Use File API (large files, need processing)
-            // - Images: Base64 encode inline (smaller, no processing needed)
+            // Prepare media for the LLM
+            // Local LLM: videos served via media server URL, images base64-encoded
+            // Gemini: videos uploaded via File API, images base64-encoded
             let mut uploaded_media: Vec<UploadedMedia> = Vec::new();
+            let media_server_url = std::env::var("MEDIA_SERVER_URL")
+                .unwrap_or_else(|_| "http://localhost:3001".to_string())
+                .trim_end_matches('/')
+                .to_string();
 
             for capture in &captures {
-                // Try to load capture data - from local storage or GCS
+                if local_llm.is_some() && capture.media_type == "video" {
+                    // Local LLM: videos served by the media server, no data loading needed
+                    let video_url = format!("{}/{}", media_server_url, capture.gcs_path);
+                    println!(
+                        "[agent] User {} - video capture {} via media server: {}",
+                        user_id, capture.id, video_url
+                    );
+                    uploaded_media.push(UploadedMedia {
+                        capture_id: capture.id,
+                        uri: video_url,
+                        mime_type: capture.content_type.clone(),
+                        is_video: true,
+                    });
+                    continue;
+                }
+
+                // Load capture data - from local storage or GCS
                 let data = if let Some(ref local_path) = local_storage_path {
                     let file_path = local_path.join(&capture.gcs_path);
                     match tokio::fs::read(&file_path).await {
@@ -1321,7 +1367,7 @@ pub async fn run_collateral_job(
                             continue;
                         }
                     }
-                } else {
+                } else if let Some(ref gcs) = gcs {
                     // Download from GCS
                     let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
                     println!(
@@ -1363,11 +1409,18 @@ pub async fn run_collateral_job(
                             continue;
                         }
                     }
+                } else {
+                    eprintln!(
+                        "[agent] User {} - capture {} skipped: no local storage or GCS configured",
+                        user_id, capture.id
+                    );
+                    continue;
                 };
 
                 if capture.media_type == "video" {
-                    // Upload video to Gemini File API
-                    match gemini_client
+                    // Gemini: upload video to File API
+                    let client = gemini_client.as_ref().expect("gemini_client required for video upload without LOCAL_LLM");
+                    match client
                         .upload_file(
                             &data,
                             &capture.content_type,
@@ -1382,7 +1435,7 @@ pub async fn run_collateral_job(
                             );
 
                             if uploaded.state == FileState::Processing {
-                                match gemini_client
+                                match client
                                     .wait_for_file_processing(&uploaded.name, Some(120))
                                     .await
                                 {
@@ -1461,7 +1514,7 @@ pub async fn run_collateral_job(
             .await;
 
             if let Err(e) = agent_result {
-                cleanup_gemini_files(&gemini_client, &uploaded_file_names).await;
+                cleanup_gemini_files(gemini_client.as_ref(), &uploaded_file_names).await;
                 return Err(e.into());
             }
 
@@ -1473,7 +1526,7 @@ pub async fn run_collateral_job(
 
             // Save threads and tweets atomically - if any fails, all are rolled back
             if let Err(e) = save_threads_and_tweets(&db, user_id, &threads, &tweets).await {
-                cleanup_gemini_files(&gemini_client, &uploaded_file_names).await;
+                cleanup_gemini_files(gemini_client.as_ref(), &uploaded_file_names).await;
                 return Err(e.into());
             }
 
@@ -1501,7 +1554,7 @@ pub async fn run_collateral_job(
             }
 
             // Cleanup uploaded video files from Gemini File API
-            cleanup_gemini_files(&gemini_client, &uploaded_file_names).await;
+            cleanup_gemini_files(gemini_client.as_ref(), &uploaded_file_names).await;
 
             if !tweets.is_empty() {
                 if let Err(e) = services::push::notify_new_content(&db, user_id, tweets.len()).await {
@@ -1534,7 +1587,7 @@ pub async fn run_collateral_job(
             }
 
             // Cleanup uploaded video files from Gemini File API
-            cleanup_gemini_files(&gemini_client, &uploaded_file_names).await;
+            cleanup_gemini_files(gemini_client.as_ref(), &uploaded_file_names).await;
             Err(error)
         }
     }
@@ -1543,8 +1596,8 @@ pub async fn run_collateral_job(
 /// Background scheduler that runs the agent for idle users
 pub async fn start_background_scheduler(
     db: PgPool,
-    gcs: Storage,
-    gemini_client: GoogleGenAIClient,
+    gcs: Option<Storage>,
+    gemini_client: Option<GoogleGenAIClient>,
     idle_minutes: i64,
     check_interval_secs: u64,
     local_storage_path: Option<std::path::PathBuf>,
@@ -1559,28 +1612,39 @@ pub async fn start_background_scheduler(
         match find_idle_users_with_pending_captures(&db, idle_minutes).await {
             Ok(user_ids) => {
                 println!("[scheduler] Found {} idle users with pending captures", user_ids.len());
+                let mut handles = Vec::new();
                 for user_id in user_ids {
                     println!("[scheduler] Processing idle user {}", user_id);
-
-                    match run_collateral_job(
-                        db.clone(),
-                        gcs.clone(),
-                        gemini_client.clone(),
-                        user_id,
-                        local_storage_path.clone(),
-                    )
-                    .await
-                    {
-                        Ok(tweets) => {
-                            println!(
-                                "[scheduler] User {} - generated {} tweets",
-                                user_id,
-                                tweets.len()
-                            );
+                    let db = db.clone();
+                    let gcs = gcs.clone();
+                    let gemini_client = gemini_client.clone();
+                    let local_storage_path = local_storage_path.clone();
+                    handles.push(tokio::spawn(async move {
+                        match run_collateral_job(
+                            db,
+                            gcs,
+                            gemini_client,
+                            user_id,
+                            local_storage_path,
+                        )
+                        .await
+                        {
+                            Ok(tweets) => {
+                                println!(
+                                    "[scheduler] User {} - generated {} tweets",
+                                    user_id,
+                                    tweets.len()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("[scheduler] User {} - error: {}", user_id, e);
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("[scheduler] User {} - error: {}", user_id, e);
-                        }
+                    }));
+                }
+                for handle in handles {
+                    if let Err(e) = handle.await {
+                        eprintln!("[scheduler] Task join error: {}", e);
                     }
                 }
             }

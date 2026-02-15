@@ -49,6 +49,11 @@ spec:
             {{- if not (hasKey $apiEnv "TWITTER_REDIRECT_URI") }}
             {{- $_ := set $apiEnv "TWITTER_REDIRECT_URI" $redirectUri }}
             {{- end }}
+            {{- if .Values.api.localStorage.enabled }}
+            {{- if not (hasKey $apiEnv "LOCAL_STORAGE_PATH") }}
+            {{- $_ := set $apiEnv "LOCAL_STORAGE_PATH" (default "/data" .Values.api.localStorage.mountPath) }}
+            {{- end }}
+            {{- end }}
             {{- range $key, $value := $apiEnv }}
             - name: {{ $key }}
               value: {{ $value | quote }}
@@ -59,10 +64,14 @@ spec:
           {{- end }}
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
-          {{- if .Values.api.volumeMounts }}
           volumeMounts:
+            {{- if .Values.api.volumeMounts }}
             {{- toYaml .Values.api.volumeMounts | nindent 12 }}
-          {{- end }}
+            {{- end }}
+            {{- if .Values.api.localStorage.enabled }}
+            - name: local-storage
+              mountPath: {{ .Values.api.localStorage.mountPath | default "/data" }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /health
@@ -75,7 +84,12 @@ spec:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 5
-      {{- if .Values.api.volumes }}
       volumes:
+        {{- if .Values.api.volumes }}
         {{- toYaml .Values.api.volumes | nindent 8 }}
-      {{- end }}
+        {{- end }}
+        {{- if .Values.api.localStorage.enabled }}
+        - name: local-storage
+          persistentVolumeClaim:
+            claimName: {{ include "cleo.fullname" . }}-api-local-storage
+        {{- end }}

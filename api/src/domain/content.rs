@@ -56,9 +56,9 @@ impl ContentStatusFilter {
     /// Tweet WHERE clause fragment (for tweet_collateral table)
     fn tweet_where(&self) -> &'static str {
         match self {
-            ContentStatusFilter::Pending => "AND posted_at IS NULL",
+            ContentStatusFilter::Pending => "AND posted_at IS NULL AND dismissed_at IS NULL",
             ContentStatusFilter::Posted => "AND posted_at IS NOT NULL",
-            ContentStatusFilter::All => "",
+            ContentStatusFilter::All => "AND dismissed_at IS NULL",
         }
     }
 

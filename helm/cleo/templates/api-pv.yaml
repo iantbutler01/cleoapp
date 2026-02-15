@@ -1,0 +1,38 @@
+{{- if .Values.api.localStorage.enabled }}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ include "cleo.fullname" . }}-api-local-storage
+  labels:
+    {{- include "cleo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  capacity:
+    storage: {{ .Values.api.localStorage.size | default "100Gi" }}
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: {{ .Values.api.localStorage.hostPath }}
+    type: DirectoryOrCreate
+  claimRef:
+    namespace: {{ .Release.Namespace }}
+    name: {{ include "cleo.fullname" . }}-api-local-storage
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "cleo.fullname" . }}-api-local-storage
+  labels:
+    {{- include "cleo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ""
+  volumeName: {{ include "cleo.fullname" . }}-api-local-storage
+  resources:
+    requests:
+      storage: {{ .Values.api.localStorage.size | default "100Gi" }}
+{{- end }}

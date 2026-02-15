@@ -422,10 +422,9 @@ async fn capture_batch(
                     Err(e)
                 }
             }
-        } else {
+        } else if let Some(ref gcs) = state.gcs {
             let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
-            match state
-                .gcs
+            match gcs
                 .write_object(&bucket, &relative_path, body.clone())
                 .send_buffered()
                 .await
@@ -442,6 +441,12 @@ async fn capture_batch(
                     ))
                 }
             }
+        } else {
+            eprintln!("[capture_batch] No storage backend configured");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "No storage backend configured",
+            ))
         };
 
         if write_result.is_err() {

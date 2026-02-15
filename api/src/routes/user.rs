@@ -7,7 +7,6 @@ use axum::{
     routing::get,
 };
 use chrono::{DateTime, Utc};
-use google_cloud_storage::client::Storage;
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -106,7 +105,7 @@ async fn calculate_user_storage(state: &AppState, user_id: i64) -> u64 {
         calculate_local_storage(local_path, user_id).await
     } else {
         // Calculate from GCS - list objects with user prefix and sum sizes
-        calculate_gcs_storage(&state.gcs, user_id).await
+        calculate_gcs_storage(user_id).await
     }
 }
 
@@ -135,7 +134,7 @@ async fn calculate_local_storage(base_path: &std::path::Path, user_id: i64) -> u
     total
 }
 
-async fn calculate_gcs_storage(_gcs: &Storage, user_id: i64) -> u64 {
+async fn calculate_gcs_storage(user_id: i64) -> u64 {
     use futures::{StreamExt, pin_mut};
 
     // Use cloud-storage crate for listing (same one used for signed URLs)

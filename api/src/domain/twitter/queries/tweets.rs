@@ -12,6 +12,7 @@ use super::super::models::{Tweet, TweetForPosting};
 pub enum StatusFilter {
     Pending,
     Posted,
+    Dismissed,
     All,
 }
 
@@ -20,6 +21,7 @@ impl StatusFilter {
         match s {
             Some("pending") => StatusFilter::Pending,
             Some("posted") => StatusFilter::Posted,
+            Some("dismissed") => StatusFilter::Dismissed,
             _ => StatusFilter::All,
         }
     }
@@ -27,9 +29,10 @@ impl StatusFilter {
     /// Returns SQL WHERE clause fragment for filtering by post status
     fn where_clause(&self) -> &'static str {
         match self {
-            StatusFilter::Pending => "AND posted_at IS NULL",
+            StatusFilter::Pending => "AND posted_at IS NULL AND dismissed_at IS NULL",
             StatusFilter::Posted => "AND posted_at IS NOT NULL",
-            StatusFilter::All => "",
+            StatusFilter::Dismissed => "AND dismissed_at IS NOT NULL",
+            StatusFilter::All => "AND dismissed_at IS NULL",
         }
     }
 }
@@ -53,7 +56,7 @@ where
                publish_status, publish_attempts, publish_error, publish_error_at,
                thread_position, reply_to_tweet_id, posted_at, tweet_id
         FROM tweet_collateral
-        WHERE user_id = $1 AND posted_at IS NULL AND thread_id IS NULL
+        WHERE user_id = $1 AND posted_at IS NULL AND dismissed_at IS NULL AND thread_id IS NULL
         ORDER BY created_at DESC
         "#,
     )
@@ -204,7 +207,7 @@ where
                COALESCE(media_options, '[]'::jsonb) as media_options,
                rationale
         FROM tweet_collateral
-        WHERE id = $1 AND user_id = $2 AND posted_at IS NULL
+        WHERE id = $1 AND user_id = $2 AND posted_at IS NULL AND dismissed_at IS NULL
         "#,
     )
     .bind(tweet_id)
@@ -301,7 +304,7 @@ where
     Ok(result.rows_affected() > 0)
 }
 
-/// Delete a pending tweet
+/// Soft-delete a pending tweet (sets dismissed_at instead of removing the row)
 pub async fn delete_tweet<'e, E>(
     executor: E,
     tweet_id: i64,
@@ -312,8 +315,10 @@ where
 {
     let result = sqlx::query(
         r#"
-        DELETE FROM tweet_collateral
-        WHERE id = $1 AND user_id = $2 AND posted_at IS NULL
+        UPDATE tweet_collateral
+        SET dismissed_at = NOW(),
+            publish_status = 'dismissed'
+        WHERE id = $1 AND user_id = $2 AND posted_at IS NULL AND dismissed_at IS NULL
         "#,
     )
     .bind(tweet_id)

@@ -43,6 +43,12 @@ api:
     # JWT_SECRET: ...
     # GOOGLE_GEMINI_API_KEY: ...
     # REDUCTO_API_KEY: ...
+  # Local storage for captures (instead of or alongside GCS)
+  localStorage:
+    enabled: false
+    hostPath: ""       # e.g. /home/crow/cleo-data
+    mountPath: "/data"
+    size: "500Gi"
 
 # Web configuration
 web:
@@ -104,6 +110,20 @@ ingress:
   #  - secretName: cleo-tls
   #    hosts:
   #      - cleo.example.com
+
+# Media server (serves capture files to local LLMs)
+mediaServer:
+  enabled: false
+  replicas: 1
+  gcsBucket: "cleo_multimedia_data"
+  env: {}
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "50m"
+    limits:
+      memory: "256Mi"
+      cpu: "200m"
 
 # External secrets (if using external-secrets operator or sealed-secrets)
 externalSecrets:

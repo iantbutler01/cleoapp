@@ -121,12 +121,12 @@ pub enum EditParams {
 /// Media Studio service for editing operations
 pub struct MediaStudio {
     db: PgPool,
-    gcs: Storage,
+    gcs: Option<Storage>,
     local_storage_path: Option<PathBuf>,
 }
 
 impl MediaStudio {
-    pub fn new(db: PgPool, gcs: Storage, local_storage_path: Option<PathBuf>) -> Self {
+    pub fn new(db: PgPool, gcs: Option<Storage>, local_storage_path: Option<PathBuf>) -> Self {
         Self {
             db,
             gcs,
@@ -256,10 +256,9 @@ impl MediaStudio {
             tokio::fs::read(&full_path)
                 .await
                 .map_err(|e| MediaStudioError::Storage(format!("Local read failed: {}", e)))
-        } else {
+        } else if let Some(ref gcs) = self.gcs {
             let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
-            let mut resp = self
-                .gcs
+            let mut resp = gcs
                 .read_object(&bucket, gcs_path)
                 .send()
                 .await
@@ -272,6 +271,8 @@ impl MediaStudio {
                 data.extend_from_slice(&bytes);
             }
             Ok(data)
+        } else {
+            Err(MediaStudioError::Storage("No storage backend configured".to_string()))
         }
     }
 
@@ -287,15 +288,17 @@ impl MediaStudio {
                 .await
                 .map_err(|e| MediaStudioError::Storage(format!("Local write failed: {}", e)))?;
             println!("[media_studio] LOCAL: Saved edited capture to {:?}", full_path);
-        } else {
+        } else if let Some(ref gcs) = self.gcs {
             let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
             let bytes = Bytes::copy_from_slice(data);
-            self.gcs
+            gcs
                 .write_object(&bucket, path, bytes)
                 .send_buffered()
                 .await
                 .map_err(|e| MediaStudioError::Storage(format!("GCS write failed: {}", e)))?;
             println!("[media_studio] GCS: Uploaded edited capture to {}", path);
+        } else {
+            return Err(MediaStudioError::Storage("No storage backend configured".to_string()));
         }
         Ok(())
     }

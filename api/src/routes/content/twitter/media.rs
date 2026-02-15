@@ -181,10 +181,10 @@ pub async fn fetch_capture_data(
         tokio::fs::read(&full_path)
             .await
             .map_err(|e| format!("Failed to read local file {:?}: {}", full_path, e))?
-    } else {
+    } else if let Some(ref gcs) = state.gcs {
         // Download from GCS
         let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
-        let mut resp = state.gcs.read_object(&bucket, &gcs_path)
+        let mut resp = gcs.read_object(&bucket, &gcs_path)
             .send()
             .await
             .map_err(|e| format!("GCS read error: {}", e))?;
@@ -195,6 +195,8 @@ pub async fn fetch_capture_data(
             data.extend_from_slice(&bytes);
         }
         data
+    } else {
+        return Err("No storage backend configured".to_string());
     };
 
     Ok((data, content_type))
@@ -224,10 +226,10 @@ pub async fn fetch_capture_data_from_path(
         tokio::fs::read(&full_path)
             .await
             .map_err(|e| format!("Failed to read local file {:?}: {}", full_path, e))
-    } else {
+    } else if let Some(ref gcs) = state.gcs {
         // Download from GCS
         let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
-        let mut resp = state.gcs.read_object(&bucket, gcs_path)
+        let mut resp = gcs.read_object(&bucket, gcs_path)
             .send()
             .await
             .map_err(|e| format!("GCS read error: {}", e))?;
@@ -238,5 +240,7 @@ pub async fn fetch_capture_data_from_path(
             data.extend_from_slice(&bytes);
         }
         Ok(data)
+    } else {
+        Err("No storage backend configured".to_string())
     }
 }

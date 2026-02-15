@@ -32,7 +32,7 @@ use services::twitter::TwitterClient;
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
-    pub gcs: Storage,
+    pub gcs: Option<Storage>,
     pub twitter: TwitterClient,
     /// Optional local storage path - if set, captures are written to disk instead of GCS
     pub local_storage_path: Option<PathBuf>,
@@ -114,11 +114,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("[startup] Database pool: {} max connections", pool_size);
 
-    // GCS client uses GOOGLE_APPLICATION_CREDENTIALS env var
-    let gcs = Storage::builder()
-        .build()
-        .await
-        .expect("Failed to create GCS client");
+    // GCS client (optional - requires GOOGLE_APPLICATION_CREDENTIALS)
+    let gcs = match Storage::builder().build().await {
+        Ok(client) => {
+            println!("[startup] GCS client initialized");
+            Some(client)
+        }
+        Err(e) => {
+            println!("[startup] GCS client not available: {} (local storage only)", e);
+            None
+        }
+    };
 
     // Gemini client for File API operations (optional - if not set, background agent is disabled)
     let gemini = match std::env::var("GOOGLE_GEMINI_API_KEY") {
@@ -217,22 +223,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|&v| v >= 30)
         .unwrap_or(5 * 60);
 
-    // Start background scheduler for idle user processing (only if Gemini is configured)
-    if let Some(gemini_client) = state.gemini.clone() {
+    // Start background scheduler for idle user processing
+    // Runs when either Gemini API key or LOCAL_LLM is configured
+    let local_llm_configured = std::env::var("LOCAL_LLM").is_ok();
+    if state.gemini.is_some() || local_llm_configured {
+        let backend = if local_llm_configured { "local LLM" } else { "Gemini" };
         tokio::spawn(agent::start_background_scheduler(
             pool.clone(),
             gcs.clone(),
-            gemini_client,
+            state.gemini.clone(),
             agent_idle_minutes,
             agent_check_interval_secs,
             local_storage_path.clone(),
         ));
         println!(
-            "[scheduler] Background scheduler started ({}min idle, {}s check)",
-            agent_idle_minutes, agent_check_interval_secs
+            "[scheduler] Background scheduler started ({} backend, {}min idle, {}s check)",
+            backend, agent_idle_minutes, agent_check_interval_secs
         );
     } else {
-        println!("[scheduler] Background scheduler DISABLED (no Gemini API key)");
+        println!("[scheduler] Background scheduler DISABLED (no Gemini API key or LOCAL_LLM)");
     }
 
     // Start thumbnail background worker

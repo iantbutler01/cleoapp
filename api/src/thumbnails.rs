@@ -38,7 +38,7 @@ impl From<chrono::DateTime<chrono::Utc>> for ThumbnailJob {
 #[derive(Clone)]
 pub struct ThumbnailContext {
     pub pool: PgPool,
-    pub gcs: google_cloud_storage::client::Storage,
+    pub gcs: Option<google_cloud_storage::client::Storage>,
     pub local_storage_path: Option<PathBuf>,
     pub bucket_name: String,
 }
@@ -66,7 +66,7 @@ async fn process_thumbnail_job(
 /// Start the thumbnail worker
 pub async fn run_thumbnail_worker(
     pool: PgPool,
-    gcs: google_cloud_storage::client::Storage,
+    gcs: Option<google_cloud_storage::client::Storage>,
     local_storage_path: Option<PathBuf>,
     bucket_name: String,
 ) {
@@ -150,7 +150,7 @@ async fn process_thumbnail_batch(
         let bucket = ctx.bucket_name.clone();
 
         tasks.spawn(async move {
-            let result = process_single_capture(&pool, &ctx_gcs, local_path.as_ref(), &bucket, &capture).await;
+            let result = process_single_capture(&pool, ctx_gcs.as_ref(), local_path.as_ref(), &bucket, &capture).await;
 
             if let Err(ref e) = result {
                 let full_path = local_path.as_ref().map(|p| p.join(&capture.gcs_path));
@@ -200,7 +200,7 @@ async fn process_thumbnail_batch(
 
 async fn process_single_capture(
     pool: &PgPool,
-    gcs: &google_cloud_storage::client::Storage,
+    gcs: Option<&google_cloud_storage::client::Storage>,
     local_storage_path: Option<&PathBuf>,
     bucket_name: &str,
     capture: &CaptureForThumbnail,
@@ -252,7 +252,7 @@ async fn process_single_capture(
 }
 
 async fn download_capture(
-    gcs: &google_cloud_storage::client::Storage,
+    gcs: Option<&google_cloud_storage::client::Storage>,
     local_storage_path: Option<&PathBuf>,
     bucket_name: &str,
     gcs_path: &str,
@@ -261,7 +261,7 @@ async fn download_capture(
         // Read from local filesystem
         let full_path = local_path.join(gcs_path);
         Ok(tokio::fs::read(&full_path).await?)
-    } else {
+    } else if let Some(gcs) = gcs {
         // Download from GCS (streaming response)
         let bucket = format!("projects/_/buckets/{}", bucket_name);
         let mut resp = gcs.read_object(&bucket, gcs_path).send().await?;
@@ -270,11 +270,13 @@ async fn download_capture(
             data.extend_from_slice(&chunk?);
         }
         Ok(data)
+    } else {
+        Err("No storage backend configured (set LOCAL_STORAGE_PATH or GOOGLE_APPLICATION_CREDENTIALS)".into())
     }
 }
 
 async fn upload_thumbnail(
-    gcs: &google_cloud_storage::client::Storage,
+    gcs: Option<&google_cloud_storage::client::Storage>,
     local_storage_path: Option<&PathBuf>,
     bucket_name: &str,
     thumbnail_path: &str,
@@ -288,7 +290,7 @@ async fn upload_thumbnail(
         }
         tokio::fs::write(&full_path, data).await?;
         println!("[thumbnails] LOCAL: Saved thumbnail to {:?}", full_path);
-    } else {
+    } else if let Some(gcs) = gcs {
         // Upload to GCS (convert to Bytes for the API)
         let bucket = format!("projects/_/buckets/{}", bucket_name);
         let bytes = Bytes::copy_from_slice(data);
@@ -296,13 +298,15 @@ async fn upload_thumbnail(
             .send_buffered()
             .await?;
         println!("[thumbnails] GCS: Uploaded thumbnail to {}", thumbnail_path);
+    } else {
+        return Err("No storage backend configured".into());
     }
     Ok(())
 }
 
 /// Delete a thumbnail from storage (for cleanup on DB failure)
 async fn delete_thumbnail(
-    _gcs: &google_cloud_storage::client::Storage,
+    _gcs: Option<&google_cloud_storage::client::Storage>,
     local_storage_path: Option<&PathBuf>,
     bucket_name: &str,
     thumbnail_path: &str,

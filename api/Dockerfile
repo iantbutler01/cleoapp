@@ -27,8 +27,9 @@ RUN apt-get update && apt-get install -y \
     postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the binary
+# Copy binaries
 COPY --from=builder /app/target/release/api /app/api
+COPY --from=builder /app/target/release/media_server /app/media_server
 
 # Copy migrations
 COPY migrations ./migrations
