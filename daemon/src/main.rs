@@ -547,7 +547,7 @@ impl CleoDaemon {
 
     fn stop_batch_uploader(&self) {
         if let Some(uploader) = self.batch_uploader.borrow_mut().take() {
-            uploader.shutdown();
+            uploader.stop();
         }
     }
 
@@ -2131,7 +2131,6 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, CaptureEr
 /// - Deletes all files (pass or fail)
 struct BatchUploader {
     stop: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
 }
 
 impl BatchUploader {
@@ -2140,7 +2139,7 @@ impl BatchUploader {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
 
-        let handle = thread::spawn(move || {
+        thread::spawn(move || {
             eprintln!("[DEBUG] BatchUploader thread spawned");
             // Create our own API client and content filter
             eprintln!("[DEBUG] BatchUploader: building API client");
@@ -2195,15 +2194,13 @@ impl BatchUploader {
             eprintln!("[DEBUG] BatchUploader: thread exiting");
         });
 
-        Self {
-            stop,
-            handle: Some(handle),
-        }
+        Self { stop }
     }
 
-    fn shutdown(mut self) {
+    fn stop(self) {
         self.stop.store(true, Ordering::Relaxed);
-        join_task_handle(&mut self.handle, "batch uploader");
+        // Keep termination responsive: the uploader may be inside a long
+        // classify/upload call, so we avoid blocking the main thread on join.
     }
 
     fn process_pending(
