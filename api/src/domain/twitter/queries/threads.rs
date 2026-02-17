@@ -4,8 +4,8 @@
 //! both `&PgPool` (for standalone queries) and `&mut PgConnection` (for transactions).
 
 use chrono::{DateTime, Utc};
-use sqlx::{Executor, Postgres, QueryBuilder};
 use sqlx::types::Json;
+use sqlx::{Executor, Postgres, QueryBuilder};
 
 use super::super::models::{Thread, ThreadStatus, ThreadWithTweets, Tweet, TweetForPosting};
 
@@ -147,7 +147,10 @@ where
     // Note: This requires a second executor call. For transactional use,
     // caller should use get_thread_tweets separately or we need a pool reference.
     // For now, this function works best with a pool.
-    Ok(Some(ThreadWithTweets { thread, tweets: vec![] }))
+    Ok(Some(ThreadWithTweets {
+        thread,
+        tweets: vec![],
+    }))
 }
 
 /// Get tweets in a thread
@@ -211,13 +214,12 @@ pub async fn get_thread_status<'e, E>(
 where
     E: Executor<'e, Database = Postgres>,
 {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT status FROM tweet_threads WHERE id = $1 AND user_id = $2"
-    )
-    .bind(thread_id)
-    .bind(user_id)
-    .fetch_optional(executor)
-    .await?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM tweet_threads WHERE id = $1 AND user_id = $2")
+            .bind(thread_id)
+            .bind(user_id)
+            .fetch_optional(executor)
+            .await?;
 
     Ok(row.map(|(s,)| ThreadStatus::from_str(&s)))
 }
@@ -337,7 +339,7 @@ where
     let result = sqlx::query(
         "UPDATE tweet_threads
          SET status = 'posting'
-         WHERE id = $1 AND user_id = $2 AND status IN ('draft', 'partial_failed')"
+         WHERE id = $1 AND user_id = $2 AND status IN ('draft', 'partial_failed')",
     )
     .bind(thread_id)
     .bind(user_id)
@@ -356,13 +358,12 @@ pub async fn thread_exists<'e, E>(
 where
     E: Executor<'e, Database = Postgres>,
 {
-    let exists: Option<(i64,)> = sqlx::query_as(
-        "SELECT id FROM tweet_threads WHERE id = $1 AND user_id = $2"
-    )
-    .bind(thread_id)
-    .bind(user_id)
-    .fetch_optional(executor)
-    .await?;
+    let exists: Option<(i64,)> =
+        sqlx::query_as("SELECT id FROM tweet_threads WHERE id = $1 AND user_id = $2")
+            .bind(thread_id)
+            .bind(user_id)
+            .fetch_optional(executor)
+            .await?;
 
     Ok(exists.is_some())
 }
@@ -809,11 +810,15 @@ where
     }
 
     if let Some(image_capture_ids) = image_capture_ids {
-        separated.push("image_capture_ids = ").push_bind_unseparated(image_capture_ids);
+        separated
+            .push("image_capture_ids = ")
+            .push_bind_unseparated(image_capture_ids);
     }
 
     if let Some(video_clip) = video_clip {
-        separated.push("video_clip = ").push_bind_unseparated(video_clip);
+        separated
+            .push("video_clip = ")
+            .push_bind_unseparated(video_clip);
     }
 
     builder.push(" WHERE id = ");

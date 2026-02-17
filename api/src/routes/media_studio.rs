@@ -2,7 +2,10 @@
 
 use axum::{
     Json, Router,
-    extract::{State, WebSocketUpgrade, ws::{Message, WebSocket}},
+    extract::{
+        State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -114,35 +117,70 @@ async fn handle_edit_ws(socket: WebSocket, state: Arc<AppState>, user_id: i64) {
             percent: 0,
             status: "Starting...".into(),
         };
-        let _ = sender.send(Message::Text(serde_json::to_string(&progress).unwrap().into())).await;
+        let _ = sender
+            .send(Message::Text(
+                serde_json::to_string(&progress).unwrap().into(),
+            ))
+            .await;
 
         // Execute command
         let result = match cmd {
-            EditCommand::Crop { capture_id, x, y, width, height } => {
+            EditCommand::Crop {
+                capture_id,
+                x,
+                y,
+                width,
+                height,
+            } => {
                 // Send progress (processing)
                 let progress = EditResponse::Progress {
                     percent: 30,
                     status: "Cropping image...".into(),
                 };
-                let _ = sender.send(Message::Text(serde_json::to_string(&progress).unwrap().into())).await;
+                let _ = sender
+                    .send(Message::Text(
+                        serde_json::to_string(&progress).unwrap().into(),
+                    ))
+                    .await;
 
                 media_studio
-                    .crop_image(user_id, capture_id, CropParams { x, y, width, height })
+                    .crop_image(
+                        user_id,
+                        capture_id,
+                        CropParams {
+                            x,
+                            y,
+                            width,
+                            height,
+                        },
+                    )
                     .await
             }
-            EditCommand::Trim { capture_id, start, duration } => {
+            EditCommand::Trim {
+                capture_id,
+                start,
+                duration,
+            } => {
                 // Send progress (processing)
                 let progress = EditResponse::Progress {
                     percent: 30,
                     status: "Trimming video...".into(),
                 };
-                let _ = sender.send(Message::Text(serde_json::to_string(&progress).unwrap().into())).await;
+                let _ = sender
+                    .send(Message::Text(
+                        serde_json::to_string(&progress).unwrap().into(),
+                    ))
+                    .await;
 
                 media_studio
-                    .trim_video(user_id, capture_id, TrimParams {
-                        start_timestamp: start,
-                        duration_secs: duration,
-                    })
+                    .trim_video(
+                        user_id,
+                        capture_id,
+                        TrimParams {
+                            start_timestamp: start,
+                            duration_secs: duration,
+                        },
+                    )
                     .await
             }
         };
@@ -150,7 +188,9 @@ async fn handle_edit_ws(socket: WebSocket, state: Arc<AppState>, user_id: i64) {
         // Send result
         let response = match result {
             Ok(new_capture_id) => EditResponse::Complete { new_capture_id },
-            Err(e) => EditResponse::Error { message: e.to_string() },
+            Err(e) => EditResponse::Error {
+                message: e.to_string(),
+            },
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -198,12 +238,16 @@ async fn crop_image(
     );
 
     let new_capture_id = media_studio
-        .crop_image(user_id, req.capture_id, CropParams {
-            x: req.x,
-            y: req.y,
-            width: req.width,
-            height: req.height,
-        })
+        .crop_image(
+            user_id,
+            req.capture_id,
+            CropParams {
+                x: req.x,
+                y: req.y,
+                width: req.width,
+                height: req.height,
+            },
+        )
         .await
         .map_err(|e| {
             eprintln!("[media_studio] Crop error: {}", e);
@@ -231,10 +275,14 @@ async fn trim_video(
     );
 
     let new_capture_id = media_studio
-        .trim_video(user_id, req.capture_id, TrimParams {
-            start_timestamp: req.start,
-            duration_secs: req.duration,
-        })
+        .trim_video(
+            user_id,
+            req.capture_id,
+            TrimParams {
+                start_timestamp: req.start,
+                duration_secs: req.duration,
+            },
+        )
         .await
         .map_err(|e| {
             eprintln!("[media_studio] Trim error: {}", e);

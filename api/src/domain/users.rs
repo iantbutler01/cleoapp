@@ -18,10 +18,8 @@ pub async fn get_user_by_id<'e, E>(
 where
     E: Executor<'e, Database = Postgres>,
 {
-    sqlx::query_as(
-        "SELECT twitter_username FROM users WHERE id = $1"
-    )
-    .bind(user_id)
-    .fetch_optional(executor)
-    .await
+    sqlx::query_as("SELECT twitter_username FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(executor)
+        .await
 }

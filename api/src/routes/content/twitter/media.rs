@@ -1,18 +1,22 @@
 //! Shared media upload utilities for Twitter routes
 
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use crate::AppState;
 use crate::constants::BUCKET_NAME;
 use crate::domain::captures;
 use crate::domain::twitter::TweetForPosting;
-use crate::AppState;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// Progress message for WebSocket
 #[derive(Clone, serde::Serialize)]
 #[serde(tag = "type")]
 pub enum UploadProgress {
     #[serde(rename = "uploading")]
-    Uploading { segment: usize, total: usize, percent: u8 },
+    Uploading {
+        segment: usize,
+        total: usize,
+        percent: u8,
+    },
     #[serde(rename = "processing")]
     Processing,
 }
@@ -103,11 +107,14 @@ pub async fn upload_tweet_media_with_progress<T: From<UploadProgress> + Send + '
                         } else {
                             0
                         };
-                        let _ = progress_tx_clone.try_send(UploadProgress::Uploading {
-                            segment,
-                            total,
-                            percent,
-                        }.into());
+                        let _ = progress_tx_clone.try_send(
+                            UploadProgress::Uploading {
+                                segment,
+                                total,
+                                percent,
+                            }
+                            .into(),
+                        );
                     },
                 )
                 .await
@@ -136,11 +143,16 @@ pub async fn upload_tweet_media_with_progress<T: From<UploadProgress> + Send + '
         for (idx, capture_id) in capture_ids.iter().enumerate() {
             // Send progress for image uploads
             let percent = ((idx as f32 / total_images as f32) * 100.0) as u8;
-            let _ = progress_tx.send(UploadProgress::Uploading {
-                segment: idx,
-                total: total_images,
-                percent,
-            }.into()).await;
+            let _ = progress_tx
+                .send(
+                    UploadProgress::Uploading {
+                        segment: idx,
+                        total: total_images,
+                        percent,
+                    }
+                    .into(),
+                )
+                .await;
 
             let capture_info = captures
                 .get(capture_id)
@@ -184,7 +196,8 @@ pub async fn fetch_capture_data(
     } else if let Some(ref gcs) = state.gcs {
         // Download from GCS
         let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
-        let mut resp = gcs.read_object(&bucket, &gcs_path)
+        let mut resp = gcs
+            .read_object(&bucket, &gcs_path)
             .send()
             .await
             .map_err(|e| format!("GCS read error: {}", e))?;
@@ -229,7 +242,8 @@ pub async fn fetch_capture_data_from_path(
     } else if let Some(ref gcs) = state.gcs {
         // Download from GCS
         let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
-        let mut resp = gcs.read_object(&bucket, gcs_path)
+        let mut resp = gcs
+            .read_object(&bucket, gcs_path)
             .send()
             .await
             .map_err(|e| format!("GCS read error: {}", e))?;

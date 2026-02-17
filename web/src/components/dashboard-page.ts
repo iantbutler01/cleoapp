@@ -27,6 +27,9 @@ export class DashboardPage extends LitElement {
   @state() viewMode: "queue" | "sent" = "queue";
   @state() showNudgesModal = false;
   @state() notificationPermission: NotificationPermission | "unsupported" = "unsupported";
+  @state() private agentRunning = false;
+  @state() private bulkRejecting = false;
+  @state() private bulkActionError: string | null = null;
 
   private readonly pollIntervalMs = 45_000;
   private pollTimer: number | null = null;
@@ -461,6 +464,103 @@ export class DashboardPage extends LitElement {
     `;
   }
 
+  private async runAgent() {
+    if (this.agentRunning) return;
+    this.agentRunning = true;
+    try {
+      const res = await api.triggerAgentRun();
+      if (res.status !== "already_running") {
+        this.dispatchEvent(
+          new CustomEvent("agent-run-started", { bubbles: true, composed: true })
+        );
+      }
+      this.pollAgentStatus();
+    } catch (e) {
+      console.error("Failed to trigger agent run:", e);
+      this.agentRunning = false;
+    }
+  }
+
+  private async rejectAllPending() {
+    if (this.bulkRejecting) return;
+
+    const confirmation = window.confirm(
+      "Reject all pending tweets and threads? This cannot be undone.",
+    );
+    if (!confirmation) return;
+
+    this.bulkRejecting = true;
+    this.bulkActionError = null;
+
+    try {
+      const batchSize = 100;
+      let rejectedCount = 0;
+      let failedCount = 0;
+
+      while (true) {
+        const pending = await api.getContent({
+          platform: "twitter",
+          status: "pending",
+          limit: batchSize,
+          offset: 0,
+        });
+
+        if (pending.items.length === 0) {
+          break;
+        }
+
+        const actions = pending.items.map((item) =>
+          item.type === "tweet"
+            ? api.dismissTweet(item.id)
+            : api.deleteThread(item.thread.id),
+        );
+
+        const results = await Promise.allSettled(actions);
+        const batchRejected = results.filter((result) => result.status === "fulfilled").length;
+        const batchFailed = results.length - batchRejected;
+
+        rejectedCount += batchRejected;
+        failedCount += batchFailed;
+
+        // Prevent infinite loop when every item in a batch fails.
+        if (batchRejected === 0 && batchFailed > 0) {
+          break;
+        }
+      }
+
+      if (failedCount > 0) {
+        throw new Error(
+          `Rejected ${rejectedCount} items, but ${failedCount} failed. Try running Reject all again.`,
+        );
+      }
+
+      if (this.viewMode === "queue") {
+        await this.loadData();
+      }
+    } catch (e) {
+      console.error("Failed to reject all pending content:", e);
+      this.bulkActionError =
+        e instanceof Error ? e.message : "Failed to reject all pending content";
+    } finally {
+      this.bulkRejecting = false;
+    }
+  }
+
+  private async pollAgentStatus() {
+    const poll = async () => {
+      try {
+        const { running } = await api.getAgentStatus();
+        this.agentRunning = running;
+        if (running) {
+          setTimeout(poll, 3000);
+        }
+      } catch {
+        this.agentRunning = false;
+      }
+    };
+    setTimeout(poll, 3000);
+  }
+
   render() {
     if (this.loadError) {
       return html`
@@ -502,19 +602,60 @@ export class DashboardPage extends LitElement {
               >Cleo</span
             >
           </div>
-          <div class="flex-none gap-2">
-            <button
-              class="btn btn-ghost btn-sm lg:hidden"
-              @click=${() => (this.showNudgesModal = true)}
-            >
-              Nudges
-            </button>
-            <button
-              class="btn btn-ghost btn-sm lg:hidden"
-              @click=${() => this.requestNotificationPermission()}
-            >
-              Notify
-            </button>
+          <div class="flex-none flex items-center gap-1 sm:gap-2">
+            <div class="dropdown dropdown-end lg:hidden">
+              <div tabindex="0" role="button" class="btn btn-ghost btn-sm btn-square">
+                <svg
+                  class="w-5 h-5"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="2"
+                    d="M4 6h16M4 12h16M4 18h16"
+                  />
+                </svg>
+              </div>
+              <ul
+                tabindex="0"
+                class="menu menu-sm dropdown-content bg-base-100 rounded-lg z-10 mt-2 w-44 p-1 shadow-lg border border-base-200"
+              >
+                <li>
+                  <a @click=${() => (this.showNudgesModal = true)} class="rounded-md">
+                    Voice & Style
+                  </a>
+                </li>
+                <li>
+                  <a
+                    @click=${() => this.requestNotificationPermission()}
+                    class="rounded-md ${this.notificationPermission === "granted"
+                      ? "text-success"
+                      : this.notificationPermission === "unsupported"
+                        ? "pointer-events-none opacity-50"
+                        : ""}"
+                  >
+                    ${this.notificationPermission === "granted"
+                      ? "Notifications enabled"
+                      : this.notificationPermission === "denied"
+                        ? "Notifications blocked"
+                        : "Enable notifications"}
+                  </a>
+                </li>
+                <li>
+                  <a
+                    @click=${this.runAgent}
+                    class="rounded-md ${this.agentRunning ? "pointer-events-none opacity-50" : ""}"
+                  >
+                    ${this.agentRunning
+                      ? html`<span class="loading loading-spinner loading-xs"></span>Agent running...`
+                      : "Run Agent"}
+                  </a>
+                </li>
+              </ul>
+            </div>
             <div class="dropdown dropdown-end">
               <div
                 tabindex="0"
@@ -529,9 +670,9 @@ export class DashboardPage extends LitElement {
                     "?"}</span
                   >
                 </div>
-                <span class="text-sm">@${this.user?.username}</span>
+                <span class="hidden sm:inline text-sm">@${this.user?.username}</span>
                 <svg
-                  class="w-4 h-4 opacity-50"
+                  class="hidden sm:block w-4 h-4 opacity-50"
                   fill="none"
                   stroke="currentColor"
                   viewBox="0 0 24 24"
@@ -623,6 +764,33 @@ export class DashboardPage extends LitElement {
             `
           : ""}
 
+        ${this.bulkActionError
+          ? html`
+              <div class="alert alert-error mx-6 mt-2">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  class="stroke-current shrink-0 h-5 w-5"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="2"
+                    d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"
+                  />
+                </svg>
+                <span>${this.bulkActionError}</span>
+                <button
+                  class="btn btn-ghost btn-xs"
+                  @click=${() => (this.bulkActionError = null)}
+                >
+                  Dismiss
+                </button>
+              </div>
+            `
+          : ""}
+
         <!-- Stack-Based Layout (Grid + Scroll Container) -->
         <div class="flex flex-col lg:flex-row h-auto lg:h-[calc(100vh-65px)]">
           <!-- Left Sidebar - Toolbar -->
@@ -634,7 +802,7 @@ export class DashboardPage extends LitElement {
 
           <!-- Center - Single Item View -->
           <div
-            class="flex-1 flex flex-col items-center justify-start min-h-[calc(100vh-65px)] p-4 sm:p-6 lg:p-8 relative"
+            class="flex-1 flex flex-col items-center justify-start min-h-[calc(100vh-65px)] p-4 sm:p-6 lg:p-8 relative overflow-x-hidden"
           >
             ${this.loading || this.refreshing
               ? html`
@@ -758,7 +926,9 @@ export class DashboardPage extends LitElement {
                   Post all pending
                 </button>
                 <button
-                  class="btn btn-ghost btn-sm w-full justify-start gap-2 text-base-content/70"
+                  class="btn btn-ghost btn-sm w-full justify-start gap-2 text-error hover:text-error"
+                  @click=${this.rejectAllPending}
+                  ?disabled=${this.bulkRejecting}
                 >
                   <svg
                     class="w-4 h-4"
@@ -773,7 +943,9 @@ export class DashboardPage extends LitElement {
                       d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
                     />
                   </svg>
-                  Clear dismissed
+                  ${this.bulkRejecting
+                    ? html`<span class="loading loading-spinner loading-xs"></span>Rejecting...`
+                    : "Reject all pending"}
                 </button>
               </div>
             </div>

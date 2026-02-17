@@ -10,11 +10,11 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::sync::Arc;
 
-use crate::constants::BUCKET_NAME;
-use crate::services::twitter;
-use crate::AppState;
 use super::auth::AuthUser;
 use super::captures::get_user_id_from_bearer;
+use crate::AppState;
+use crate::constants::BUCKET_NAME;
+use crate::services::twitter;
 
 /// User API response DTO
 #[derive(Debug, Serialize)]

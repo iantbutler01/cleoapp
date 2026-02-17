@@ -1,7 +1,7 @@
-pub mod tweets;
-pub mod threads;
-pub mod media;
 mod dto;
+pub mod media;
+pub mod threads;
+pub mod tweets;
 
 // Re-export DTOs for parent content/mod.rs
 pub use dto::{ThreadWithTweetsResponse, TweetResponse};

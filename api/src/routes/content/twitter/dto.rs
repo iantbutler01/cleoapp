@@ -23,6 +23,7 @@ pub struct TweetResponse {
     pub publish_status: String,
     pub publish_attempts: i32,
     pub publish_error: Option<String>,
+    pub publish_error_at: Option<DateTime<Utc>>,
 }
 
 impl From<Tweet> for TweetResponse {
@@ -43,6 +44,7 @@ impl From<Tweet> for TweetResponse {
             publish_status: t.publish_status,
             publish_attempts: t.publish_attempts,
             publish_error: t.publish_error,
+            publish_error_at: t.publish_error_at,
         }
     }
 }

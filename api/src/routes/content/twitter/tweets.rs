@@ -2,7 +2,10 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State, WebSocketUpgrade, ws::{Message, WebSocket}},
+    extract::{
+        Path, Query, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post},
@@ -13,17 +16,17 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+use super::dto::TweetResponse;
+use super::media::{UploadProgress, upload_tweet_media, upload_tweet_media_with_progress};
 use crate::AppState;
-use crate::domain::twitter::{tweets, queries::threads as thread_queries};
+use crate::constants::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
+use crate::domain::twitter::{queries::threads as thread_queries, tweets};
 use crate::routes::auth::AuthUser;
 use crate::routes::nudges::get_sanitized_nudges;
 use crate::services::{auth, error::LogErr, session, twitter};
-use crate::constants::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
 use reson_agentic::providers::{GenerationConfig, InferenceClient};
 use reson_agentic::types::ChatMessage;
 use reson_agentic::utils::ConversationMessage;
-use super::dto::TweetResponse;
-use super::media::{upload_tweet_media, upload_tweet_media_with_progress, UploadProgress};
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -62,9 +65,10 @@ async fn list_tweets(
         .await
         .log_500("Count tweets error")?;
 
-    let result = tweets::list_pending_tweets_paginated(&state.db, user_id, status_filter, limit, offset)
-        .await
-        .log_500("List tweets error")?;
+    let result =
+        tweets::list_pending_tweets_paginated(&state.db, user_id, status_filter, limit, offset)
+            .await
+            .log_500("List tweets error")?;
 
     let has_more = offset + (result.len() as i64) < total;
 
@@ -87,7 +91,10 @@ async fn post_tweet(
     AuthUser(user_id): AuthUser,
     Path(tweet_collateral_id): Path<i64>,
 ) -> Result<Json<PostTweetResponse>, StatusCode> {
-    println!("[post_tweet] Handler called for tweet_collateral_id={}", tweet_collateral_id);
+    println!(
+        "[post_tweet] Handler called for tweet_collateral_id={}",
+        tweet_collateral_id
+    );
     println!("[post_tweet] user_id={}", user_id);
 
     // Get the tweet with media info
@@ -110,7 +117,8 @@ async fn post_tweet(
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
     // Ensure token is valid (refresh if needed)
-    let access_token = auth::ensure_valid_access_token(&state.db, &state.twitter, user_id, tokens).await?;
+    let access_token =
+        auth::ensure_valid_access_token(&state.db, &state.twitter, user_id, tokens).await?;
 
     let publish_result = (|| async {
         // Upload media if present
@@ -124,7 +132,10 @@ async fn post_tweet(
             .await
             .map_err(|e| e.to_string())?;
 
-        println!("[post_tweet] Media upload complete, got {} media_ids", media_ids.len());
+        println!(
+            "[post_tweet] Media upload complete, got {} media_ids",
+            media_ids.len()
+        );
 
         let media_ids_ref: Option<Vec<String>> = if media_ids.is_empty() {
             None
@@ -150,13 +161,9 @@ async fn post_tweet(
     match publish_result {
         Ok((tweet_id, text)) => Ok(Json(PostTweetResponse { tweet_id, text })),
         Err(error) => {
-            let _ = tweets::mark_tweet_publish_failed(
-                &state.db,
-                tweet_collateral_id,
-                user_id,
-                &error,
-            )
-            .await;
+            let _ =
+                tweets::mark_tweet_publish_failed(&state.db, tweet_collateral_id, user_id, &error)
+                    .await;
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -184,7 +191,11 @@ async fn dismiss_tweet(
 #[serde(tag = "type")]
 enum WsProgress {
     #[serde(rename = "uploading")]
-    Uploading { segment: usize, total: usize, percent: u8 },
+    Uploading {
+        segment: usize,
+        total: usize,
+        percent: u8,
+    },
     #[serde(rename = "processing")]
     Processing,
     #[serde(rename = "posting")]
@@ -198,9 +209,15 @@ enum WsProgress {
 impl From<UploadProgress> for WsProgress {
     fn from(p: UploadProgress) -> Self {
         match p {
-            UploadProgress::Uploading { segment, total, percent } => {
-                WsProgress::Uploading { segment, total, percent }
-            }
+            UploadProgress::Uploading {
+                segment,
+                total,
+                percent,
+            } => WsProgress::Uploading {
+                segment,
+                total,
+                percent,
+            },
             UploadProgress::Processing => WsProgress::Processing,
         }
     }
@@ -248,12 +265,15 @@ async fn handle_publish_ws(
     });
 
     // Do the actual work
-    let result = do_publish_with_progress(&state, user_id, tweet_collateral_id, progress_tx.clone()).await;
+    let result =
+        do_publish_with_progress(&state, user_id, tweet_collateral_id, progress_tx.clone()).await;
 
     // Send final message
     match result {
         Ok((tweet_id, text)) => {
-            let _ = progress_tx.send(WsProgress::Complete { tweet_id, text }).await;
+            let _ = progress_tx
+                .send(WsProgress::Complete { tweet_id, text })
+                .await;
         }
         Err(e) => {
             let _ = progress_tx.send(WsProgress::Error { message: e }).await;
@@ -294,7 +314,8 @@ async fn do_publish_with_progress(
             .ok_or("Not authenticated with Twitter")?;
 
         // Ensure token is valid (refresh if needed)
-        let access_token = auth::ensure_valid_access_token_str(&state.db, &state.twitter, user_id, tokens).await?;
+        let access_token =
+            auth::ensure_valid_access_token_str(&state.db, &state.twitter, user_id, tokens).await?;
 
         // Upload media with progress
         let media_ids = upload_tweet_media_with_progress(
@@ -335,13 +356,9 @@ async fn do_publish_with_progress(
     match publish_result {
         Ok((tweet_id, text)) => Ok((tweet_id, text)),
         Err(error) => {
-            let _ = tweets::mark_tweet_publish_failed(
-                &state.db,
-                tweet_collateral_id,
-                user_id,
-                &error,
-            )
-            .await;
+            let _ =
+                tweets::mark_tweet_publish_failed(&state.db, tweet_collateral_id, user_id, &error)
+                    .await;
             Err(error)
         }
     }
@@ -375,10 +392,7 @@ async fn regenerate_tweet(
 
     // Build the prompt
     let nudges_section = match nudges {
-        Some(n) if !n.trim().is_empty() => format!(
-            "\n\nUser's style preferences:\n{}\n",
-            n
-        ),
+        Some(n) if !n.trim().is_empty() => format!("\n\nUser's style preferences:\n{}\n", n),
         _ => String::new(),
     };
 
@@ -400,9 +414,7 @@ Rules:
 - Maintain the same general topic/message but vary the wording
 
 Respond with ONLY the new tweet text, nothing else."#,
-        tweet.text,
-        tweet.rationale,
-        nudges_section
+        tweet.text, tweet.rationale, nudges_section
     );
 
     // Call Gemini
@@ -418,6 +430,7 @@ Respond with ONLY the new tweet text, nothing else."#,
         thinking_budget: None,
         output_schema: None,
         output_type_name: None,
+        timeout: Some(std::time::Duration::from_secs(600)),
     };
 
     let response = gemini
@@ -433,7 +446,10 @@ Respond with ONLY the new tweet text, nothing else."#,
 
     // Validate length
     if new_text.is_empty() || new_text.len() > 280 {
-        eprintln!("[regenerate_tweet] Invalid generated text length: {}", new_text.len());
+        eprintln!(
+            "[regenerate_tweet] Invalid generated text length: {}",
+            new_text.len()
+        );
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -449,7 +465,10 @@ Respond with ONLY the new tweet text, nothing else."#,
     .await
     .log_500("Update tweet text error")?;
 
-    println!("[regenerate_tweet] Generated new text for tweet {}: {}", tweet_id, new_text);
+    println!(
+        "[regenerate_tweet] Generated new text for tweet {}: {}",
+        tweet_id, new_text
+    );
 
     Ok(Json(RegenerateTweetResponse { text: new_text }))
 }

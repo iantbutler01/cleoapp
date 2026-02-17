@@ -10,15 +10,18 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use std::sync::Arc;
 
-use crate::AppState;
 use super::auth::AuthUser;
+use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         // System personas (public, no auth required)
         .route("/personas", get(list_system_personas))
         // User's custom personas
-        .route("/me/personas", get(list_user_personas).post(create_user_persona))
+        .route(
+            "/me/personas",
+            get(list_user_personas).post(create_user_persona),
+        )
         .route("/me/personas/{id}", delete(delete_user_persona))
         // User's active nudges
         .route("/me/nudges", get(get_nudges).put(update_nudges))
@@ -80,7 +83,7 @@ async fn list_system_personas(
         FROM personas
         WHERE is_system = true
         ORDER BY name
-        "#
+        "#,
     )
     .fetch_all(&state.db)
     .await
@@ -107,7 +110,7 @@ async fn list_user_personas(
         FROM user_personas
         WHERE user_id = $1
         ORDER BY created_at DESC
-        "#
+        "#,
     )
     .bind(user_id)
     .fetch_all(&state.db)
@@ -127,16 +130,15 @@ async fn create_user_persona(
     Json(req): Json<CreatePersonaRequest>,
 ) -> Result<Json<UserPersonaResponse>, StatusCode> {
     // Get user's current nudges
-    let current_nudges: Option<String> = sqlx::query_scalar(
-        "SELECT nudges FROM users WHERE id = $1"
-    )
-    .bind(user_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        eprintln!("Failed to get user nudges: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let current_nudges: Option<String> =
+        sqlx::query_scalar("SELECT nudges FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| {
+                eprintln!("Failed to get user nudges: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     let nudges = current_nudges.ok_or_else(|| {
         eprintln!("Cannot save persona: user has no nudges set");
@@ -149,7 +151,7 @@ async fn create_user_persona(
         INSERT INTO user_personas (user_id, name, nudges)
         VALUES ($1, $2, $3)
         RETURNING id, name, nudges
-        "#
+        "#,
     )
     .bind(user_id)
     .bind(&req.name)
@@ -170,17 +172,15 @@ async fn delete_user_persona(
     AuthUser(user_id): AuthUser,
     Path(persona_id): Path<i64>,
 ) -> Result<StatusCode, StatusCode> {
-    let result = sqlx::query(
-        "DELETE FROM user_personas WHERE id = $1 AND user_id = $2"
-    )
-    .bind(persona_id)
-    .bind(user_id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| {
-        eprintln!("Failed to delete user persona: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let result = sqlx::query("DELETE FROM user_personas WHERE id = $1 AND user_id = $2")
+        .bind(persona_id)
+        .bind(user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| {
+            eprintln!("Failed to delete user persona: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     if result.rows_affected() == 0 {
         return Err(StatusCode::NOT_FOUND);
@@ -199,7 +199,7 @@ async fn get_nudges(
     AuthUser(user_id): AuthUser,
 ) -> Result<Json<NudgesResponse>, StatusCode> {
     let row = sqlx::query_as::<_, NudgesRow>(
-        "SELECT nudges, selected_persona_id FROM users WHERE id = $1"
+        "SELECT nudges, selected_persona_id FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_one(&state.db)
@@ -224,18 +224,16 @@ async fn update_nudges(
     // Sanitize nudges
     let sanitized = sanitize_nudges(&req.nudges);
 
-    sqlx::query(
-        "UPDATE users SET nudges = $1, selected_persona_id = $2 WHERE id = $3"
-    )
-    .bind(&sanitized)
-    .bind(req.selected_persona_id)
-    .bind(user_id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| {
-        eprintln!("Failed to update nudges: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    sqlx::query("UPDATE users SET nudges = $1, selected_persona_id = $2 WHERE id = $3")
+        .bind(&sanitized)
+        .bind(req.selected_persona_id)
+        .bind(user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| {
+            eprintln!("Failed to update nudges: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Json(NudgesResponse {
         nudges: Some(sanitized),
@@ -256,7 +254,13 @@ fn sanitize_nudges(input: &str) -> String {
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
 
     // Log suspicious patterns (don't block, just monitor)
-    let suspicious = ["ignore previous", "system prompt", "you are now", "disregard", "forget your instructions"];
+    let suspicious = [
+        "ignore previous",
+        "system prompt",
+        "you are now",
+        "disregard",
+        "forget your instructions",
+    ];
     for pattern in suspicious {
         if s.to_lowercase().contains(pattern) {
             eprintln!("[security] Suspicious nudge pattern detected: {}", pattern);
@@ -268,13 +272,11 @@ fn sanitize_nudges(input: &str) -> String {
 
 /// Get sanitized nudges for a user (used by agent)
 pub async fn get_sanitized_nudges(db: &PgPool, user_id: i64) -> Option<String> {
-    sqlx::query_scalar::<_, Option<String>>(
-        "SELECT nudges FROM users WHERE id = $1"
-    )
-    .bind(user_id)
-    .fetch_one(db)
-    .await
-    .ok()
-    .flatten()
-    .map(|n| sanitize_nudges(&n))
+    sqlx::query_scalar::<_, Option<String>>("SELECT nudges FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(db)
+        .await
+        .ok()
+        .flatten()
+        .map(|n| sanitize_nudges(&n))
 }

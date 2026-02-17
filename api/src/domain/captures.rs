@@ -82,21 +82,22 @@ pub async fn user_owns_media_path<'e, E>(
 where
     E: Executor<'e, Database = Postgres>,
 {
-    let row: Option<(i64,)> = sqlx::query_as(
+    let exists: bool = sqlx::query_scalar(
         r#"
-        SELECT 1
-        FROM captures
-        WHERE user_id = $1
-          AND (gcs_path = $2 OR thumbnail_path = $2)
-        LIMIT 1
+        SELECT EXISTS(
+            SELECT 1
+            FROM captures
+            WHERE user_id = $1
+              AND (gcs_path = $2 OR thumbnail_path = $2)
+        )
         "#,
     )
     .bind(user_id)
     .bind(media_path)
-    .fetch_optional(executor)
+    .fetch_one(executor)
     .await?;
 
-    Ok(row.is_some())
+    Ok(exists)
 }
 
 /// Capture row with total count from window function
@@ -245,13 +246,11 @@ pub async fn get_capture_info<'e, E>(
 where
     E: Executor<'e, Database = Postgres>,
 {
-    sqlx::query_as(
-        "SELECT id, gcs_path, content_type FROM captures WHERE id = $1 AND user_id = $2",
-    )
-    .bind(capture_id)
-    .bind(user_id)
-    .fetch_optional(executor)
-    .await
+    sqlx::query_as("SELECT id, gcs_path, content_type FROM captures WHERE id = $1 AND user_id = $2")
+        .bind(capture_id)
+        .bind(user_id)
+        .fetch_optional(executor)
+        .await
 }
 
 /// Batch get capture info for media upload

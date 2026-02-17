@@ -67,22 +67,34 @@ pub struct CropParams {
 impl CropParams {
     pub fn validate(&self) -> Result<(), MediaStudioError> {
         if self.x < 0.0 || self.x > 1.0 {
-            return Err(MediaStudioError::InvalidParams("x must be between 0 and 1".into()));
+            return Err(MediaStudioError::InvalidParams(
+                "x must be between 0 and 1".into(),
+            ));
         }
         if self.y < 0.0 || self.y > 1.0 {
-            return Err(MediaStudioError::InvalidParams("y must be between 0 and 1".into()));
+            return Err(MediaStudioError::InvalidParams(
+                "y must be between 0 and 1".into(),
+            ));
         }
         if self.width <= 0.0 || self.width > 1.0 {
-            return Err(MediaStudioError::InvalidParams("width must be between 0 and 1".into()));
+            return Err(MediaStudioError::InvalidParams(
+                "width must be between 0 and 1".into(),
+            ));
         }
         if self.height <= 0.0 || self.height > 1.0 {
-            return Err(MediaStudioError::InvalidParams("height must be between 0 and 1".into()));
+            return Err(MediaStudioError::InvalidParams(
+                "height must be between 0 and 1".into(),
+            ));
         }
         if self.x + self.width > 1.0 {
-            return Err(MediaStudioError::InvalidParams("x + width exceeds image bounds".into()));
+            return Err(MediaStudioError::InvalidParams(
+                "x + width exceeds image bounds".into(),
+            ));
         }
         if self.y + self.height > 1.0 {
-            return Err(MediaStudioError::InvalidParams("y + height exceeds image bounds".into()));
+            return Err(MediaStudioError::InvalidParams(
+                "y + height exceeds image bounds".into(),
+            ));
         }
         Ok(())
     }
@@ -100,11 +112,15 @@ pub struct TrimParams {
 impl TrimParams {
     pub fn validate(&self) -> Result<(), MediaStudioError> {
         if self.duration_secs <= 0.0 {
-            return Err(MediaStudioError::InvalidParams("duration must be positive".into()));
+            return Err(MediaStudioError::InvalidParams(
+                "duration must be positive".into(),
+            ));
         }
         // Validate timestamp format (simple check)
         if self.start_timestamp.is_empty() {
-            return Err(MediaStudioError::InvalidParams("start_timestamp is required".into()));
+            return Err(MediaStudioError::InvalidParams(
+                "start_timestamp is required".into(),
+            ));
         }
         Ok(())
     }
@@ -272,7 +288,9 @@ impl MediaStudio {
             }
             Ok(data)
         } else {
-            Err(MediaStudioError::Storage("No storage backend configured".to_string()))
+            Err(MediaStudioError::Storage(
+                "No storage backend configured".to_string(),
+            ))
         }
     }
 
@@ -280,25 +298,29 @@ impl MediaStudio {
         if let Some(local_path) = &self.local_storage_path {
             let full_path = local_path.join(path);
             if let Some(parent) = full_path.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| MediaStudioError::Storage(format!("Failed to create dir: {}", e)))?;
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    MediaStudioError::Storage(format!("Failed to create dir: {}", e))
+                })?;
             }
             tokio::fs::write(&full_path, data)
                 .await
                 .map_err(|e| MediaStudioError::Storage(format!("Local write failed: {}", e)))?;
-            println!("[media_studio] LOCAL: Saved edited capture to {:?}", full_path);
+            println!(
+                "[media_studio] LOCAL: Saved edited capture to {:?}",
+                full_path
+            );
         } else if let Some(ref gcs) = self.gcs {
             let bucket = format!("projects/_/buckets/{}", BUCKET_NAME);
             let bytes = Bytes::copy_from_slice(data);
-            gcs
-                .write_object(&bucket, path, bytes)
+            gcs.write_object(&bucket, path, bytes)
                 .send_buffered()
                 .await
                 .map_err(|e| MediaStudioError::Storage(format!("GCS write failed: {}", e)))?;
             println!("[media_studio] GCS: Uploaded edited capture to {}", path);
         } else {
-            return Err(MediaStudioError::Storage("No storage backend configured".to_string()));
+            return Err(MediaStudioError::Storage(
+                "No storage backend configured".to_string(),
+            ));
         }
         Ok(())
     }
@@ -347,7 +369,11 @@ impl MediaStudio {
         Ok(result.0)
     }
 
-    fn apply_image_crop(&self, data: &[u8], crop: &CropParams) -> Result<Vec<u8>, MediaStudioError> {
+    fn apply_image_crop(
+        &self,
+        data: &[u8],
+        crop: &CropParams,
+    ) -> Result<Vec<u8>, MediaStudioError> {
         let img = ImageReader::new(Cursor::new(data))
             .with_guessed_format()
             .map_err(|e| MediaStudioError::Processing(format!("Failed to read image: {}", e)))?
@@ -388,9 +414,9 @@ impl MediaStudio {
         let output_path = temp_dir.join(format!("cleo_trim_output_{}.mp4", rand::random::<u64>()));
 
         // Write input to temp file
-        tokio::fs::write(&input_path, data)
-            .await
-            .map_err(|e| MediaStudioError::Processing(format!("Failed to write temp input: {}", e)))?;
+        tokio::fs::write(&input_path, data).await.map_err(|e| {
+            MediaStudioError::Processing(format!("Failed to write temp input: {}", e))
+        })?;
 
         // Run ffmpeg to trim
         // -ss before -i for fast seeking, -t for duration
@@ -427,9 +453,9 @@ impl MediaStudio {
         }
 
         // Read output
-        let trimmed_data = tokio::fs::read(&output_path)
-            .await
-            .map_err(|e| MediaStudioError::Processing(format!("Failed to read trimmed output: {}", e)))?;
+        let trimmed_data = tokio::fs::read(&output_path).await.map_err(|e| {
+            MediaStudioError::Processing(format!("Failed to read trimmed output: {}", e))
+        })?;
 
         // Clean up output
         let _ = tokio::fs::remove_file(&output_path).await;

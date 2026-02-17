@@ -3,7 +3,7 @@
 use axum::{
     Json, Router,
     extract::State,
-    http::{header::SET_COOKIE, StatusCode},
+    http::{StatusCode, header::SET_COOKIE},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -11,19 +11,17 @@ use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_governor::{
-    GovernorLayer,
-    governor::GovernorConfigBuilder,
-    key_extractor::SmartIpKeyExtractor,
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
 };
 
-use crate::services::{cookies, session, twitter};
 use crate::AppState;
+use crate::services::{cookies, session, twitter};
 
 pub fn routes() -> Router<Arc<AppState>> {
     // Rate limit: Stricter for OAuth - 5 requests per minute to prevent abuse
     let rate_limit_config = GovernorConfigBuilder::default()
-        .per_second(12)  // Refill rate
-        .burst_size(5)   // Allow burst of 5 requests, then 1 per 12 seconds
+        .per_second(12) // Refill rate
+        .burst_size(5) // Allow burst of 5 requests, then 1 per 12 seconds
         .key_extractor(SmartIpKeyExtractor)
         .finish()
         .expect("Failed to build rate limit config");
@@ -54,7 +52,9 @@ async fn auth_twitter(State(state): State<Arc<AppState>>) -> Json<AuthUrlRespons
     ]);
 
     // Store state and code_verifier for callback
-    if let Err(e) = twitter::save_oauth_state(&state.db, &auth_request.state, &auth_request.code_verifier).await {
+    if let Err(e) =
+        twitter::save_oauth_state(&state.db, &auth_request.state, &auth_request.code_verifier).await
+    {
         eprintln!("Failed to save OAuth state: {}", e);
         // Return the URL anyway - login will fail at token exchange if state isn't found
         // This is better than blocking the user completely
@@ -142,11 +142,10 @@ async fn auth_twitter_token(
     })?;
 
     // Create session tokens
-    let access_token = session::create_access_token(user_id, &state.jwt_secret)
-        .map_err(|e| {
-            eprintln!("Failed to create access token: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let access_token = session::create_access_token(user_id, &state.jwt_secret).map_err(|e| {
+        eprintln!("Failed to create access token: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let refresh_token = session::create_refresh_token(user_id, &state.db)
         .await
@@ -161,8 +160,12 @@ async fn auth_twitter_token(
     });
 
     let mut response = body.into_response();
-    response.headers_mut().append(SET_COOKIE, cookies::build_access_cookie(&access_token)?);
-    response.headers_mut().append(SET_COOKIE, cookies::build_refresh_cookie(&refresh_token)?);
+    response
+        .headers_mut()
+        .append(SET_COOKIE, cookies::build_access_cookie(&access_token)?);
+    response
+        .headers_mut()
+        .append(SET_COOKIE, cookies::build_refresh_cookie(&refresh_token)?);
 
     Ok(response)
 }

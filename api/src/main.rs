@@ -1,9 +1,11 @@
 mod agent;
 mod constants;
 mod domain;
+mod frames;
 mod models;
 mod routes;
 mod services;
+mod storage;
 mod thumbnails;
 
 use axum::{
@@ -12,19 +14,16 @@ use axum::{
     http::{HeaderName, HeaderValue, Method, header},
     routing::get,
 };
-use std::net::SocketAddr;
-use tower_http::{
-    cors::CorsLayer,
-    set_header::SetResponseHeaderLayer,
-};
 use chrono::{DateTime, Utc};
 use google_cloud_storage::client::Storage;
 use reson_agentic::providers::GoogleGenAIClient;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer};
 
 use constants::{BUCKET_NAME, MAX_CAPTURE_UPLOAD_SIZE};
 use services::twitter::TwitterClient;
@@ -121,7 +120,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(client)
         }
         Err(e) => {
-            println!("[startup] GCS client not available: {} (local storage only)", e);
+            println!(
+                "[startup] GCS client not available: {} (local storage only)",
+                e
+            );
             None
         }
     };
@@ -149,19 +151,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("TWITTER_CLIENT_ID").expect("TWITTER_CLIENT_ID must be set");
     let twitter_client_secret =
         std::env::var("TWITTER_CLIENT_SECRET").expect("TWITTER_CLIENT_SECRET must be set");
-    let twitter_redirect_uri = std::env::var("TWITTER_REDIRECT_URI")
-        .unwrap_or_else(|_| {
-            let callback_path = std::env::var("TWITTER_CALLBACK_PATH")
-                .unwrap_or_else(|_| "/auth/twitter/callback".to_string());
-            let callback_path = if callback_path.is_empty() {
-                "/auth/twitter/callback".to_string()
-            } else if callback_path.starts_with('/') {
-                callback_path
-            } else {
-                format!("/{}", callback_path)
-            };
-            format!("{}{}", app_origin, callback_path)
-        });
+    let twitter_redirect_uri = std::env::var("TWITTER_REDIRECT_URI").unwrap_or_else(|_| {
+        let callback_path = std::env::var("TWITTER_CALLBACK_PATH")
+            .unwrap_or_else(|_| "/auth/twitter/callback".to_string());
+        let callback_path = if callback_path.is_empty() {
+            "/auth/twitter/callback".to_string()
+        } else if callback_path.starts_with('/') {
+            callback_path
+        } else {
+            format!("/{}", callback_path)
+        };
+        format!("{}{}", app_origin, callback_path)
+    });
     let twitter = TwitterClient::new(
         &twitter_client_id,
         &twitter_client_secret,
@@ -227,7 +228,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Runs when either Gemini API key or LOCAL_LLM is configured
     let local_llm_configured = std::env::var("LOCAL_LLM").is_ok();
     if state.gemini.is_some() || local_llm_configured {
-        let backend = if local_llm_configured { "local LLM" } else { "Gemini" };
+        let backend = if local_llm_configured {
+            "local LLM"
+        } else {
+            "Gemini"
+        };
         tokio::spawn(agent::start_background_scheduler(
             pool.clone(),
             gcs.clone(),
@@ -252,11 +257,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         BUCKET_NAME.to_string(),
     ));
 
+    // Start frame extraction background worker
+    tokio::spawn(frames::run_frame_worker(
+        pool.clone(),
+        gcs.clone(),
+        local_storage_path.clone(),
+        BUCKET_NAME.to_string(),
+    ));
+
     // CORS configuration - allow web frontend origin
     let cors_origin = std::env::var("CORS_ORIGIN").unwrap_or_else(|_| app_origin.clone());
     let cors = CorsLayer::new()
-        .allow_origin(cors_origin.parse::<HeaderValue>().unwrap_or_else(|_| HeaderValue::from_static("http://localhost:5173")))
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_origin(
+            cors_origin
+                .parse::<HeaderValue>()
+                .unwrap_or_else(|_| HeaderValue::from_static("http://localhost:5173")),
+        )
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT])
         .allow_credentials(true);
 
@@ -291,5 +314,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", addr, e));
 
     println!("Listening on http://{}", addr);
-    Ok(axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.expect("Server failed"))
+    Ok(axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("Server failed"))
 }

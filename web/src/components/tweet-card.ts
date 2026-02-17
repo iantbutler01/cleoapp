@@ -168,9 +168,9 @@ export class TweetCard extends LitElement {
         : "status-success";
 
     return html`
-      <div class="relative ${this.copyChoices.length > 1 ? 'ml-6' : ''}">
+      <div class="w-full flex items-start gap-2">
         ${this.copyChoices.length > 1 ? html`
-          <div class="absolute -left-6 top-3 flex flex-col gap-0.5">
+          <div class="shrink-0 pt-3 flex flex-col gap-0.5">
             ${this.copyChoices.map((_, i) => html`
               <button
                 class="w-6 h-7 text-[10px] font-semibold rounded-l-md border border-r-0 transition-colors
@@ -185,7 +185,7 @@ export class TweetCard extends LitElement {
         <card-shell
           ?showRailConnector=${this.showRailConnector}
           variant=${this.compact ? "compact" : "default"}
-          class="max-w-2xl w-full max-h-sm"
+          class="w-full max-w-2xl max-h-sm"
         >
           <card-header slot="header">
             <span slot="left" class="text-xs">${this.formatDate(this.tweet.created_at)}</span>

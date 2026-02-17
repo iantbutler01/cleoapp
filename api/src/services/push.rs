@@ -2,8 +2,8 @@ use crate::domain::push as domain_push;
 use serde::Serialize;
 use sqlx::PgPool;
 use web_push::{
-    ContentEncoding, IsahcWebPushClient, SubscriptionInfo, Urgency, VapidSignatureBuilder,
-    URL_SAFE_NO_PAD, WebPushClient, WebPushMessageBuilder,
+    ContentEncoding, IsahcWebPushClient, SubscriptionInfo, URL_SAFE_NO_PAD, Urgency,
+    VapidSignatureBuilder, WebPushClient, WebPushMessageBuilder,
 };
 
 #[derive(Debug, Serialize)]
@@ -44,8 +44,11 @@ async fn send_push_message(
     subscription: &domain_push::PushSubscriptionData,
     private_key: &str,
 ) -> Result<(), String> {
-    let subscription_info =
-        SubscriptionInfo::new(&subscription.endpoint, &subscription.keys.p256dh, &subscription.keys.auth);
+    let subscription_info = SubscriptionInfo::new(
+        &subscription.endpoint,
+        &subscription.keys.p256dh,
+        &subscription.keys.auth,
+    );
 
     let signature = build_vapid_signature(private_key, &subscription_info)?;
 
@@ -104,7 +107,9 @@ pub async fn notify_new_content(
     let payload_bytes = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
 
     for subscription in subscriptions {
-        if let Err(error) = send_push_message(&client, &payload_bytes, &subscription, &private_key).await {
+        if let Err(error) =
+            send_push_message(&client, &payload_bytes, &subscription, &private_key).await
+        {
             eprintln!(
                 "[push] Failed to send notification to {} for user {}: {}",
                 subscription.endpoint, user_id, error

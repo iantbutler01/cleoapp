@@ -293,7 +293,6 @@ impl TwitterClient {
         }
     }
 
-
     /// Upload media to Twitter using the v2 API
     /// For images: uses simple upload
     /// For videos: uses chunked upload (INIT/APPEND/FINALIZE)
@@ -305,7 +304,9 @@ impl TwitterClient {
     ) -> Result<String, TwitterError> {
         // Videos require chunked upload
         if media_type.starts_with("video/") {
-            return self.upload_media_chunked(access_token, data, media_type).await;
+            return self
+                .upload_media_chunked(access_token, data, media_type)
+                .await;
         }
 
         // Simple upload for images
@@ -341,8 +342,9 @@ impl TwitterClient {
             return Err(TwitterError::Api(format!("Status {}: {}", status, text)));
         }
 
-        let wrapper: MediaUploadResponse = serde_json::from_str(&text)
-            .map_err(|e| TwitterError::Api(format!("Failed to parse response: {} - body: {}", e, text)))?;
+        let wrapper: MediaUploadResponse = serde_json::from_str(&text).map_err(|e| {
+            TwitterError::Api(format!("Failed to parse response: {} - body: {}", e, text))
+        })?;
         Ok(wrapper.data.id)
     }
 
@@ -386,8 +388,12 @@ impl TwitterClient {
         };
 
         // Step 1: INIT via /2/media/upload/initialize (JSON body)
-        println!("[upload_media_chunked] INIT: media_type={}, total_bytes={}, media_category={}",
-            media_type, data.len(), media_category);
+        println!(
+            "[upload_media_chunked] INIT: media_type={}, total_bytes={}, media_category={}",
+            media_type,
+            data.len(),
+            media_category
+        );
 
         let init_body = serde_json::json!({
             "media_type": media_type,
@@ -408,11 +414,18 @@ impl TwitterClient {
         let text = resp.text().await?;
 
         if !status.is_success() {
-            return Err(TwitterError::Api(format!("INIT failed - Status {}: {}", status, text)));
+            return Err(TwitterError::Api(format!(
+                "INIT failed - Status {}: {}",
+                status, text
+            )));
         }
 
-        let init_response: MediaUploadResponse = serde_json::from_str(&text)
-            .map_err(|e| TwitterError::Api(format!("Failed to parse INIT response: {} - body: {}", e, text)))?;
+        let init_response: MediaUploadResponse = serde_json::from_str(&text).map_err(|e| {
+            TwitterError::Api(format!(
+                "Failed to parse INIT response: {} - body: {}",
+                e, text
+            ))
+        })?;
         let media_id = init_response.data.id;
 
         println!("[upload_media_chunked] Got media_id: {}", media_id);
@@ -423,7 +436,12 @@ impl TwitterClient {
         let total_segments = chunks.len();
 
         for (segment_index, chunk) in chunks.into_iter().enumerate() {
-            println!("[upload_media_chunked] APPEND segment {}/{} ({} bytes)", segment_index + 1, total_segments, chunk.len());
+            println!(
+                "[upload_media_chunked] APPEND segment {}/{} ({} bytes)",
+                segment_index + 1,
+                total_segments,
+                chunk.len()
+            );
 
             // Report progress before uploading segment
             on_progress(segment_index, total_segments);
@@ -438,7 +456,10 @@ impl TwitterClient {
 
             let resp = self
                 .http
-                .post(format!("https://api.x.com/2/media/upload/{}/append", media_id))
+                .post(format!(
+                    "https://api.x.com/2/media/upload/{}/append",
+                    media_id
+                ))
                 .header("Authorization", format!("Bearer {}", access_token))
                 .multipart(append_form)
                 .send()
@@ -447,7 +468,10 @@ impl TwitterClient {
             let status = resp.status();
             if !status.is_success() {
                 let text = resp.text().await?;
-                return Err(TwitterError::Api(format!("APPEND failed at segment {} - Status {}: {}", segment_index, status, text)));
+                return Err(TwitterError::Api(format!(
+                    "APPEND failed at segment {} - Status {}: {}",
+                    segment_index, status, text
+                )));
             }
         }
 
@@ -459,7 +483,10 @@ impl TwitterClient {
 
         let resp = self
             .http
-            .post(format!("https://api.x.com/2/media/upload/{}/finalize", media_id))
+            .post(format!(
+                "https://api.x.com/2/media/upload/{}/finalize",
+                media_id
+            ))
             .header("Authorization", format!("Bearer {}", access_token))
             .send()
             .await?;
@@ -468,11 +495,18 @@ impl TwitterClient {
         let text = resp.text().await?;
 
         if !status.is_success() {
-            return Err(TwitterError::Api(format!("FINALIZE failed - Status {}: {}", status, text)));
+            return Err(TwitterError::Api(format!(
+                "FINALIZE failed - Status {}: {}",
+                status, text
+            )));
         }
 
-        let finalize_response: MediaUploadResponse = serde_json::from_str(&text)
-            .map_err(|e| TwitterError::Api(format!("Failed to parse FINALIZE response: {} - body: {}", e, text)))?;
+        let finalize_response: MediaUploadResponse = serde_json::from_str(&text).map_err(|e| {
+            TwitterError::Api(format!(
+                "Failed to parse FINALIZE response: {} - body: {}",
+                e, text
+            ))
+        })?;
 
         // Step 4: Poll STATUS if processing is needed
         if let Some(ref processing_info) = finalize_response.data.processing_info {
@@ -508,20 +542,31 @@ impl TwitterClient {
             let text = resp.text().await?;
 
             if !status.is_success() {
-                return Err(TwitterError::Api(format!("STATUS check failed - Status {}: {}", status, text)));
+                return Err(TwitterError::Api(format!(
+                    "STATUS check failed - Status {}: {}",
+                    status, text
+                )));
             }
 
-            let status_response: MediaUploadResponse = serde_json::from_str(&text)
-                .map_err(|e| TwitterError::Api(format!("Failed to parse STATUS response: {} - body: {}", e, text)))?;
+            let status_response: MediaUploadResponse =
+                serde_json::from_str(&text).map_err(|e| {
+                    TwitterError::Api(format!(
+                        "Failed to parse STATUS response: {} - body: {}",
+                        e, text
+                    ))
+                })?;
 
             if let Some(processing_info) = status_response.data.processing_info {
                 match processing_info.state.as_str() {
                     "succeeded" => return Ok(()),
-                    "failed" => return Err(TwitterError::Api("Media processing failed".to_string())),
+                    "failed" => {
+                        return Err(TwitterError::Api("Media processing failed".to_string()));
+                    }
                     _ => {
                         // Wait before polling again
                         let wait_secs = processing_info.check_after_secs.unwrap_or(5);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs as u64)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs as u64))
+                            .await;
                     }
                 }
             } else {

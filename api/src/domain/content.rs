@@ -1,8 +1,8 @@
 //! Content domain - unified content queries with DB-level pagination
 
 use chrono::{DateTime, Utc};
-use sqlx::{Executor, PgPool, Postgres};
 use sqlx::types::Json;
+use sqlx::{Executor, PgPool, Postgres};
 use std::collections::HashMap;
 
 use super::twitter::{Thread, ThreadWithTweets, Tweet};
@@ -97,7 +97,10 @@ where
         filter.thread_where()
     );
 
-    let (count,): (i64,) = sqlx::query_as(&query).bind(user_id).fetch_one(executor).await?;
+    let (count,): (i64,) = sqlx::query_as(&query)
+        .bind(user_id)
+        .fetch_one(executor)
+        .await?;
     Ok(count)
 }
 

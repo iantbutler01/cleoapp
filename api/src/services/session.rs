@@ -3,7 +3,7 @@
 #![allow(dead_code)] // Functions will be used as we implement auth
 
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -60,20 +60,20 @@ pub fn validate_access_token(token: &str, secret: &[u8]) -> Result<i64, SessionE
     let mut validation = Validation::new(Algorithm::HS256);
     validation.set_required_spec_claims(&["exp", "sub", "iat"]);
 
-    let token_data = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(secret),
-        &validation,
-    )
-    .map_err(|e| {
-        eprintln!("JWT decode error: {:?}", e);
-        match e.kind() {
-            jsonwebtoken::errors::ErrorKind::ExpiredSignature => SessionError::Expired,
-            _ => SessionError::InvalidToken,
-        }
-    })?;
+    let token_data = decode::<Claims>(token, &DecodingKey::from_secret(secret), &validation)
+        .map_err(|e| {
+            eprintln!("JWT decode error: {:?}", e);
+            match e.kind() {
+                jsonwebtoken::errors::ErrorKind::ExpiredSignature => SessionError::Expired,
+                _ => SessionError::InvalidToken,
+            }
+        })?;
 
-    token_data.claims.sub.parse::<i64>().map_err(|_| SessionError::InvalidToken)
+    token_data
+        .claims
+        .sub
+        .parse::<i64>()
+        .map_err(|_| SessionError::InvalidToken)
 }
 
 /// Create a random refresh token and store it in the database

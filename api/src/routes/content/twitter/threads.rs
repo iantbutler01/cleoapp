@@ -9,21 +9,27 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::domain::{captures, twitter::threads};
-use crate::domain::twitter::ThreadStatus;
-use crate::services::{auth, error::LogErr, twitter as twitter_service};
-use crate::AppState;
-use crate::routes::auth::AuthUser;
-use crate::constants::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
 use super::dto::{ThreadResponse, ThreadWithTweetsResponse};
 use super::media::upload_tweet_media;
+use crate::AppState;
+use crate::constants::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
+use crate::domain::twitter::ThreadStatus;
+use crate::domain::{captures, twitter::threads};
+use crate::routes::auth::AuthUser;
+use crate::services::{auth, error::LogErr, twitter as twitter_service};
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/threads", post(create_thread).get(list_threads))
-        .route("/threads/{id}", get(get_thread).put(update_thread).delete(delete_thread))
+        .route(
+            "/threads/{id}",
+            get(get_thread).put(update_thread).delete(delete_thread),
+        )
         .route("/threads/{id}/tweets", post(add_tweet_to_thread))
-        .route("/threads/{thread_id}/tweets/{tweet_id}", delete(remove_tweet_from_thread))
+        .route(
+            "/threads/{thread_id}/tweets/{tweet_id}",
+            delete(remove_tweet_from_thread),
+        )
         .route("/threads/{id}/publish", post(post_thread))
         .route("/tweets/{id}/collateral", put(update_tweet_collateral))
 }
@@ -47,7 +53,6 @@ async fn create_thread(
     AuthUser(user_id): AuthUser,
     Json(payload): Json<CreateThreadRequest>,
 ) -> Result<(StatusCode, Json<CreateThreadResponse>), StatusCode> {
-
     if payload.tweet_ids.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -74,11 +79,14 @@ async fn create_thread(
 
     tx.commit().await.log_500("Commit transaction error")?;
 
-    Ok((StatusCode::CREATED, Json(CreateThreadResponse {
-        id: thread_id,
-        title: payload.title,
-        tweet_count: payload.tweet_ids.len(),
-    })))
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateThreadResponse {
+            id: thread_id,
+            title: payload.title,
+            tweet_count: payload.tweet_ids.len(),
+        }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -128,7 +136,6 @@ async fn get_thread(
     AuthUser(user_id): AuthUser,
     Path(thread_id): Path<i64>,
 ) -> Result<Json<ThreadWithTweetsResponse>, StatusCode> {
-
     let result = threads::get_thread_with_tweets(&state.db, thread_id, user_id)
         .await
         .log_500("Get thread error")?
@@ -160,7 +167,6 @@ async fn update_thread(
     Path(thread_id): Path<i64>,
     Json(payload): Json<UpdateThreadRequest>,
 ) -> Result<StatusCode, StatusCode> {
-
     let status = threads::get_thread_status(&state.db, thread_id, user_id)
         .await
         .log_500("Get thread status error")?
@@ -205,7 +211,6 @@ async fn delete_thread(
     AuthUser(user_id): AuthUser,
     Path(thread_id): Path<i64>,
 ) -> Result<StatusCode, StatusCode> {
-
     // Use transaction for atomic check + unlink + delete
     let mut tx = state.db.begin().await.log_500("Begin transaction error")?;
 
@@ -243,7 +248,6 @@ async fn add_tweet_to_thread(
     Path(thread_id): Path<i64>,
     Json(payload): Json<AddTweetToThreadRequest>,
 ) -> Result<StatusCode, StatusCode> {
-
     let status = threads::get_thread_status(&state.db, thread_id, user_id)
         .await
         .log_500("Get thread status error")?
@@ -280,9 +284,15 @@ async fn add_tweet_to_thread(
         max_pos.map(|p| p + 1).unwrap_or(0)
     };
 
-    threads::assign_tweet_to_thread(&mut *tx, payload.tweet_id, thread_id, user_id, final_position)
-        .await
-        .log_500("Assign tweet to thread error")?;
+    threads::assign_tweet_to_thread(
+        &mut *tx,
+        payload.tweet_id,
+        thread_id,
+        user_id,
+        final_position,
+    )
+    .await
+    .log_500("Assign tweet to thread error")?;
 
     tx.commit().await.log_500("Commit transaction error")?;
 
@@ -295,7 +305,6 @@ async fn remove_tweet_from_thread(
     AuthUser(user_id): AuthUser,
     Path((thread_id, tweet_id)): Path<(i64, i64)>,
 ) -> Result<StatusCode, StatusCode> {
-
     let status = threads::get_thread_status(&state.db, thread_id, user_id)
         .await
         .log_500("Get thread status error")?
@@ -376,7 +385,8 @@ async fn post_thread(
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
     // Ensure token is valid (refresh if needed)
-    let access_token = auth::ensure_valid_access_token(&state.db, &state.twitter, user_id, tokens).await?;
+    let access_token =
+        auth::ensure_valid_access_token(&state.db, &state.twitter, user_id, tokens).await?;
 
     // Record intent in transaction
     let mut tx = state.db.begin().await.log_500("Begin transaction error")?;
@@ -406,10 +416,18 @@ async fn post_thread(
                 return Err(StatusCode::BAD_REQUEST);
             }
 
-            threads::update_thread_status(&mut *tx, thread_id, user_id, "posted", previous_tweet_id.as_deref())
+            threads::update_thread_status(
+                &mut *tx,
+                thread_id,
+                user_id,
+                "posted",
+                previous_tweet_id.as_deref(),
+            )
+            .await
+            .log_500("Finalize partial thread status error")?;
+            tx.commit()
                 .await
-                .log_500("Finalize partial thread status error")?;
-            tx.commit().await.log_500("Commit intent transaction error")?;
+                .log_500("Commit intent transaction error")?;
             return Ok(Json(PostThreadResponse {
                 status: "posted".to_string(),
                 tweets: vec![],
@@ -419,7 +437,9 @@ async fn post_thread(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    tx.commit().await.log_500("Commit intent transaction error")?;
+    tx.commit()
+        .await
+        .log_500("Commit intent transaction error")?;
 
     // Phase 2: External API calls with compensation tracking
     let mut posted_results = Vec::new();
@@ -483,12 +503,22 @@ async fn post_thread(
     }
 
     // Phase 3: Record results in transaction
-    let mut tx = state.db.begin().await.log_500("Begin results transaction error")?;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .log_500("Begin results transaction error")?;
 
     for (collateral_id, twitter_id, reply_to) in &posted_results {
-        threads::mark_thread_tweet_posted(&mut *tx, *collateral_id, user_id, twitter_id, reply_to.as_deref())
-            .await
-            .log_500("Mark thread tweet posted error")?;
+        threads::mark_thread_tweet_posted(
+            &mut *tx,
+            *collateral_id,
+            user_id,
+            twitter_id,
+            reply_to.as_deref(),
+        )
+        .await
+        .log_500("Mark thread tweet posted error")?;
     }
 
     for (collateral_id, message) in &failed_results {
@@ -498,13 +528,17 @@ async fn post_thread(
     }
 
     let final_status = if failed { "partial_failed" } else { "posted" };
-    let first_tweet_id = posted_results.first().map(|(_, twitter_id, _)| twitter_id.as_str());
+    let first_tweet_id = posted_results
+        .first()
+        .map(|(_, twitter_id, _)| twitter_id.as_str());
 
     threads::update_thread_status(&mut *tx, thread_id, user_id, final_status, first_tweet_id)
         .await
         .log_500("Update thread status error")?;
 
-    tx.commit().await.log_500("Commit results transaction error")?;
+    tx.commit()
+        .await
+        .log_500("Commit results transaction error")?;
 
     // Phase 4: Compensation on failure
     // TODO: Add delete_tweet to TwitterClient to enable compensation for orphaned tweets
@@ -555,7 +589,6 @@ async fn update_tweet_collateral(
     Path(tweet_id): Path<i64>,
     Json(payload): Json<UpdateCollateralRequest>,
 ) -> Result<StatusCode, StatusCode> {
-
     let exists = threads::verify_tweet_exists_unposted(&state.db, tweet_id, user_id)
         .await
         .log_500("Verify tweet exists error")?;

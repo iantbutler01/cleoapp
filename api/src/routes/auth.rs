@@ -3,7 +3,7 @@
 use axum::{
     Json, Router,
     extract::{FromRequestParts, State},
-    http::{header::SET_COOKIE, request::Parts, StatusCode},
+    http::{StatusCode, header::SET_COOKIE, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -11,19 +11,17 @@ use axum_extra::extract::CookieJar;
 use serde::Serialize;
 use std::sync::Arc;
 use tower_governor::{
-    GovernorLayer,
-    governor::GovernorConfigBuilder,
-    key_extractor::SmartIpKeyExtractor,
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
 };
 
+use crate::AppState;
 use crate::domain::users;
 use crate::services::{cookies, session, twitter};
-use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
     // Rate limit: 10 requests per minute for auth endpoints to prevent brute force
     let rate_limit_config = GovernorConfigBuilder::default()
-        .per_second(6)  // 6 tokens per second
+        .per_second(6) // 6 tokens per second
         .burst_size(10) // Allow burst of 10 requests, then 1 per 10 seconds
         .key_extractor(SmartIpKeyExtractor)
         .finish()
@@ -70,8 +68,8 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
             .ok_or(StatusCode::UNAUTHORIZED)?;
 
         // Validate JWT
-        let user_id = session::validate_access_token(access_token, &state.jwt_secret)
-            .map_err(|e| {
+        let user_id =
+            session::validate_access_token(access_token, &state.jwt_secret).map_err(|e| {
                 eprintln!("JWT validation failed: {:?}", e);
                 StatusCode::UNAUTHORIZED
             })?;
@@ -79,7 +77,6 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
         Ok(AuthUser(user_id))
     }
 }
-
 
 // ============================================================================
 // Session endpoints
@@ -105,25 +102,26 @@ async fn refresh_session(
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     // Generate new access token
-    let access_token = session::create_access_token(user_id, &state.jwt_secret)
-        .map_err(|e| {
-            eprintln!("Failed to create access token: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let access_token = session::create_access_token(user_id, &state.jwt_secret).map_err(|e| {
+        eprintln!("Failed to create access token: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // Build response with cookies (204 No Content - only sets cookies)
     let mut response = StatusCode::NO_CONTENT.into_response();
-    response.headers_mut().append(SET_COOKIE, cookies::build_access_cookie(&access_token)?);
-    response.headers_mut().append(SET_COOKIE, cookies::build_refresh_cookie(&new_refresh_token)?);
+    response
+        .headers_mut()
+        .append(SET_COOKIE, cookies::build_access_cookie(&access_token)?);
+    response.headers_mut().append(
+        SET_COOKIE,
+        cookies::build_refresh_cookie(&new_refresh_token)?,
+    );
 
     Ok(response)
 }
 
 /// POST /auth/logout - Clear session and revoke refresh token
-async fn logout(
-    State(state): State<Arc<AppState>>,
-    jar: CookieJar,
-) -> Response {
+async fn logout(State(state): State<Arc<AppState>>, jar: CookieJar) -> Response {
     // Try to revoke the refresh token if it exists
     if let Some(refresh_token) = jar.get("refresh_token") {
         if let Err(e) = session::revoke_refresh_token(refresh_token.value(), &state.db).await {
@@ -134,8 +132,12 @@ async fn logout(
 
     // Clear cookies (204 No Content - session ended)
     let mut response = StatusCode::NO_CONTENT.into_response();
-    response.headers_mut().append(SET_COOKIE, cookies::build_clear_access_cookie());
-    response.headers_mut().append(SET_COOKIE, cookies::build_clear_refresh_cookie());
+    response
+        .headers_mut()
+        .append(SET_COOKIE, cookies::build_clear_access_cookie());
+    response
+        .headers_mut()
+        .append(SET_COOKIE, cookies::build_clear_refresh_cookie());
 
     response
 }
@@ -162,7 +164,10 @@ async fn get_me(
     // Return 401 if user not found - a valid JWT for a deleted user is still unauthorized
     let user = user.ok_or(StatusCode::UNAUTHORIZED)?;
 
-    Ok(Json(MeResponse { id: user_id, username: user.twitter_username }))
+    Ok(Json(MeResponse {
+        id: user_id,
+        username: user.twitter_username,
+    }))
 }
 
 // ============================================================================
@@ -187,7 +192,10 @@ async fn generate_api_token(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    Ok((StatusCode::CREATED, Json(ApiTokenResponse { api_token: token })))
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiTokenResponse { api_token: token }),
+    ))
 }
 
 /// GET /me/token - Get current API token (if exists)

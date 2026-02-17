@@ -642,7 +642,7 @@ export class TweetContent extends LitElement {
 
     return html`
       <!-- Tweet text with edit/refresh controls -->
-      <div class="relative group">
+      <div>
         ${this.editing ? html`
           <!-- Edit mode -->
           <div class="space-y-2">
@@ -676,11 +676,11 @@ export class TweetContent extends LitElement {
           </div>
         ` : html`
           <!-- Display mode -->
-          <p class="${textSize} leading-relaxed whitespace-pre-wrap h-26 overflow-hidden">${this.tweet.text}</p>
-          <!-- Edit/Refresh buttons - show on hover -->
-          <div class="absolute top-0 right-0 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1">
+          <p class="${textSize} leading-relaxed whitespace-pre-wrap break-words">${this.tweet.text}</p>
+          <!-- Edit/Refresh buttons -->
+          <div class="mt-2 flex justify-end gap-1">
             <button
-              class="btn btn-xs btn-ghost btn-circle"
+              class="btn btn-xs btn-outline bg-base-100 border-base-300/80 hover:bg-base-200"
               @click=${this.regenerateTweet}
               ?disabled=${this.regenerating}
               title="Regenerate tweet"
@@ -692,7 +692,7 @@ export class TweetContent extends LitElement {
                   </svg>`}
             </button>
             <button
-              class="btn btn-xs btn-ghost btn-circle"
+              class="btn btn-xs btn-outline bg-base-100 border-base-300/80 hover:bg-base-200"
               @click=${this.startEditing}
               title="Edit tweet"
             >

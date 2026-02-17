@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
 
+use super::auth::AuthUser;
 use crate::constants::{BUCKET_NAME, SIGNED_URL_EXPIRY_SECS};
 use crate::domain::{activities, captures as captures_domain};
 use crate::services::{error::LogErr, rate_limit::DAEMON_RATE_LIMITER, twitter};
-use crate::{get_extension, Activity, ActivityEvent, AppState, BatchCaptureResponse};
-use super::auth::AuthUser;
+use crate::{Activity, ActivityEvent, AppState, BatchCaptureResponse, get_extension};
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -57,7 +57,6 @@ async fn get_capture_url(
     AuthUser(user_id): AuthUser,
     Path(capture_id): Path<i64>,
 ) -> Result<Json<SignedUrlResponse>, StatusCode> {
-
     // Get capture info and verify ownership
     let capture = captures_domain::get_capture_media(&state.db, capture_id, user_id)
         .await
@@ -104,7 +103,6 @@ async fn get_capture_thumbnail(
     AuthUser(user_id): AuthUser,
     Path(capture_id): Path<i64>,
 ) -> Result<Json<ThumbnailUrlResponse>, StatusCode> {
-
     // Get capture info and verify ownership
     let capture = captures_domain::get_capture_thumbnail(&state.db, capture_id, user_id)
         .await
@@ -183,7 +181,6 @@ async fn browse_captures(
     AuthUser(user_id): AuthUser,
     Query(query): Query<BrowseCapturesQuery>,
 ) -> Result<Json<BrowseCapturesResponse>, StatusCode> {
-
     let limit = query.limit.unwrap_or(50).min(100);
     let offset = query.offset.unwrap_or(0);
 
@@ -282,7 +279,7 @@ async fn serve_media(
     // canonicalize() resolves symlinks and normalizes the path
     let canonical = full_path
         .canonicalize()
-        .map_err(|_| StatusCode::NOT_FOUND)?;  // Silent - expected for missing files
+        .map_err(|_| StatusCode::NOT_FOUND)?; // Silent - expected for missing files
     let storage_canonical = local_path
         .canonicalize()
         .log_500("Failed to canonicalize storage path")?;
@@ -294,7 +291,7 @@ async fn serve_media(
     // Read file
     let bytes = tokio::fs::read(&canonical)
         .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;  // Silent - expected for missing files
+        .map_err(|_| StatusCode::NOT_FOUND)?; // Silent - expected for missing files
 
     // Determine content type from extension
     let content_type = match canonical.extension().and_then(|e| e.to_str()) {
@@ -486,13 +483,18 @@ async fn capture_batch(
                 } else {
                     // For GCS, attempt to delete the orphaned object
                     let client = cloud_storage::Client::default();
-                    if let Err(cleanup_err) = client.object().delete(BUCKET_NAME, &relative_path).await {
+                    if let Err(cleanup_err) =
+                        client.object().delete(BUCKET_NAME, &relative_path).await
+                    {
                         eprintln!(
                             "[capture_batch] Failed to clean up orphaned GCS object {}: {}",
                             relative_path, cleanup_err
                         );
                     } else {
-                        eprintln!("[capture_batch] Cleaned up orphaned GCS object: {}", relative_path);
+                        eprintln!(
+                            "[capture_batch] Cleaned up orphaned GCS object: {}",
+                            relative_path
+                        );
                     }
                 }
                 failed += 1;
@@ -509,12 +511,15 @@ async fn capture_batch(
         failed
     );
 
-    Ok((StatusCode::CREATED, Json(BatchCaptureResponse {
-        ids: ids.clone(),
-        uploaded: ids.len(),
-        failed,
-        successful_indices,
-    })))
+    Ok((
+        StatusCode::CREATED,
+        Json(BatchCaptureResponse {
+            ids: ids.clone(),
+            uploaded: ids.len(),
+            failed,
+            successful_indices,
+        }),
+    ))
 }
 
 async fn activity(

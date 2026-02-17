@@ -1,9 +1,10 @@
+pub mod agent;
 pub mod auth;
 pub mod captures;
 pub mod content;
 pub mod media_studio;
-pub mod push;
 pub mod nudges;
+pub mod push;
 pub mod twitter_oauth;
 pub mod user;
 
@@ -15,6 +16,7 @@ use crate::AppState;
 /// Build all routes for the API
 pub fn build_routes() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(agent::routes())
         .merge(auth::routes())
         .merge(captures::routes())
         .merge(content::routes())

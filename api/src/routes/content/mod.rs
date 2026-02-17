@@ -11,10 +11,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::domain::content;
-use crate::AppState;
 use super::auth::AuthUser;
-use twitter::{TweetResponse, ThreadWithTweetsResponse};
+use crate::AppState;
+use crate::domain::content;
+use twitter::{ThreadWithTweetsResponse, TweetResponse};
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -81,7 +81,9 @@ async fn list_content(
                 .into_iter()
                 .map(|item| match item {
                     content::ContentItem::Tweet(t) => ContentItem::Tweet(TweetResponse::from(t)),
-                    content::ContentItem::Thread(t) => ContentItem::Thread(ThreadWithTweetsResponse::from(t)),
+                    content::ContentItem::Thread(t) => {
+                        ContentItem::Thread(ThreadWithTweetsResponse::from(t))
+                    }
                 })
                 .collect();
 

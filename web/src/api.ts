@@ -744,6 +744,24 @@ class ApiClient {
       'Failed to regenerate tweet'
     );
   }
+
+  // Agent run
+
+  async triggerAgentRun(): Promise<{ status: string; run_id: number | null }> {
+    return this.fetchJsonRaw(
+      `${API_BASE}/agent/run`,
+      { method: 'POST' },
+      'Failed to trigger agent run'
+    );
+  }
+
+  async getAgentStatus(): Promise<{ running: boolean }> {
+    return this.fetchJsonRaw(
+      `${API_BASE}/agent/status`,
+      {},
+      'Failed to get agent status'
+    );
+  }
 }
 
 export const api = new ApiClient();
