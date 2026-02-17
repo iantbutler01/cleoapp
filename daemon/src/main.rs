@@ -80,11 +80,9 @@ const DEFAULT_API_BASE: &str = "http://localhost:3000";
 const DEFAULT_PENDING_ROOT_DIR: &str = ".cleo/captures";
 const PENDING_SCREENSHOTS_SUBDIR: &str = "screenshots";
 const PENDING_RECORDINGS_SUBDIR: &str = "recordings";
-const CONFIG_SUBDIR: &str = "cleo";
-const CONFIG_FILENAME: &str = "config.json";
 const SCREENSHOT_INTERVAL_SECS: u64 = 5;
 const BURST_WINDOW_SECS: u64 = 5;
-const BURST_THRESHOLD_WITH_SWITCH: usize = 1; // App switch alone triggers recording
+const BURST_THRESHOLD_WITH_SWITCH: usize = 3; // Require multiple app switches before auto-recording
 const BURST_THRESHOLD_ACTIONS_ONLY: usize = 5; // Actions without app switch need higher threshold
 const AUTO_RECORDING_TAIL_SECS: u64 = 30; // Stop recording after 30s of no activity
 const MAX_RECORDING_DURATION_SECS: u64 = 5 * 60; // Hard cap at 5 minutes per recording
@@ -1602,10 +1600,9 @@ fn load_config() -> Result<CleoConfig, CaptureError> {
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == ErrorKind::NotFound => {
-            return Err(CaptureError::Config(format!(
-                "Missing Cleo config at {}. Use cleo://login/<api_key> or create the file with an `api_token` field.",
-                path.display()
-            )));
+            let config = create_default_config(&path)?;
+            info!("Created default Cleo config at {}", path.display());
+            return Ok(config);
         }
         Err(err) => return Err(CaptureError::from(err)),
     };
@@ -1616,6 +1613,29 @@ fn load_config() -> Result<CleoConfig, CaptureError> {
             path.display()
         ))
     })
+}
+
+fn create_default_config(path: &Path) -> Result<CleoConfig, CaptureError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(CaptureError::from)?;
+    }
+
+    let config = CleoConfig {
+        api_token: String::new(),
+        api_url: None,
+        privacy: PrivacySettings::default(),
+        daemon: DaemonSettings::default(),
+    };
+
+    let payload = serde_json::to_string_pretty(&config).map_err(|err| {
+        CaptureError::Config(format!(
+            "Failed to serialize default Cleo config at {}: {err}",
+            path.display()
+        ))
+    })?;
+
+    fs::write(path, payload).map_err(CaptureError::from)?;
+    Ok(config)
 }
 
 fn load_api_token() -> Result<String, CaptureError> {
@@ -1636,43 +1656,16 @@ fn resolve_api_base() -> String {
     env::var(API_BASE_ENV).unwrap_or_else(|_| DEFAULT_API_BASE.to_string())
 }
 
-fn platform_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join(CONFIG_SUBDIR).join(CONFIG_FILENAME))
-}
-
-fn legacy_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".config").join("cleo.json"))
-}
-
-fn config_path_candidates() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(path) = platform_config_path() {
-        paths.push(path);
-    }
-    if let Some(path) = legacy_config_path() {
-        if !paths.iter().any(|candidate| candidate == &path) {
-            paths.push(path);
-        }
-    }
-    paths
-}
-
 fn cleo_config_path() -> Result<PathBuf, CaptureError> {
-    let paths = config_path_candidates();
-
-    for path in &paths {
-        if path.is_file() {
-            return Ok(path.clone());
-        }
-    }
-
-    if let Some(path) = paths.into_iter().next() {
-        return Ok(path);
-    }
-
-    Err(CaptureError::Config(
-        "Unable to resolve config directory for cleo config file".into(),
-    ))
+    let home = env::var("HOME").map_err(|_| {
+        CaptureError::Config(
+            "HOME environment variable must be set to locate ~/.config/cleo.json".into(),
+        )
+    })?;
+    let mut path = PathBuf::from(home);
+    path.push(".config");
+    path.push("cleo.json");
+    Ok(path)
 }
 
 fn save_api_token(token: &str) -> Result<(), CaptureError> {
@@ -1984,6 +1977,7 @@ fn join_task_handle(handle: &mut Option<thread::JoinHandle<()>>, task_name: &str
 
 struct ScreenRecorder {
     stream: SCStream,
+    stream_output_handler_id: Option<usize>,
     recording_output: SCRecordingOutput,
     file_path: PathBuf,
     started_at: Instant,
@@ -2034,7 +2028,16 @@ impl ScreenRecorder {
             .with_shows_cursor(true)
             .with_fps(30);
 
-        let stream = SCStream::new(&filter, &config);
+        let mut stream = SCStream::new(&filter, &config);
+
+        // Register a no-op stream output so ScreenCaptureKit has an attached
+        // video consumer while direct-to-file recording is active.
+        let stream_output_handler_id = stream.add_output_handler(
+            |_sample, _of_type| {
+                // Intentionally no-op.
+            },
+            SCStreamOutputType::Screen,
+        );
         let file_path = recording_file_path();
 
         let recording_config = SCRecordingOutputConfiguration::new()
@@ -2052,6 +2055,7 @@ impl ScreenRecorder {
 
         Ok(Self {
             stream,
+            stream_output_handler_id,
             recording_output,
             file_path,
             started_at: Instant::now(),
@@ -2092,6 +2096,12 @@ impl ScreenRecorder {
     }
 
     fn stop_stream(&mut self) -> Result<(), CaptureError> {
+        if let Some(handler_id) = self.stream_output_handler_id.take() {
+            let _ = self
+                .stream
+                .remove_output_handler(handler_id, SCStreamOutputType::Screen);
+        }
+
         if self.running {
             self.stream.stop_capture().map_err(CaptureError::from)?;
             self.stream
